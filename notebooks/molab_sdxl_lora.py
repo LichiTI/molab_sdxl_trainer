@@ -82,8 +82,8 @@ def __():
                 pass
         return cwd
 
-    repo = find_repo_root()
-    repo_ready = is_repo_root(repo)
+    detected_repo = find_repo_root()
+    detected_repo_ready = is_repo_root(detected_repo)
 
     github_repo_input = mo.ui.text(
         value="",
@@ -92,7 +92,6 @@ def __():
     )
     clone_dir_input = mo.ui.text(value="/marimo/lulynx-sdxl-trainer", label="clone 到这个目录", full_width=True)
     clone_repo_button = mo.ui.run_button(label="clone / 更新完整仓库")
-    clone_message = ""
 
     def clone_or_update_repo(repo_url: str, target_dir: Path) -> str:
         """Clone or update the full training repository.
@@ -119,30 +118,16 @@ def __():
                     timeout=300,
                 )
             if git_result.returncode == 0:
-                return "✅ 完整仓库已 clone/update；请重新运行全部 cells。"
+                return "✅ 完整仓库已 clone/update。"
             return f"❌ git 失败，退出码 {git_result.returncode}\n\n```text\n{git_result.stdout}\n{git_result.stderr}\n```"
         except Exception as clone_error:
             return f"❌ clone/update 失败：{type(clone_error).__name__}: {clone_error}"
 
-    if clone_repo_button.value:
-        clone_message = clone_or_update_repo(
-            str(github_repo_input.value or "").strip(),
-            Path(str(clone_dir_input.value or "/marimo/lulynx-sdxl-trainer")).expanduser(),
-        )
-        repo = find_repo_root()
-        repo_ready = is_repo_root(repo)
-        if repo_ready and clone_message.startswith("✅"):
-            clone_message = f"✅ 完整仓库已准备：`{repo}`"
-
-    if repo_ready:
-        for rel in ["configs", "work/models", "work/datasets", "work/outputs", "work/logs", "work/runs", "work/archives"]:
-            (repo / rel).mkdir(parents=True, exist_ok=True)
-
     def q(path: Path | str) -> str:
         return shlex.quote(str(path))
 
-    repo_status = "✅ 已找到完整训练仓库" if repo_ready else "⚠️ 当前还没找到完整训练仓库，只找到了 notebook 工作目录"
-    bootstrap_panel = [] if repo_ready else [
+    detected_repo_status = "✅ 已找到完整训练仓库" if detected_repo_ready else "⚠️ 当前还没找到完整训练仓库，只找到了 notebook 工作目录"
+    bootstrap_panel = [] if detected_repo_ready else [
         mo.callout(
             "如果左侧文件目录只有这个 `.py`，请在下面填 GitHub 仓库地址并点击 clone。clone 完后重新运行全部 cells。",
             kind="warn",
@@ -150,8 +135,6 @@ def __():
         mo.hstack([github_repo_input, clone_dir_input]),
         clone_repo_button,
     ]
-    if clone_message:
-        bootstrap_panel.append(mo.md(clone_message))
 
     mo.vstack(
         [
@@ -159,9 +142,9 @@ def __():
                 f"""
                 # Lulynx SDXL LoRA — molab 交互训练面板
 
-                {repo_status}
+                {detected_repo_status}
 
-                当前训练仓库根目录：`{repo}`
+                当前检测到的目录：`{detected_repo}`
 
                 这个 notebook 只控制 **SDXL LoRA 训练**，不依赖前端 `plugin/lora-scripts-ui-main`，也不启动 WebUI。
                 """
@@ -169,7 +152,32 @@ def __():
             *bootstrap_panel,
         ]
     )
-    return Any, Path, json, mo, os, q, repo, shlex, subprocess, sys, time, zipfile
+    return Any, Path, clone_dir_input, clone_or_update_repo, clone_repo_button, detected_repo, find_repo_root, github_repo_input, is_repo_root, json, mo, os, q, shlex, subprocess, sys, time, zipfile
+
+
+@app.cell
+def __(Path, clone_dir_input, clone_or_update_repo, clone_repo_button, detected_repo, find_repo_root, github_repo_input, is_repo_root, mo):
+    bootstrap_message = ""
+    repo = detected_repo
+
+    if clone_repo_button.value:
+        bootstrap_message = clone_or_update_repo(
+            str(github_repo_input.value or "").strip(),
+            Path(str(clone_dir_input.value or "/marimo/lulynx-sdxl-trainer")).expanduser(),
+        )
+        repo = find_repo_root()
+
+    repo_is_ready = is_repo_root(repo)
+    if repo_is_ready:
+        for repo_work_dir in ["configs", "work/models", "work/datasets", "work/outputs", "work/logs", "work/runs", "work/archives"]:
+            (repo / repo_work_dir).mkdir(parents=True, exist_ok=True)
+
+    if bootstrap_message:
+        mo.md(f"{bootstrap_message}\n\n当前训练仓库根目录：`{repo}`")
+    else:
+        mo.md(f"当前训练仓库根目录：`{repo}`")
+
+    return bootstrap_message, repo, repo_is_ready
 
 
 @app.cell
@@ -581,11 +589,6 @@ def __(Path, caption_ext_input, config, config_name_input, core_entry, count_dat
     logging_dir.mkdir(parents=True, exist_ok=True)
 
     config_path = repo / "configs" / f"{safe_config_name(str(config_name_input.value))}.json"
-    write_message = ""
-    if write_config_button.value:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-        write_message = f"✅ 已写入：`{config_path}`"
 
     subset_preview = dataset_info.get("subsets", [])
     subset_text = "\n".join([f"  - `{item}`" for item in subset_preview]) or "  - 暂无"
@@ -595,10 +598,22 @@ def __(Path, caption_ext_input, config, config_name_input, core_entry, count_dat
         [
             mo.md(f"### 预检结果\n{status_text}\n\n### 数据集 subset 预览\n{subset_text}"),
             write_config_button,
-            mo.md(write_message or f"配置路径将是：`{config_path}`"),
+            mo.md(f"配置路径将是：`{config_path}`"),
         ]
     )
-    return config_path, dataset_info, logging_dir, model_path, output_dir, preflight, train_dir, write_config_button, write_message
+    return config_path, dataset_info, logging_dir, model_path, output_dir, preflight, train_dir, write_config_button
+
+
+@app.cell
+def __(config, config_path, json, mo, write_config_button):
+    write_config_message = ""
+    if write_config_button.value:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_config_message = f"✅ 已写入：`{config_path}`"
+
+    mo.md(write_config_message or "点击上面的按钮后，这里会显示配置写入结果。")
+    return write_config_message,
 
 
 @app.cell
