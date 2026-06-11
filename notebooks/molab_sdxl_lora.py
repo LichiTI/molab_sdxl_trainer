@@ -49,30 +49,106 @@ def __():
 
     import marimo as mo
 
+    def is_repo_root(candidate: Path) -> bool:
+        return (candidate / "core" / "entry_train.py").is_file() and (candidate / "scripts" / "run_sdxl_train.py").is_file()
+
     def find_repo_root() -> Path:
-        """Find the exported repo root even when the notebook starts under notebooks/."""
+        """Find the exported repo root even when molab starts from a single notebook file."""
         cwd = Path.cwd().resolve()
-        candidates = [cwd, *cwd.parents]
-        for candidate in candidates:
-            if (candidate / "core" / "entry_train.py").is_file() and (candidate / "scripts" / "run_sdxl_train.py").is_file():
+
+        # 1) Normal case: cwd is repo root, or cwd is repo/notebooks.
+        for candidate in [cwd, *cwd.parents]:
+            if is_repo_root(candidate):
                 return candidate
+
+        # 2) Molab may keep the notebook in /marimo while a cloned repo is a child of /marimo.
+        # Keep this search shallow and marker-based to avoid scanning huge model/dataset folders.
+        search_roots = [cwd, Path("/marimo"), Path("/workspaces")]
+        seen: set[Path] = set()
+        for root_candidate in search_roots:
+            try:
+                root_candidate = root_candidate.resolve()
+            except Exception:
+                continue
+            if root_candidate in seen or not root_candidate.exists():
+                continue
+            seen.add(root_candidate)
+            try:
+                for marker in root_candidate.glob("*/core/entry_train.py"):
+                    candidate = marker.parent.parent
+                    if is_repo_root(candidate):
+                        return candidate
+            except Exception:
+                pass
         return cwd
 
     repo = find_repo_root()
-    for rel in ["configs", "work/models", "work/datasets", "work/outputs", "work/logs", "work/runs", "work/archives"]:
-        (repo / rel).mkdir(parents=True, exist_ok=True)
+    repo_ready = is_repo_root(repo)
+
+    github_repo_input = mo.ui.text(
+        value="",
+        label="如果当前只看到单个 py 文件，请粘贴完整 GitHub 仓库地址，例如 https://github.com/you/repo.git",
+        full_width=True,
+    )
+    clone_dir_input = mo.ui.text(value="/marimo/lulynx-sdxl-trainer", label="clone 到这个目录", full_width=True)
+    clone_repo_button = mo.ui.run_button(label="clone / 更新完整仓库")
+    clone_message = ""
+
+    if clone_repo_button.value:
+        url = str(github_repo_input.value or "").strip()
+        clone_dir = Path(str(clone_dir_input.value or "/marimo/lulynx-sdxl-trainer")).expanduser()
+        if not url:
+            clone_message = "❌ 请先填写 GitHub 仓库地址。"
+        else:
+            try:
+                if (clone_dir / ".git").is_dir():
+                    proc = subprocess.run(["git", "-C", str(clone_dir), "pull", "--ff-only"], text=True, capture_output=True, timeout=180)
+                else:
+                    clone_dir.parent.mkdir(parents=True, exist_ok=True)
+                    proc = subprocess.run(["git", "clone", "--depth", "1", url, str(clone_dir)], text=True, capture_output=True, timeout=300)
+                if proc.returncode == 0:
+                    repo = find_repo_root()
+                    repo_ready = is_repo_root(repo)
+                    clone_message = f"✅ 完整仓库已准备：`{repo}`"
+                else:
+                    clone_message = f"❌ git 失败，退出码 {proc.returncode}\n\n```text\n{proc.stdout}\n{proc.stderr}\n```"
+            except Exception as exc:
+                clone_message = f"❌ clone/update 失败：{type(exc).__name__}: {exc}"
+
+    if repo_ready:
+        for rel in ["configs", "work/models", "work/datasets", "work/outputs", "work/logs", "work/runs", "work/archives"]:
+            (repo / rel).mkdir(parents=True, exist_ok=True)
 
     def q(path: Path | str) -> str:
         return shlex.quote(str(path))
 
-    mo.md(
-        f"""
-        # Lulynx SDXL LoRA — molab 交互训练面板
+    repo_status = "✅ 已找到完整训练仓库" if repo_ready else "⚠️ 当前还没找到完整训练仓库，只找到了 notebook 工作目录"
+    bootstrap_panel = [] if repo_ready else [
+        mo.callout(
+            "如果左侧文件目录只有这个 `.py`，请在下面填 GitHub 仓库地址并点击 clone。clone 完后重新运行全部 cells。",
+            kind="warn",
+        ),
+        mo.hstack([github_repo_input, clone_dir_input]),
+        clone_repo_button,
+    ]
+    if clone_message:
+        bootstrap_panel.append(mo.md(clone_message))
 
-        当前仓库根目录：`{repo}`
+    mo.vstack(
+        [
+            mo.md(
+                f"""
+                # Lulynx SDXL LoRA — molab 交互训练面板
 
-        这个 notebook 只控制 **SDXL LoRA 训练**，不依赖前端 `plugin/lora-scripts-ui-main`，也不启动 WebUI。
-        """
+                {repo_status}
+
+                当前训练仓库根目录：`{repo}`
+
+                这个 notebook 只控制 **SDXL LoRA 训练**，不依赖前端 `plugin/lora-scripts-ui-main`，也不启动 WebUI。
+                """
+            ),
+            *bootstrap_panel,
+        ]
     )
     return Any, Path, json, mo, os, q, repo, shlex, subprocess, sys, time, zipfile
 
