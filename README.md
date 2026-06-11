@@ -66,8 +66,9 @@ notebooks/molab_sdxl_lora.py
 
 1. 检查 Python / Torch / CUDA / GPU
 2. 可选从 Hugging Face 下载 SDXL 底模
-3. 填写模型路径、数据集路径、输出名
-4. 设置 rank、alpha、分辨率、epoch、学习率、optimizer
+3. 可选从普通直链 / Civitai download URL 下载模型到 `work/models/`
+4. 填写模型路径、数据集路径、输出名
+5. 设置 rank、alpha、分辨率、epoch、学习率、optimizer
 5. 设置 bucket、cache、混合精度、低显存策略
 6. 预检模型和数据集
 7. 写出训练配置 JSON
@@ -164,3 +165,5 @@ git push
 ```
 
 注意 `.gitignore` 已排除模型、数据集和输出，请不要把 `.safetensors`、训练集图片、输出 LoRA 直接提交到 GitHub。
+
+`work/models/`、`work/datasets/`、`work/outputs/`、`work/logs/`、`work/runs/`、`work/archives/` 会通过 `.gitkeep` 作为空目录保留在仓库中；目录里的实际大文件仍会被忽略。

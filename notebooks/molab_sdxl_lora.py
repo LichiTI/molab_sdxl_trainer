@@ -337,6 +337,109 @@ def __(Path, hf_download_button, hf_file_input, hf_local_dir_input, hf_repo_inpu
     return hf_download_result,
 
 
+
+
+@app.cell
+def __(mo):
+    mo.md("## 3B. 可选：直接 URL / Civitai 下载模型")
+
+    direct_model_url_input = mo.ui.text(
+        value="",
+        label="模型下载 URL：支持普通直链，也支持 Civitai download URL",
+        full_width=True,
+    )
+    direct_model_filename_input = mo.ui.text(
+        value="model.safetensors",
+        label="保存文件名，建议 .safetensors；如果 URL 不能推断文件名，请务必填写",
+        full_width=True,
+    )
+    direct_model_local_dir_input = mo.ui.text(value="work/models", label="保存目录", full_width=True)
+    direct_model_token_env_input = mo.ui.text(
+        value="",
+        label="可选 Token 环境变量名：例如 CIVITAI_TOKEN；公开直链留空",
+        full_width=True,
+    )
+    direct_model_auth_mode_dropdown = mo.ui.dropdown(
+        options=["none", "bearer_header", "civitai_query"],
+        value="none",
+        label="Token 使用方式：无 / Authorization Bearer / Civitai ?token=",
+    )
+    direct_model_download_button = mo.ui.run_button(label="下载 URL / Civitai 模型到 work/models")
+
+    mo.vstack(
+        [
+            direct_model_url_input,
+            mo.hstack([direct_model_filename_input, direct_model_local_dir_input]),
+            mo.hstack([direct_model_token_env_input, direct_model_auth_mode_dropdown]),
+            mo.callout(
+                "Token 不要写进 GitHub。需要鉴权时，先在终端执行 `export CIVITAI_TOKEN=你的token`，然后这里填写环境变量名 `CIVITAI_TOKEN`。",
+                kind="info",
+            ),
+            direct_model_download_button,
+        ]
+    )
+    return direct_model_auth_mode_dropdown, direct_model_download_button, direct_model_filename_input, direct_model_local_dir_input, direct_model_token_env_input, direct_model_url_input
+
+
+@app.cell
+def __(Path, direct_model_auth_mode_dropdown, direct_model_download_button, direct_model_filename_input, direct_model_local_dir_input, direct_model_token_env_input, direct_model_url_input, mo, os, repo, subprocess):
+    def download_direct_model(model_url: str, output_name: str, output_dir_text: str, token_env_name: str, auth_mode: str) -> str:
+        if not model_url:
+            return "❌ 请先填写模型下载 URL。"
+
+        direct_output_dir = Path(output_dir_text or "work/models").expanduser()
+        if not direct_output_dir.is_absolute():
+            direct_output_dir = repo / direct_output_dir
+        direct_output_dir.mkdir(parents=True, exist_ok=True)
+
+        clean_output_name = (output_name or "model.safetensors").strip().split("/")[-1].split("\\\\")[-1]
+        if not clean_output_name:
+            clean_output_name = "model.safetensors"
+        direct_target_path = direct_output_dir / clean_output_name
+
+        direct_token_value = os.environ.get((token_env_name or "").strip(), "") if token_env_name else ""
+        effective_url = model_url.strip()
+        curl_command = ["curl", "-L", "--fail", "--retry", "3", "--continue-at", "-", "-o", str(direct_target_path)]
+
+        if auth_mode == "bearer_header" and direct_token_value:
+            curl_command.extend(["-H", f"Authorization: Bearer {direct_token_value}"])
+        elif auth_mode == "civitai_query" and direct_token_value:
+            join_char = "&" if "?" in effective_url else "?"
+            effective_url = f"{effective_url}{join_char}token={direct_token_value}"
+
+        curl_command.append(effective_url)
+
+        try:
+            direct_download_result = subprocess.run(
+                curl_command,
+                text=True,
+                capture_output=True,
+                timeout=7200,
+            )
+        except Exception as direct_download_error:
+            return f"❌ 下载进程启动失败：{type(direct_download_error).__name__}: {direct_download_error}"
+
+        if direct_download_result.returncode != 0:
+            sanitized_stderr = (direct_download_result.stderr or "").replace(direct_token_value, "***") if direct_token_value else (direct_download_result.stderr or "")
+            sanitized_stdout = (direct_download_result.stdout or "").replace(direct_token_value, "***") if direct_token_value else (direct_download_result.stdout or "")
+            return f"❌ 下载失败，退出码 {direct_download_result.returncode}\n\n```text\n{sanitized_stdout}\n{sanitized_stderr}\n```"
+
+        size_gb = direct_target_path.stat().st_size / 1024**3 if direct_target_path.exists() else 0
+        return f"✅ 下载完成：`{direct_target_path}`，大小约 `{size_gb:.2f} GB`。上面的底模路径可填写：`{direct_target_path}`"
+
+    direct_model_download_message = ""
+    if direct_model_download_button.value:
+        direct_model_download_message = download_direct_model(
+            str(direct_model_url_input.value or "").strip(),
+            str(direct_model_filename_input.value or "model.safetensors").strip(),
+            str(direct_model_local_dir_input.value or "work/models").strip(),
+            str(direct_model_token_env_input.value or "").strip(),
+            str(direct_model_auth_mode_dropdown.value or "none"),
+        )
+
+    mo.md(direct_model_download_message or "未触发 URL 下载。")
+    return direct_model_download_message,
+
 @app.cell
 def __(mo):
     mo.md("## 4. 训练参数")
