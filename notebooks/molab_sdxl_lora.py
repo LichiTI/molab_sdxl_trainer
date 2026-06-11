@@ -94,26 +94,45 @@ def __():
     clone_repo_button = mo.ui.run_button(label="clone / 更新完整仓库")
     clone_message = ""
 
+    def clone_or_update_repo(repo_url: str, target_dir: Path) -> str:
+        """Clone or update the full training repository.
+
+        Keep subprocess temporaries inside this helper so marimo does not treat
+        names like `proc` as cell-level variables that can collide with other cells.
+        """
+        if not repo_url:
+            return "❌ 请先填写 GitHub 仓库地址。"
+        try:
+            if (target_dir / ".git").is_dir():
+                git_result = subprocess.run(
+                    ["git", "-C", str(target_dir), "pull", "--ff-only"],
+                    text=True,
+                    capture_output=True,
+                    timeout=180,
+                )
+            else:
+                target_dir.parent.mkdir(parents=True, exist_ok=True)
+                git_result = subprocess.run(
+                    ["git", "clone", "--depth", "1", repo_url, str(target_dir)],
+                    text=True,
+                    capture_output=True,
+                    timeout=300,
+                )
+            if git_result.returncode == 0:
+                return "✅ 完整仓库已 clone/update；请重新运行全部 cells。"
+            return f"❌ git 失败，退出码 {git_result.returncode}\n\n```text\n{git_result.stdout}\n{git_result.stderr}\n```"
+        except Exception as clone_error:
+            return f"❌ clone/update 失败：{type(clone_error).__name__}: {clone_error}"
+
     if clone_repo_button.value:
-        url = str(github_repo_input.value or "").strip()
-        clone_dir = Path(str(clone_dir_input.value or "/marimo/lulynx-sdxl-trainer")).expanduser()
-        if not url:
-            clone_message = "❌ 请先填写 GitHub 仓库地址。"
-        else:
-            try:
-                if (clone_dir / ".git").is_dir():
-                    proc = subprocess.run(["git", "-C", str(clone_dir), "pull", "--ff-only"], text=True, capture_output=True, timeout=180)
-                else:
-                    clone_dir.parent.mkdir(parents=True, exist_ok=True)
-                    proc = subprocess.run(["git", "clone", "--depth", "1", url, str(clone_dir)], text=True, capture_output=True, timeout=300)
-                if proc.returncode == 0:
-                    repo = find_repo_root()
-                    repo_ready = is_repo_root(repo)
-                    clone_message = f"✅ 完整仓库已准备：`{repo}`"
-                else:
-                    clone_message = f"❌ git 失败，退出码 {proc.returncode}\n\n```text\n{proc.stdout}\n{proc.stderr}\n```"
-            except Exception as exc:
-                clone_message = f"❌ clone/update 失败：{type(exc).__name__}: {exc}"
+        clone_message = clone_or_update_repo(
+            str(github_repo_input.value or "").strip(),
+            Path(str(clone_dir_input.value or "/marimo/lulynx-sdxl-trainer")).expanduser(),
+        )
+        repo = find_repo_root()
+        repo_ready = is_repo_root(repo)
+        if repo_ready and clone_message.startswith("✅"):
+            clone_message = f"✅ 完整仓库已准备：`{repo}`"
 
     if repo_ready:
         for rel in ["configs", "work/models", "work/datasets", "work/outputs", "work/logs", "work/runs", "work/archives"]:
@@ -171,8 +190,8 @@ def __(Path, mo, repo, subprocess, sys):
             if cuda_available
             else 0
         )
-    except Exception as exc:
-        torch_version = f"torch 导入失败：{exc}"
+    except Exception as torch_error:
+        torch_version = f"torch 导入失败：{torch_error}"
         cuda_available = False
         cuda_version = "-"
         gpu_name = "-"
@@ -210,8 +229,8 @@ def __(mo, nvidia_smi_button, subprocess):
     if nvidia_smi_button.value:
         try:
             smi_output = subprocess.check_output(["nvidia-smi"], text=True, stderr=subprocess.STDOUT, timeout=20)
-        except Exception as exc:
-            smi_output = f"nvidia-smi 执行失败：{exc}"
+        except Exception as smi_error:
+            smi_output = f"nvidia-smi 执行失败：{smi_error}"
     mo.md(f"```text\n{smi_output}\n```") if smi_output else mo.md("刷新后这里会显示 `nvidia-smi` 输出。")
     return smi_output,
 
@@ -303,8 +322,8 @@ def __(Path, hf_download_button, hf_file_input, hf_local_dir_input, hf_repo_inpu
                 token=token,
             )
             hf_download_result = f"✅ 下载/命中缓存：{downloaded}"
-        except Exception as exc:
-            hf_download_result = f"❌ 下载失败：{type(exc).__name__}: {exc}"
+        except Exception as hf_error:
+            hf_download_result = f"❌ 下载失败：{type(hf_error).__name__}: {hf_error}"
 
     mo.md(hf_download_result or "未触发下载。")
     return hf_download_result,
@@ -462,9 +481,9 @@ def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_
         if not isinstance(advanced_overrides, dict):
             advanced_overrides = {}
             advanced_error = "高级 JSON 必须是对象。"
-    except Exception as exc:
+    except Exception as advanced_json_error:
         advanced_overrides = {}
-        advanced_error = f"高级 JSON 解析失败：{type(exc).__name__}: {exc}"
+        advanced_error = f"高级 JSON 解析失败：{type(advanced_json_error).__name__}: {advanced_json_error}"
 
     attention_backend = str(attention_backend_dropdown.value)
     config = {
@@ -537,7 +556,6 @@ def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_
         "execution_core": "standard",
     }
     config.update(advanced_overrides)
-    config_filename = safe_name = "placeholder"
     return advanced_error, advanced_overrides, config
 
 
@@ -631,7 +649,7 @@ def __(config_path, mo, os, repo, start_train_button, subprocess, sys):
             env.setdefault("TOKENIZERS_PARALLELISM", "false")
             env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
             cmd = [sys.executable, "scripts/run_sdxl_train.py", "--config", str(config_path)]
-            proc = subprocess.Popen(
+            train_proc = subprocess.Popen(
                 cmd,
                 cwd=str(repo),
                 env=env,
@@ -641,11 +659,11 @@ def __(config_path, mo, os, repo, start_train_button, subprocess, sys):
                 bufsize=1,
             )
             lines: list[str] = []
-            assert proc.stdout is not None
-            for line in proc.stdout:
+            assert train_proc.stdout is not None
+            for line in train_proc.stdout:
                 print(line, end="")
                 lines.append(line)
-            train_returncode = proc.wait()
+            train_returncode = train_proc.wait()
             train_output = "".join(lines[-300:])
 
     if train_output:
@@ -668,8 +686,8 @@ def __(mo, output_dir, repo, time, zip_outputs_button, zipfile):
                 for file in files:
                     zf.write(file, file.relative_to(output_dir.parent))
             zip_message = f"✅ 已打包 {len(files)} 个文件：`{archive_path}`"
-        except Exception as exc:
-            zip_message = f"❌ 打包失败：{type(exc).__name__}: {exc}"
+        except Exception as zip_error:
+            zip_message = f"❌ 打包失败：{type(zip_error).__name__}: {zip_error}"
 
     mo.md(zip_message or "点击打包后，这里会显示 zip 路径。")
     return zip_message,
