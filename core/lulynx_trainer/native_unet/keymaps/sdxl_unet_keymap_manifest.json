@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "family": "sdxl",
+  "component": "unet",
+  "source_format": "original_sdxl_ldm",
+  "target_format": "lulynx_native_sdxl_unet",
+  "checkpoint_prefix": "model.diffusion_model.",
+  "target_prefix": "",
+  "notes": [
+    "Warehouse manifest generated from public SDXL checkpoint key namespaces and local model inspection.",
+    "Rules describe mapping contracts for future native blocks; they are not copied implementation code."
+  ],
+  "required_source_prefixes": [
+    "model.diffusion_model.time_embed.",
+    "model.diffusion_model.input_blocks.",
+    "model.diffusion_model.middle_block.",
+    "model.diffusion_model.output_blocks.",
+    "model.diffusion_model.out."
+  ],
+  "top_level_rules": [
+    { "source": "time_embed.0.weight", "target": "time_embedding.linear_1.weight" },
+    { "source": "time_embed.0.bias", "target": "time_embedding.linear_1.bias" },
+    { "source": "time_embed.2.weight", "target": "time_embedding.linear_2.weight" },
+    { "source": "time_embed.2.bias", "target": "time_embedding.linear_2.bias" },
+    { "source": "input_blocks.0.0.weight", "target": "conv_in.weight" },
+    { "source": "input_blocks.0.0.bias", "target": "conv_in.bias" },
+    { "source": "out.0.weight", "target": "conv_norm_out.weight" },
+    { "source": "out.0.bias", "target": "conv_norm_out.bias" },
+    { "source": "out.2.weight", "target": "conv_out.weight" },
+    { "source": "out.2.bias", "target": "conv_out.bias" },
+    { "source": "label_emb.0.0.weight", "target": "add_embedding.linear_1.weight", "optional": true },
+    { "source": "label_emb.0.0.bias", "target": "add_embedding.linear_1.bias", "optional": true },
+    { "source": "label_emb.0.2.weight", "target": "add_embedding.linear_2.weight", "optional": true },
+    { "source": "label_emb.0.2.bias", "target": "add_embedding.linear_2.bias", "optional": true }
+  ],
+  "regex_rules": [
+    {
+      "name": "down_resnet",
+      "source_regex": "^input_blocks\\.(?P<input_index>1|2|4|5|7|8)\\.0\\.(?P<leaf>.+)$",
+      "target_template": "down_blocks.{down_block}.resnets.{resnet_index}.{leaf}",
+      "stage": "down",
+      "leaf_replacements": {
+        "in_layers.0": "norm1",
+        "in_layers.2": "conv1",
+        "out_layers.0": "norm2",
+        "out_layers.3": "conv2",
+        "emb_layers.1": "time_emb_proj",
+        "skip_connection": "conv_shortcut"
+      }
+    },
+    {
+      "name": "down_attention",
+      "source_regex": "^input_blocks\\.(?P<input_index>[4-8])\\.1\\.(?P<leaf>.+)$",
+      "target_template": "down_blocks.{down_block}.attentions.{resnet_index}.{leaf}",
+      "stage": "down"
+    },
+    {
+      "name": "downsampler",
+      "source_regex": "^input_blocks\\.(?P<input_index>3|6|9)\\.0\\.op\\.(?P<leaf>.+)$",
+      "target_template": "down_blocks.{down_block}.downsamplers.0.conv.{leaf}",
+      "stage": "down"
+    },
+    {
+      "name": "mid_resnet_0",
+      "source_regex": "^middle_block\\.0\\.(?P<leaf>.+)$",
+      "target_template": "mid_block.resnets.0.{leaf}",
+      "stage": "mid",
+      "leaf_replacements": {
+        "in_layers.0": "norm1",
+        "in_layers.2": "conv1",
+        "out_layers.0": "norm2",
+        "out_layers.3": "conv2",
+        "emb_layers.1": "time_emb_proj",
+        "skip_connection": "conv_shortcut"
+      }
+    },
+    {
+      "name": "mid_attention",
+      "source_regex": "^middle_block\\.1\\.(?P<leaf>.+)$",
+      "target_template": "mid_block.attentions.0.{leaf}",
+      "stage": "mid"
+    },
+    {
+      "name": "mid_resnet_1",
+      "source_regex": "^middle_block\\.2\\.(?P<leaf>.+)$",
+      "target_template": "mid_block.resnets.1.{leaf}",
+      "stage": "mid",
+      "leaf_replacements": {
+        "in_layers.0": "norm1",
+        "in_layers.2": "conv1",
+        "out_layers.0": "norm2",
+        "out_layers.3": "conv2",
+        "emb_layers.1": "time_emb_proj",
+        "skip_connection": "conv_shortcut"
+      }
+    },
+    {
+      "name": "up_resnet",
+      "source_regex": "^output_blocks\\.(?P<output_index>[0-8])\\.0\\.(?P<leaf>.+)$",
+      "target_template": "up_blocks.{up_block}.resnets.{resnet_index}.{leaf}",
+      "stage": "up",
+      "leaf_replacements": {
+        "in_layers.0": "norm1",
+        "in_layers.2": "conv1",
+        "out_layers.0": "norm2",
+        "out_layers.3": "conv2",
+        "emb_layers.1": "time_emb_proj",
+        "skip_connection": "conv_shortcut"
+      }
+    },
+    {
+      "name": "up_attention",
+      "source_regex": "^output_blocks\\.(?P<output_index>[0-7])\\.1\\.(?P<leaf>.+)$",
+      "target_template": "up_blocks.{up_block}.attentions.{resnet_index}.{leaf}",
+      "stage": "up"
+    },
+    {
+      "name": "upsampler",
+      "source_regex": "^output_blocks\\.(?P<output_index>2|5)\\.(?P<slot>1|2)\\.conv\\.(?P<leaf>.+)$",
+      "target_template": "up_blocks.{up_block}.upsamplers.0.conv.{leaf}",
+      "stage": "up"
+    }
+  ],
+  "block_index_formulas": {
+    "down_block": "(input_index - 1) // 3",
+    "down_resnet_index": "(input_index - 1) % 3",
+    "up_block": "output_index // 3",
+    "up_resnet_index": "output_index % 3"
+  },
+  "expected_local_model": "models/sdxl/silentEraFurrymixNAIXL_v10.safetensors",
+  "coverage_expectations": {
+    "min_component_keys": 1500,
+    "min_rule_matches": 1200
+  }
+}
+

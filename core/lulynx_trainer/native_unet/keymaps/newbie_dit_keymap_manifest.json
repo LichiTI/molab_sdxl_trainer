@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "family": "newbie",
+  "component": "dit",
+  "source_format": "newbie_diffusion_safetensors",
+  "target_format": "lulynx_native_newbie_dit",
+  "checkpoint_prefix": "",
+  "target_prefix": "",
+  "notes": [
+    "Warehouse manifest from local Newbie diffusion checkpoint key namespaces.",
+    "The current pass validates key coverage only; tensor conversion comes later."
+  ],
+  "required_source_prefixes": [
+    "layers.",
+    "noise_refiner.",
+    "context_refiner.",
+    "final_layer.",
+    "t_embedder.",
+    "x_embedder."
+  ],
+  "top_level_rules": [
+    { "source": "x_embedder.weight", "target": "patch_embed.proj.weight" },
+    { "source": "x_embedder.bias", "target": "patch_embed.proj.bias", "optional": true },
+    { "source": "t_embedder.mlp.0.weight", "target": "time_embedding.linear_1.weight", "optional": true },
+    { "source": "t_embedder.mlp.0.bias", "target": "time_embedding.linear_1.bias", "optional": true },
+    { "source": "t_embedder.mlp.2.weight", "target": "time_embedding.linear_2.weight", "optional": true },
+    { "source": "t_embedder.mlp.2.bias", "target": "time_embedding.linear_2.bias", "optional": true },
+    { "source": "norm_final.weight", "target": "norm_final.weight", "optional": true },
+    { "source": "final_layer.linear.weight", "target": "final_layer.linear.weight" },
+    { "source": "final_layer.linear.bias", "target": "final_layer.linear.bias", "optional": true },
+    { "source": "final_layer.adaLN_modulation.1.weight", "target": "final_layer.ada_norm.linear.weight" },
+    { "source": "final_layer.adaLN_modulation.1.bias", "target": "final_layer.ada_norm.linear.bias", "optional": true }
+  ],
+  "regex_rules": [
+    {
+      "name": "transformer_attention",
+      "source_regex": "^layers\\.(?P<block_index>\\d+)\\.attention\\.(?P<leaf>.+)$",
+      "target_template": "layers.{block_index}.attention.{leaf}",
+      "stage": "transformer"
+    },
+    {
+      "name": "transformer_feed_forward",
+      "source_regex": "^layers\\.(?P<block_index>\\d+)\\.feed_forward\\.(?P<leaf>.+)$",
+      "target_template": "layers.{block_index}.ff.{leaf}",
+      "stage": "transformer"
+    },
+    {
+      "name": "transformer_norms",
+      "source_regex": "^layers\\.(?P<block_index>\\d+)\\.(?P<leaf>(?:adaLN_modulation|attention_norm1|attention_norm2|ffn_norm1|ffn_norm2)\\..+)$",
+      "target_template": "layers.{block_index}.{leaf}",
+      "stage": "transformer"
+    },
+    {
+      "name": "context_refiner",
+      "source_regex": "^context_refiner\\.(?P<block_index>\\d+)\\.(?P<leaf>.+)$",
+      "target_template": "context_refiner.{block_index}.{leaf}",
+      "stage": "condition_adapter"
+    },
+    {
+      "name": "noise_refiner",
+      "source_regex": "^noise_refiner\\.(?P<block_index>\\d+)\\.(?P<leaf>.+)$",
+      "target_template": "noise_refiner.{block_index}.{leaf}",
+      "stage": "noise_adapter"
+    },
+    {
+      "name": "caption_embedder",
+      "source_regex": "^cap_embedder\\.(?P<leaf>.+)$",
+      "target_template": "caption_embedder.{leaf}",
+      "stage": "condition_adapter"
+    },
+    {
+      "name": "clip_text_pooled_projection",
+      "source_regex": "^clip_text_pooled_proj\\.(?P<leaf>.+)$",
+      "target_template": "clip_text_pooled_proj.{leaf}",
+      "stage": "condition_adapter"
+    },
+    {
+      "name": "time_text_embedding",
+      "source_regex": "^time_text_embed\\.(?P<leaf>.+)$",
+      "target_template": "time_text_embed.{leaf}",
+      "stage": "condition_adapter"
+    },
+    {
+      "name": "time_embedder",
+      "source_regex": "^t_embedder\\.(?P<leaf>.+)$",
+      "target_template": "time_embedding.{leaf}",
+      "stage": "embedding"
+    }
+  ],
+  "expected_local_model": "models/newbie/diffusion_pytorch_model.safetensors",
+  "coverage_expectations": {
+    "min_component_keys": 530,
+    "min_rule_matches": 530,
+    "max_unmatched_keys": 0
+  }
+}
+

@@ -1,0 +1,49 @@
+"""Smoke checks for selected plugin adamp native scratch-kernel parity."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+BACKEND_ROOT = REPO_ROOT / "backend"
+for import_root in (str(REPO_ROOT), str(BACKEND_ROOT)):
+    if import_root not in sys.path:
+        sys.path.insert(0, import_root)
+
+from core.turbocore_plugin_adamp_native_scratch_kernel_scorecard import (  # noqa: E402
+    build_plugin_adamp_native_scratch_kernel_scorecard,
+)
+
+
+def run_smoke() -> dict[str, Any]:
+    report = build_plugin_adamp_native_scratch_kernel_scorecard()
+    assert report["scorecard"] == "turbocore_plugin_adamp_native_scratch_kernel_scorecard_v0", report
+    assert report["ok"] is True, report
+    assert report["adamp_native_kernel_parity"] is True, report
+    assert report["training_path_enabled"] is False, report
+    assert report["native_dispatch_allowed"] is False, report
+    case = report["case"]
+    assert case["optimizer_kind"] == "adamp", case
+    assert case["kernel_executed"] is True, case
+    assert case["native_kernel_parity_ready"] is True, case
+    return {
+        "schema_version": 1,
+        "probe": "turbocore_plugin_adamp_native_scratch_kernel_scorecard_smoke",
+        "ok": True,
+        "summary": report["summary"],
+        "recommended_next_step": report["recommended_next_step"],
+    }
+
+
+def main() -> None:
+    print(json.dumps(run_smoke(), ensure_ascii=False, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
+
+

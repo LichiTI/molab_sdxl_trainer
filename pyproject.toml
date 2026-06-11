@@ -1,0 +1,9 @@
+[project]
+name = "lulynx-sdxl-molab"
+version = "0.1.0"
+description = "Standalone SDXL LoRA training subset exported from Lulynx Trainer for molab."
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*"]

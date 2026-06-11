@@ -1,0 +1,268 @@
+"""TrainingLoop canary for PagedAdamW8bit native dispatch."""
+
+from __future__ import annotations
+
+import importlib.util
+from typing import Any
+from unittest.mock import patch
+
+import torch
+
+from core.lulynx_trainer.training_loop import TrainingLoop
+from core.turbocore_paged_adamw8bit_bnb_exact_parity_scorecard import _step_int
+from core.turbocore_paged_adamw8bit_residency_scorecard import _first_live_state, _make_trainer
+
+
+def build_paged_adamw8bit_training_loop_canary_scorecard() -> dict[str, Any]:
+    if not torch.cuda.is_available():
+        return _blocked("cuda_required_for_paged_adamw8bit_training_loop_canary")
+    if importlib.util.find_spec("bitsandbytes") is None:
+        return _blocked("bitsandbytes_required_for_paged_adamw8bit_training_loop_canary")
+    case = _run_case()
+    ok = bool(case.get("ok", False))
+    blockers = list(case.get("blocked_reasons", []) or [])
+    return {
+        "schema_version": 1,
+        "scorecard": "turbocore_paged_adamw8bit_training_loop_canary_scorecard_v0",
+        "gate": "paged_adamw8bit_training_loop_native_canary",
+        "ok": ok,
+        "promotion_ready": False,
+        "training_path_enabled": False,
+        "default_behavior_changed": False,
+        "native_dispatch_allowed": False,
+        "optimizer_kind": "paged_adamw8bit",
+        "case": case,
+        "summary": {
+            "native_step_count": 1 if case.get("native_step_executed") is True else 0,
+            "native_kernel_launch_count": 1 if case.get("native_kernel_launched") is True else 0,
+            "primed_pytorch_state": bool(case.get("primed_pytorch_state", False)),
+            "step_after_native": case.get("step_after_native"),
+        },
+        "promotion_blockers": blockers + ["product_rollout_review_missing"],
+        "blocked_reasons": blockers,
+        "recommended_next_step": (
+            "measure PagedAdamW8bit product canary overhead and decide rollout scope"
+            if ok
+            else "fix PagedAdamW8bit TrainingLoop canary blockers"
+        ),
+    }
+
+
+def _run_case() -> dict[str, Any]:
+    loop, param, optimizer = _make_loop()
+    optimizer_name = type(optimizer).__name__
+    if optimizer_name == "AdamW":
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "probe": "paged_adamw8bit_training_loop_native_canary_v0",
+            "optimizer_class": optimizer_name,
+            "blocked_reasons": ["paged_adamw8bit_resolved_to_fallback_adamw"],
+        }
+    _prime_optimizer_state(param, optimizer)
+    captured: list[dict[str, Any]] = []
+
+    def _fake_train_step(
+        self: TrainingLoop,
+        _batch: dict[str, Any],
+        accumulation_steps: int = 1,
+        return_loss_tensor: bool = False,
+    ) -> Any:
+        params = self._get_trainable_params()
+        for item in params:
+            item.grad = None
+        scale = 0.71
+        loss = sum(((item.float() * scale) ** 2).mean() + item.float().mean() * 0.013 for item in params)
+        loss = loss / max(int(accumulation_steps or 1), 1)
+        loss.backward()
+        _seed_previous_gate(self)
+        return loss.detach() if return_loss_tensor else float(loss.detach().item())
+
+    loop.on_step_end = lambda _step, _loss, info: captured.append(dict(info))
+    with patch.object(TrainingLoop, "train_step", new=_fake_train_step):
+        result = loop.train_epoch([{}], 0)
+    if not captured:
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "probe": "paged_adamw8bit_training_loop_native_canary_v0",
+            "result": result,
+            "captured_step_count": len(captured),
+            "blocked_reasons": ["paged_training_loop_did_not_emit_step"],
+        }
+    runtime = _runtime_payload(captured[0])
+    training_executor = _executor_payload(runtime)
+    executor_result = training_executor.get("result", {}) if isinstance(training_executor, dict) else {}
+    live_state = _first_live_state(optimizer)
+    native_step = bool(runtime.get("native_step_executed", False))
+    native_kernel = bool(runtime.get("native_kernel_launched", False))
+    step_after = _step_int(live_state.get("step"))
+    ok = bool(
+        result.get("steps") == 1
+        and native_step
+        and native_kernel
+        and not bool(runtime.get("should_call_pytorch_optimizer_step", True))
+        and step_after == 2
+    )
+    return {
+        "schema_version": 1,
+        "ok": ok,
+        "probe": "paged_adamw8bit_training_loop_native_canary_v0",
+        "optimizer_class": optimizer_name,
+        "result": result,
+        "captured_step_count": len(captured),
+        "primed_pytorch_state": True,
+        "native_step_executed": native_step,
+        "native_kernel_launched": native_kernel,
+        "should_call_pytorch_optimizer_step": bool(runtime.get("should_call_pytorch_optimizer_step", True)),
+        "fallback_to_pytorch_required": bool(runtime.get("fallback_to_pytorch_required", True)),
+        "training_executor_called": bool(training_executor.get("called", False)) if isinstance(training_executor, dict) else False,
+        "training_executor_ok": bool(training_executor.get("ok", False)) if isinstance(training_executor, dict) else False,
+        "executor_result_ok": bool(executor_result.get("ok", False)) if isinstance(executor_result, dict) else False,
+        "step_after_native": step_after,
+        "param_dtype": str(param.dtype).replace("torch.", ""),
+        "training_path_enabled": False,
+        "default_behavior_changed": False,
+        "blocked_reasons": [] if ok else _dedupe(list(runtime.get("blocked_reasons", []) or []) + ["paged_training_loop_native_step_missing"]),
+    }
+
+
+def _make_loop() -> tuple[TrainingLoop, torch.nn.Parameter, torch.optim.Optimizer]:
+    values = torch.linspace(-1.0, 1.0, steps=4096, device="cuda", dtype=torch.float32)
+    trainer = _make_trainer(values)
+    param = trainer.lora_injector.param
+    optimizer = trainer._create_optimizer()
+    loop = TrainingLoop(
+        unet=torch.nn.Identity(),
+        text_encoder_1=torch.nn.Identity(),
+        text_encoder_2=None,
+        vae=torch.nn.Identity(),
+        tokenizer_1=None,
+        tokenizer_2=None,
+        noise_scheduler=None,
+        lora_injector=trainer.lora_injector,
+        optimizer=optimizer,
+        lr_scheduler=None,
+        device="cuda",
+        dtype=torch.float32,
+        gradient_accumulation_steps=1,
+        max_grad_norm=0.0,
+        layer_monitor_enabled=False,
+        vram_smart_sensing_enabled=False,
+        turbocore_native_update_mode="native_experimental",
+        turbocore_native_update_required_shadow_passes=1,
+        turbocore_native_update_allow_missing_kernel=True,
+        turbocore_native_update_dispatch_enabled=True,
+        turbocore_native_update_training_path_enabled=True,
+        turbocore_native_update_require_native_cuda=True,
+        turbocore_native_update_quantized_optimizer_kind="paged_adamw8bit",
+    )
+    loop.total_steps = 1
+    return loop, param, optimizer
+
+
+def _prime_optimizer_state(param: torch.nn.Parameter, optimizer: torch.optim.Optimizer) -> None:
+    param.grad = None
+    loss = ((param.float() * 0.37) ** 2).mean() + param.float().mean() * 0.013
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def _seed_previous_gate(loop: TrainingLoop) -> None:
+    loop._turbocore_native_update_dispatch_armer._last_gate_report = _explicit_gate()
+
+
+def _explicit_gate() -> dict[str, Any]:
+    request = {
+        "requested": True,
+        "dispatch_allowed": True,
+        "training_path_enabled": True,
+        "training_path_request": {
+            "request_boundary_ready": True,
+            "explicit_training_path_requested": True,
+        },
+    }
+    contract = {
+        "dispatch_rehearsal_ready": True,
+        "would_allow_native_dispatch": True,
+        "rehearsal": {"would_launch_native_kernel": True},
+        "recovery": {
+            "default_off_recovery_bridge_ready": True,
+            "training_dispatch_recovery_ready": True,
+        },
+        "owner_gradient_sync": _ready_contract("sync_boundary_ready", "owner_gradient_sync_preconditions_ready"),
+        "training_flat_owner": _ready_contract("owner_boundary_ready", "training_flat_owner_preconditions_ready"),
+        "training_dispatch_kernel": _ready_contract("kernel_boundary_ready", "training_dispatch_kernel_preconditions_ready"),
+        "training_executor": {"executor_boundary_ready": True, "training_executor_preconditions_ready": True},
+        "stream_lifetime_ownership": {
+            "ownership_boundary_ready": True,
+            "stream_lifetime_ownership_preconditions_ready": True,
+        },
+        "evidence": {
+            "owner_native_launch_ok": True,
+            "copyback_dispatch_validated": True,
+            "event_chain_verified": True,
+            "stream_ordering_verified": True,
+            "representative_performance_gate_ready": True,
+        },
+        "blocked_reasons": [],
+    }
+    return {
+        "dispatch_request": request,
+        "dispatch_contract": contract,
+        "kernel_launch_plan": {
+            "launch_allowed": True,
+            "evidence": {"diagnostic_kernel_executed": True, "diagnostic_parity_ok": True},
+        },
+    }
+
+
+def _ready_contract(boundary: str, precondition: str) -> dict[str, Any]:
+    return {
+        boundary: True,
+        precondition: True,
+        "native_supported": True,
+        "training_lifecycle_integrated": True,
+    }
+
+
+def _runtime_payload(step_info: dict[str, Any]) -> dict[str, Any]:
+    value = step_info.get("turbocore_native_update_dispatch_runtime", {})
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _executor_payload(runtime: dict[str, Any]) -> dict[str, Any]:
+    value = runtime.get("training_executor", {})
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _blocked(reason: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "scorecard": "turbocore_paged_adamw8bit_training_loop_canary_scorecard_v0",
+        "gate": "paged_adamw8bit_training_loop_native_canary",
+        "ok": False,
+        "promotion_ready": False,
+        "training_path_enabled": False,
+        "default_behavior_changed": False,
+        "native_dispatch_allowed": False,
+        "optimizer_kind": "paged_adamw8bit",
+        "case": {},
+        "summary": {"native_step_count": 0, "native_kernel_launch_count": 0, "primed_pytorch_state": False},
+        "promotion_blockers": [reason],
+        "blocked_reasons": [reason],
+        "recommended_next_step": "run PagedAdamW8bit TrainingLoop canary on CUDA with bitsandbytes",
+    }
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    out: list[str] = []
+    for value in values:
+        text = str(value or "")
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+__all__ = ["build_paged_adamw8bit_training_loop_canary_scorecard"]

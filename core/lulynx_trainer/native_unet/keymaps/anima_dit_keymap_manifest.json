@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "family": "anima",
+  "component": "dit",
+  "source_format": "anima_diffusion_safetensors",
+  "target_format": "lulynx_native_anima_dit",
+  "checkpoint_prefix": "net.",
+  "target_prefix": "",
+  "notes": [
+    "Warehouse manifest from local Anima diffusion checkpoint key namespaces.",
+    "This is a mapping contract only; it does not copy model implementation code."
+  ],
+  "required_source_prefixes": [
+    "net.blocks.",
+    "net.llm_adapter.",
+    "net.final_layer.",
+    "net.t_embedder.",
+    "net.x_embedder."
+  ],
+  "top_level_rules": [
+    { "source": "t_embedder.0.weight", "target": "time_embedding.linear_1.weight" },
+    { "source": "t_embedder.2.weight", "target": "time_embedding.linear_2.weight", "optional": true },
+    { "source": "t_embedder.1.linear_1.weight", "target": "time_embedding.mlp.linear_1.weight" },
+    { "source": "t_embedder.1.linear_2.weight", "target": "time_embedding.mlp.linear_2.weight" },
+    { "source": "t_embedding_norm.weight", "target": "time_embedding_norm.weight", "optional": true },
+    { "source": "x_embedder.weight", "target": "patch_embed.proj.weight" },
+    { "source": "x_embedder.proj.1.weight", "target": "patch_embed.proj.1.weight" },
+    { "source": "final_layer.linear.weight", "target": "final_layer.linear.weight" },
+    { "source": "final_layer.linear.bias", "target": "final_layer.linear.bias", "optional": true },
+    { "source": "final_layer.adaln_modulation.1.weight", "target": "final_layer.ada_norm.linear.weight" },
+    { "source": "final_layer.adaln_modulation.2.weight", "target": "final_layer.ada_norm.proj.weight" },
+    { "source": "final_layer.adaln_modulation.1.bias", "target": "final_layer.ada_norm.linear.bias", "optional": true }
+  ],
+  "regex_rules": [
+    {
+      "name": "transformer_self_attention",
+      "source_regex": "^blocks\\.(?P<block_index>\\d+)\\.self_attn\\.(?P<leaf>.+)$",
+      "target_template": "blocks.{block_index}.self_attn.{leaf}",
+      "stage": "transformer"
+    },
+    {
+      "name": "transformer_cross_attention",
+      "source_regex": "^blocks\\.(?P<block_index>\\d+)\\.cross_attn\\.(?P<leaf>.+)$",
+      "target_template": "blocks.{block_index}.cross_attn.{leaf}",
+      "stage": "transformer"
+    },
+    {
+      "name": "transformer_mlp",
+      "source_regex": "^blocks\\.(?P<block_index>\\d+)\\.mlp\\.(?P<leaf>.+)$",
+      "target_template": "blocks.{block_index}.ff.{leaf}",
+      "stage": "transformer"
+    },
+    {
+      "name": "transformer_adaln",
+      "source_regex": "^blocks\\.(?P<block_index>\\d+)\\.adaln_modulation_(?P<branch>self_attn|cross_attn|mlp)\\.(?P<leaf>.+)$",
+      "target_template": "blocks.{block_index}.ada_norm_{branch}.{leaf}",
+      "stage": "transformer"
+    },
+    {
+      "name": "llm_adapter_blocks",
+      "source_regex": "^llm_adapter\\.blocks\\.(?P<block_index>\\d+)\\.(?P<leaf>.+)$",
+      "target_template": "llm_adapter.blocks.{block_index}.{leaf}",
+      "stage": "condition_adapter"
+    },
+    {
+      "name": "llm_adapter_top_level",
+      "source_regex": "^llm_adapter\\.(?P<leaf>.+)$",
+      "target_template": "llm_adapter.{leaf}",
+      "stage": "condition_adapter"
+    }
+  ],
+  "expected_local_model": "models/anima/diffusion_models/anima-preview2.safetensors",
+  "coverage_expectations": {
+    "min_component_keys": 680,
+    "min_rule_matches": 680,
+    "max_unmatched_keys": 0
+  }
+}
+

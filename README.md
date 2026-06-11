@@ -1,86 +1,49 @@
-# Lulynx SDXL LoRA Molab 精简仓库脚手架
+# Lulynx SDXL LoRA Molab Trainer
 
-这个目录用于把当前项目中 **SDXL LoRA 训练所需的后端核心** 单独导出成一个可上传到 GitHub、再给 molab 使用的轻量仓库。
+这是从 Lulynx Trainer 后端中拆出的 **SDXL LoRA 训练专用 molab 仓库**。
 
-> 说明：你把 `plugin/lora-scripts-ui-main` 称为前端；本方案不包含前端、不包含 Launcher/WPF、不包含 WebUI，只保留训练引擎入口和 molab 辅助脚本。
+本仓库不包含前端 `plugin/lora-scripts-ui-main`，也不启动 WebUI / Launcher。molab 上直接使用 marimo notebook 或命令行控制训练。
 
-## 为什么不是只复制几个文件？
+## 仓库结构
 
-当前 SDXL LoRA 训练入口是：
+```text
+core/                         # 训练核心，来自原项目 backend/core
+configs/
+  sdxl_lora_minimal.json       # 最小 SDXL LoRA 配置模板
+notebooks/
+  molab_sdxl_lora.py           # molab / marimo 交互训练面板
+scripts/
+  run_sdxl_train.py            # 命令行训练启动器
+requirements-molab.txt         # molab 依赖
+work/
+  models/                      # 放 SDXL 底模，不要提交到 GitHub
+  datasets/                    # 放训练集，不要提交到 GitHub
+  outputs/                     # 训练输出，不要提交到 GitHub
+  logs/                        # 日志，不要提交到 GitHub
+  runs/                        # 每次训练的运行配置和状态
+```
 
-```bash
+只要仓库根目录下存在：
+
+```text
 core/entry_train.py
-```
-
-它会进入：
-
-```text
-core/lulynx_trainer/
-```
-
-其中 SDXL LoRA 路线和通用训练循环、数据集读取、LoRA 注入、优化器、缓存、保存、低显存策略等耦合较深。直接手工挑 10～20 个文件很容易漏动态导入或配置兼容层。所以第一版推荐导出：
-
-```text
-core/                    # 由原 backend/core 复制而来
 scripts/run_sdxl_train.py
-configs/sdxl_lora_minimal.json
-requirements-molab.txt
-notebooks/molab_sdxl_lora.py
 ```
 
-这已经去掉了：
+就不再依赖原始大项目工作区。
 
-- 前端 `plugin/lora-scripts-ui-main`
-- Launcher/WPF/Tauri/Monitor
-- Web API routers
-- 安装器、资源包、开发文档
+## molab 快速使用
 
-但保留 `core/` 训练引擎，确保 SDXL LoRA 能跑。
-
-## 导出步骤
-
-在当前大项目根目录执行：
-
-```bash
-python molab_sdxl_trainer/scripts/export_molab_sdxl_repo.py --out dist/lulynx-sdxl-molab
-```
-
-导出后得到：
-
-```text
-dist/lulynx-sdxl-molab/
-├── core/
-├── configs/
-│   └── sdxl_lora_minimal.json
-├── notebooks/
-│   └── molab_sdxl_lora.py
-├── scripts/
-│   └── run_sdxl_train.py
-├── requirements-molab.txt
-├── pyproject.toml
-├── .gitignore
-└── README.md
-```
-
-然后进入导出目录，新建 GitHub 仓库并推送：
-
-```bash
-cd dist/lulynx-sdxl-molab
-git init
-git add .
-git commit -m "Initial SDXL LoRA molab trainer"
-git branch -M main
-git remote add origin https://github.com/<你的用户名>/<你的仓库名>.git
-git push -u origin main
-```
-
-## molab 上使用
-
-在 molab notebook 中：
+在 molab 中 clone 你的仓库：
 
 ```bash
 git clone https://github.com/<你的用户名>/<你的仓库名>.git
 cd <你的仓库名>
+```
+
+安装依赖：
+
+```bash
 pip install -r requirements-molab.txt
 ```
 
@@ -93,29 +56,38 @@ print(torch.cuda.is_available())
 print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no cuda")
 ```
 
-准备目录：
+推荐打开交互 notebook：
 
 ```text
-work/
-├── models/
-│   └── sd_xl_base_1.0.safetensors
-├── datasets/
-│   └── my_lora/
-│       └── 10_character/
-│           ├── 0001.png
-│           ├── 0001.txt
-│           ├── 0002.png
-│           └── 0002.txt
-├── outputs/
-├── logs/
-└── runs/
+notebooks/molab_sdxl_lora.py
 ```
 
-修改 `configs/sdxl_lora_minimal.json` 里的：
+在 notebook 中可以完成：
+
+1. 检查 Python / Torch / CUDA / GPU
+2. 可选从 Hugging Face 下载 SDXL 底模
+3. 填写模型路径、数据集路径、输出名
+4. 设置 rank、alpha、分辨率、epoch、学习率、optimizer
+5. 设置 bucket、cache、混合精度、低显存策略
+6. 预检模型和数据集
+7. 写出训练配置 JSON
+8. 生成启动命令
+9. 可选直接启动训练或打包输出
+
+## 命令行训练
+
+如果不用 notebook，也可以直接改：
+
+```text
+configs/sdxl_lora_minimal.json
+```
+
+重点字段：
 
 ```json
 {
   "pretrained_model_name_or_path": "work/models/sd_xl_base_1.0.safetensors",
+  "base_model_path": "work/models/sd_xl_base_1.0.safetensors",
   "train_data_dir": "work/datasets/my_lora",
   "output_dir": "work/outputs",
   "logging_dir": "work/logs",
@@ -123,15 +95,27 @@ work/
 }
 ```
 
-启动训练：
+然后运行：
 
 ```bash
 python scripts/run_sdxl_train.py --config configs/sdxl_lora_minimal.json
 ```
 
+启动脚本会自动创建：
+
+```text
+work/runs/<时间戳>-<输出名>/config.json
+```
+
+并将该运行配置传给：
+
+```text
+core/entry_train.py
+```
+
 ## 数据集格式
 
-兼容 sd-scripts 风格 subset：
+推荐使用 sd-scripts 风格目录：
 
 ```text
 work/datasets/my_lora/
@@ -142,17 +126,41 @@ work/datasets/my_lora/
     └── 0002.txt
 ```
 
-`10_character` 中 `10` 表示 repeats，`character` 是概念名。每张图片可以有同名 `.txt` caption。
+`10_character` 中的 `10` 表示 repeats，后半部分是概念名。同名 `.txt` 是 caption。
 
-## 推荐先关闭的功能
+## 首次跑通推荐参数
 
-为了 molab 首次跑通，建议第一版配置里保持：
+首次建议保守一点：
 
-- 不用 WebUI
-- 不启用 `torch_compile`
-- 不启用 `xformers/flash-attn/sageattention`
-- 不启用复杂插件优化器
-- 不启用预览采样
-- 先用 `AdamW8bit` 或 `AdamW`
+```json
+{
+  "network_dim": 16,
+  "network_alpha": 8,
+  "resolution": "1024,1024",
+  "train_batch_size": 1,
+  "gradient_accumulation_steps": 1,
+  "optimizer_type": "AdamW8bit",
+  "mixed_precision": "bf16",
+  "gradient_checkpointing": true,
+  "cache_latents": true,
+  "cache_latents_to_disk": true,
+  "attention_backend": "sdpa",
+  "xformers": false,
+  "torch_compile": false,
+  "sample_every": false
+}
+```
 
-跑通后再逐步打开 cache、低显存策略或采样预览。
+跑通后再逐步尝试更高 rank、更大 batch、采样预览或低显存策略。
+
+## 更新 GitHub
+
+如果你已经把这个文件夹作为独立仓库，更新时在该仓库根目录执行：
+
+```bash
+git add .
+git commit -m "Add standalone core and interactive molab notebook"
+git push
+```
+
+注意 `.gitignore` 已排除模型、数据集和输出，请不要把 `.safetensors`、训练集图片、输出 LoRA 直接提交到 GitHub。

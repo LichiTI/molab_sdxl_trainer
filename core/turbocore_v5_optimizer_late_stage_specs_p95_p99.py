@@ -1,0 +1,302 @@
+"""Stage specs for optimizer late-stage contracts P95-P99."""
+
+from __future__ import annotations
+
+from core.turbocore_v5_optimizer_late_stage_contract_utils import OptimizerLateStageSpec
+
+
+BASE_UNSAFE_TRUE_FIELDS = (
+    "optimizer_kernel_launch_applied",
+    "optimizer_kernel_launch_enabled",
+    "optimizer_kernel_launch_executed",
+    "optimizer_tensor_transfer_applied",
+    "optimizer_tensor_transfer_enabled",
+    "optimizer_tensor_transfer_executed",
+    "optimizer_parity_applied",
+    "optimizer_parity_enabled",
+    "optimizer_parity_executed",
+    "kernel_launch_requested",
+    "kernel_launch_submitted",
+    "kernel_launch_executed",
+    "tensor_transfer_requested",
+    "tensor_transfer_submitted",
+    "tensor_transfer_executed",
+    "parity_execution_requested",
+    "parity_execution_executed",
+    "training_step_requested",
+    "training_step_executed",
+    "training_launch_requested",
+    "training_launch_executed",
+    "training_job_created",
+    "run_dispatched",
+    "request_adapter_enabled",
+    "request_fields_emitted",
+    "schema_config_router_ui_patched",
+    "ui_route_registered",
+    "ui_exposure_allowed",
+    "default_rollout_allowed",
+    "auto_rollout_allowed",
+)
+BASE_UNSAFE_NON_EMPTY_FIELDS = (
+    "optimizer_kernel_launch_payload",
+    "optimizer_tensor_transfer_payload",
+    "optimizer_parity_payload",
+    "kernel_launch_payload",
+    "tensor_transfer_payload",
+    "parity_execution_payload",
+    "training_step_payload",
+    "training_launch_payload",
+    "request_field_payload",
+    "schema_config_router_ui_patch_payload",
+)
+COMMON_SECTIONS = (
+    "kernel_launch_boundary_inventory",
+    "tensor_transfer_boundary_inventory",
+    "parity_boundary_inventory",
+    "training_step_boundary_inventory",
+    "training_launch_boundary_inventory",
+    "request_schema_router_ui_boundary_inventory",
+    "default_rollout_boundary_inventory",
+    "rollback_policy_summary",
+    "observability_summary",
+    "no_kernel_launch_execution_boundary",
+    "no_tensor_transfer_execution_boundary",
+    "no_parity_execution_boundary",
+    "no_training_step_or_launch_boundary",
+    "no_request_field_emission_boundary",
+    "no_schema_config_router_ui_patch_boundary",
+    "no_default_rollout_boundary",
+)
+
+
+def _sections(previous: str, package: str, rows: str) -> tuple[str, ...]:
+    return (previous, package, rows, *COMMON_SECTIONS)
+
+
+def _unsafe(*fields: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(fields))
+
+
+P95_SPEC = OptimizerLateStageSpec(
+    stage_id=95,
+    token="optimizer_training_step",
+    scope="optimizer_training_step_contract",
+    title="optimizer training-step",
+    previous_token="optimizer_parity",
+    previous_label="P94 optimizer parity contract",
+    previous_ready_decision="optimizer_parity_contract_p94_recorded_default_off",
+    previous_ready_field="optimizer_parity_contract_ready",
+    previous_evidence_field="optimizer_parity_evidence_recorded",
+    previous_signed_field="optimizer_parity_signed",
+    previous_post_fields="post_p94_request_fields",
+    previous_ack="acknowledge_p94_optimizer_parity_contract_recorded",
+    package_ready_field="optimizer_training_step_package_ready",
+    policy_ready_field="training_step_policy_ready",
+    row_keys=("optimizer_training_step_rows", "optimizer_training_rows"),
+    row_ready_field="training_step_review_ready",
+    later_field="later_optimizer_training_launch_contract_required",
+    later_ack="acknowledge_later_optimizer_training_launch_contract_required",
+    next_contract="optimizer_training_launch",
+    allowed_intents=frozenset({"training_step_candidate", "hold_for_more_evidence", "reject_training_step"}),
+    required_sections=_sections(
+        "p94_optimizer_parity_contract_reference",
+        "optimizer_training_step_package",
+        "per_optimizer_training_step_rows",
+    ),
+    unsafe_true_fields=_unsafe(
+        "optimizer_training_step_applied",
+        "optimizer_training_step_enabled",
+        "optimizer_training_step_executed",
+        "training_step_requested",
+        "training_step_submitted",
+        "training_step_executed",
+        "training_launch_requested",
+        "training_launch_executed",
+    ),
+    unsafe_non_empty_fields=_unsafe("optimizer_training_step_payload", "training_step_payload", "training_launch_payload"),
+    inherited_unsafe_true_fields=BASE_UNSAFE_TRUE_FIELDS,
+    inherited_unsafe_non_empty_fields=BASE_UNSAFE_NON_EMPTY_FIELDS,
+)
+
+
+P96_SPEC = OptimizerLateStageSpec(
+    stage_id=96,
+    token="optimizer_training_launch",
+    scope="optimizer_training_launch_contract",
+    title="optimizer training-launch",
+    previous_token="optimizer_training_step",
+    previous_label="P95 optimizer training-step contract",
+    previous_ready_decision=P95_SPEC.ready_decision,
+    previous_ready_field="optimizer_training_step_contract_ready",
+    previous_evidence_field="optimizer_training_step_evidence_recorded",
+    previous_signed_field="optimizer_training_step_signed",
+    previous_post_fields="post_p95_request_fields",
+    previous_ack="acknowledge_p95_optimizer_training_step_contract_recorded",
+    package_ready_field="optimizer_training_launch_package_ready",
+    policy_ready_field="training_launch_policy_ready",
+    row_keys=("optimizer_training_launch_rows", "optimizer_launch_rows"),
+    row_ready_field="training_launch_review_ready",
+    later_field="later_optimizer_rollout_default_enable_contract_required",
+    later_ack="acknowledge_later_optimizer_rollout_default_enable_contract_required",
+    next_contract="optimizer_rollout_default_enable",
+    allowed_intents=frozenset({"training_launch_candidate", "hold_for_more_evidence", "reject_training_launch"}),
+    required_sections=_sections(
+        "p95_optimizer_training_step_contract_reference",
+        "optimizer_training_launch_package",
+        "per_optimizer_training_launch_rows",
+    ),
+    unsafe_true_fields=_unsafe(
+        "optimizer_training_launch_applied",
+        "optimizer_training_launch_enabled",
+        "optimizer_training_launch_executed",
+        "training_launch_requested",
+        "training_launch_submitted",
+        "training_launch_executed",
+        "training_job_created",
+        "run_dispatched",
+    ),
+    unsafe_non_empty_fields=_unsafe("optimizer_training_launch_payload", "training_launch_payload", "training_job_payload"),
+    inherited_unsafe_true_fields=P95_SPEC.all_unsafe_true_fields,
+    inherited_unsafe_non_empty_fields=P95_SPEC.all_unsafe_non_empty_fields,
+)
+
+
+P97_SPEC = OptimizerLateStageSpec(
+    stage_id=97,
+    token="optimizer_rollout_default_enable",
+    scope="optimizer_rollout_default_enable_contract",
+    title="optimizer rollout/default-enable",
+    previous_token="optimizer_training_launch",
+    previous_label="P96 optimizer training-launch contract",
+    previous_ready_decision=P96_SPEC.ready_decision,
+    previous_ready_field="optimizer_training_launch_contract_ready",
+    previous_evidence_field="optimizer_training_launch_evidence_recorded",
+    previous_signed_field="optimizer_training_launch_signed",
+    previous_post_fields="post_p96_request_fields",
+    previous_ack="acknowledge_p96_optimizer_training_launch_contract_recorded",
+    package_ready_field="optimizer_rollout_default_enable_package_ready",
+    policy_ready_field="rollout_default_enable_policy_ready",
+    row_keys=("optimizer_rollout_default_enable_rows", "optimizer_rollout_rows"),
+    row_ready_field="rollout_default_enable_review_ready",
+    later_field="later_optimizer_product_request_ui_integration_contract_required",
+    later_ack="acknowledge_later_optimizer_product_request_ui_integration_contract_required",
+    next_contract="optimizer_product_request_ui_integration",
+    allowed_intents=frozenset({"rollout_default_enable_candidate", "hold_for_more_evidence", "reject_rollout_default_enable"}),
+    required_sections=_sections(
+        "p96_optimizer_training_launch_contract_reference",
+        "optimizer_rollout_default_enable_package",
+        "per_optimizer_rollout_default_enable_rows",
+    ),
+    unsafe_true_fields=_unsafe(
+        "optimizer_rollout_default_enable_applied",
+        "optimizer_rollout_default_enable_enabled",
+        "default_enable_requested",
+        "default_behavior_changed",
+        "training_path_enabled",
+        "default_rollout_allowed",
+        "auto_rollout_allowed",
+    ),
+    unsafe_non_empty_fields=_unsafe("optimizer_rollout_default_enable_payload", "rollout_default_enable_payload"),
+    inherited_unsafe_true_fields=P96_SPEC.all_unsafe_true_fields,
+    inherited_unsafe_non_empty_fields=P96_SPEC.all_unsafe_non_empty_fields,
+)
+
+
+P98_SPEC = OptimizerLateStageSpec(
+    stage_id=98,
+    token="optimizer_product_request_ui_integration",
+    scope="optimizer_product_request_ui_integration_contract",
+    title="optimizer product/request/UI integration",
+    previous_token="optimizer_rollout_default_enable",
+    previous_label="P97 optimizer rollout/default-enable contract",
+    previous_ready_decision=P97_SPEC.ready_decision,
+    previous_ready_field="optimizer_rollout_default_enable_contract_ready",
+    previous_evidence_field="optimizer_rollout_default_enable_evidence_recorded",
+    previous_signed_field="optimizer_rollout_default_enable_signed",
+    previous_post_fields="post_p97_request_fields",
+    previous_ack="acknowledge_p97_optimizer_rollout_default_enable_contract_recorded",
+    package_ready_field="optimizer_product_request_ui_integration_package_ready",
+    policy_ready_field="product_request_ui_integration_policy_ready",
+    row_keys=("optimizer_product_request_ui_integration_rows", "optimizer_product_ui_rows"),
+    row_ready_field="product_request_ui_integration_review_ready",
+    later_field="later_optimizer_request_adapter_activation_contract_required",
+    later_ack="acknowledge_later_optimizer_request_adapter_activation_contract_required",
+    next_contract="optimizer_request_adapter_activation",
+    allowed_intents=frozenset({"product_request_ui_integration_candidate", "hold_for_more_evidence", "reject_product_request_ui_integration"}),
+    required_sections=_sections(
+        "p97_optimizer_rollout_default_enable_contract_reference",
+        "optimizer_product_request_ui_integration_package",
+        "per_optimizer_product_request_ui_integration_rows",
+    ),
+    unsafe_true_fields=_unsafe(
+        "optimizer_product_request_ui_integration_applied",
+        "product_integration_enabled",
+        "request_adapter_enabled",
+        "request_fields_emitted",
+        "schema_config_router_ui_patched",
+        "ui_route_registered",
+        "ui_exposure_allowed",
+    ),
+    unsafe_non_empty_fields=_unsafe(
+        "optimizer_product_request_ui_integration_payload",
+        "request_field_payload",
+        "schema_config_router_ui_patch_payload",
+        "ui_route_payload",
+    ),
+    inherited_unsafe_true_fields=P97_SPEC.all_unsafe_true_fields,
+    inherited_unsafe_non_empty_fields=P97_SPEC.all_unsafe_non_empty_fields,
+)
+
+
+P99_SPEC = OptimizerLateStageSpec(
+    stage_id=99,
+    token="optimizer_request_adapter_activation",
+    scope="optimizer_request_adapter_activation_contract",
+    title="optimizer request-adapter activation",
+    previous_token="optimizer_product_request_ui_integration",
+    previous_label="P98 optimizer product/request/UI integration contract",
+    previous_ready_decision=P98_SPEC.ready_decision,
+    previous_ready_field="optimizer_product_request_ui_integration_contract_ready",
+    previous_evidence_field="optimizer_product_request_ui_integration_evidence_recorded",
+    previous_signed_field="optimizer_product_request_ui_integration_signed",
+    previous_post_fields="post_p98_request_fields",
+    previous_ack="acknowledge_p98_optimizer_product_request_ui_integration_contract_recorded",
+    package_ready_field="optimizer_request_adapter_activation_package_ready",
+    policy_ready_field="request_adapter_activation_policy_ready",
+    row_keys=("optimizer_request_adapter_activation_rows", "optimizer_request_adapter_rows"),
+    row_ready_field="request_adapter_activation_review_ready",
+    later_field="later_optimizer_request_field_emission_contract_required",
+    later_ack="acknowledge_later_optimizer_request_field_emission_contract_required",
+    next_contract="optimizer_request_field_emission",
+    allowed_intents=frozenset({"request_adapter_activation_candidate", "hold_for_more_evidence", "reject_request_adapter_activation"}),
+    required_sections=_sections(
+        "p98_optimizer_product_request_ui_integration_contract_reference",
+        "optimizer_request_adapter_activation_package",
+        "per_optimizer_request_adapter_activation_rows",
+    ),
+    unsafe_true_fields=_unsafe(
+        "optimizer_request_adapter_activation_applied",
+        "request_adapter_enabled",
+        "request_adapter_registered",
+        "request_fields_emitted",
+        "request_submitted",
+        "schema_config_router_ui_patched",
+        "backend_router_registered",
+        "ui_route_registered",
+        "ui_exposure_allowed",
+    ),
+    unsafe_non_empty_fields=_unsafe(
+        "optimizer_request_adapter_activation_payload",
+        "request_field_payload",
+        "request_payload",
+        "schema_config_router_ui_patch_payload",
+    ),
+    inherited_unsafe_true_fields=P98_SPEC.all_unsafe_true_fields,
+    inherited_unsafe_non_empty_fields=P98_SPEC.all_unsafe_non_empty_fields,
+)
+
+
+P95_P99_SPECS = (P95_SPEC, P96_SPEC, P97_SPEC, P98_SPEC, P99_SPEC)
+
+
+__all__ = ["P95_SPEC", "P96_SPEC", "P97_SPEC", "P98_SPEC", "P99_SPEC", "P95_P99_SPECS"]

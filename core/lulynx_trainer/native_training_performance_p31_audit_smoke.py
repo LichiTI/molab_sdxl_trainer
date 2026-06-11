@@ -1,0 +1,60 @@
+"""Smoke checks for Native Training Performance V2-P31 audit."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+BACKEND_ROOT = REPO_ROOT / "backend"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from devtools.audit_native_training_performance_p31 import (  # noqa: E402
+    P23_AUDIT_BUILDER,
+    build_p31_automagicpp_e2e_shadow_matrix_audit,
+)
+
+
+def run_smoke() -> dict[str, Any]:
+    report = build_p31_automagicpp_e2e_shadow_matrix_audit(quick=True)
+    gates = report["progress_gates"]
+    summary = report["summary"]
+    assert report["ok"] is True, report
+    assert report["milestone_completed"] is True, report
+    assert report["report_only"] is True, report
+    assert report["native_call_performed_by_p31"] is False, report
+    assert report["p23_audit_builder"] == P23_AUDIT_BUILDER, report
+    assert gates["p23_training_loop_canary_dependency_named"] is True, gates
+    assert gates["e2e_shadow_matrix_scaffold"] is True, gates
+    assert gates["fallback_backend_authoritative"] is True, gates
+    assert gates["native_shadow_training_does_not_mutate_authority"] is True, gates
+    assert gates["report_only_no_native_call"] is True, gates
+    assert gates["runtime_dispatch_not_enabled"] is True, gates
+    assert gates["default_behavior_unchanged"] is True, gates
+    assert report["remaining_blockers"] == [], report
+    assert summary["fallback_backend"] == "python_automagicpp", summary
+    assert summary["fallback_backend_authoritative"] is True, summary
+    assert summary["native_shadow_training_mutates_authority"] is False, summary
+    assert summary["runtime_dispatch_not_enabled"] is True, summary
+    assert summary["default_behavior_unchanged"] is True, summary
+    return {
+        "schema_version": 1,
+        "probe": "native_training_performance_p31_audit_smoke",
+        "ok": True,
+        "progress_gates": gates,
+        "recommended_next_step": summary["recommended_next_step"],
+    }
+
+
+def main() -> None:
+    print(json.dumps(run_smoke(), ensure_ascii=False, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
