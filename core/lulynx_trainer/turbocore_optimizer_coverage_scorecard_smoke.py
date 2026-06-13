@@ -439,9 +439,6 @@ def run_rebuild_smoke() -> dict[str, Any]:
 def _validate_coverage_report(report: dict[str, Any], *, artifact_mode: str) -> dict[str, Any]:
     rows = {str(row["optimizer_type"]): row for row in report["rows"]}
     simple_batch = report.get("simple_optimizer_family_batch") or {}
-    simple_state_machine_reference_ready = (
-        int(simple_batch.get("variant_state_machine_reference_ready_count", 0) or 0) > 0
-    )
     assert report["ok"] is True, report
     assert report["evidence_ready"] is True, report
     assert report["promotion_ready"] is True, report
@@ -512,16 +509,16 @@ def _validate_coverage_report(report: dict[str, Any], *, artifact_mode: str) -> 
     ), rows["Automagic++"]
     assert (
         rows["AutoProdigy"]["turbocore_status"]
-        == "adaptive_lr_request_schema_ui_non_exposure_ready"
+        == "adaptive_lr_state_machine_reference_ready"
     ), rows["AutoProdigy"]
     assert rows["Muon"]["turbocore_status"] == "model_shape_aware_request_schema_ui_non_exposure_ready", rows["Muon"]
     assert (
         rows["DAdaptAdam"]["turbocore_status"]
-        == "adaptive_lr_request_schema_ui_non_exposure_ready"
+        == "adaptive_lr_state_machine_reference_ready"
     ), rows["DAdaptAdam"]
     assert (
         rows["prodigyplus.ProdigyPlusScheduleFree"]["turbocore_status"]
-        == "adaptive_lr_request_schema_ui_non_exposure_ready"
+        == "adaptive_lr_state_machine_reference_ready"
     ), rows["prodigyplus.ProdigyPlusScheduleFree"]
     assert (
         rows["AnimaFactoredAdamW"]["turbocore_status"]
@@ -531,105 +528,37 @@ def _validate_coverage_report(report: dict[str, Any], *, artifact_mode: str) -> 
         rows["adafactor"]["turbocore_status"]
         == "factored_custom_request_schema_ui_non_exposure_ready"
     ), rows["adafactor"]
-    expected_simple_status = "simple_formula_request_schema_ui_non_exposure_ready"
+    expected_simple_status = "simple_formula_native_dispatch_canary_ready"
     assert rows["Lion"]["turbocore_status"] == expected_simple_status, rows["Lion"]
     assert rows["SGDNesterov"]["turbocore_status"] == expected_simple_status, rows["SGDNesterov"]
-    assert rows["Lion8bit"]["turbocore_status"] == expected_simple_status, rows["Lion8bit"]
-    assert rows["PagedLion8bit"]["turbocore_status"] == expected_simple_status, rows["PagedLion8bit"]
-    assert rows["SGDNesterov8bit"]["turbocore_status"] == expected_simple_status, rows["SGDNesterov8bit"]
-    if simple_state_machine_reference_ready:
-        assert rows["RAdamScheduleFree"]["turbocore_status"] == expected_simple_status, rows["RAdamScheduleFree"]
-        assert rows["SGDScheduleFree"]["turbocore_status"] == expected_simple_status, rows["SGDScheduleFree"]
-    else:
-        assert rows["RAdamScheduleFree"]["turbocore_status"] == "simple_update_research", rows["RAdamScheduleFree"]
-        assert rows["SGDScheduleFree"]["turbocore_status"] == "simple_update_research", rows["SGDScheduleFree"]
-    assert report["summary"]["simple_formula_native_dispatch_canary_ready_count"] == 0, report
-    assert report["summary"]["simple_formula_native_batch_canary_ready_count"] == 2, report
-    assert report["summary"]["simple_formula_representative_product_training_canary_ready_count"] == 2, report
-    assert report["summary"]["simple_formula_owner_release_hold_ready_count"] == 2, report
-    assert report["summary"]["simple_formula_request_schema_ui_non_exposure_ready_count"] == 7, report
+    assert rows["Lion8bit"]["turbocore_status"] == "simple_update_research", rows["Lion8bit"]
+    assert rows["PagedLion8bit"]["turbocore_status"] == "simple_update_research", rows["PagedLion8bit"]
+    assert rows["SGDNesterov8bit"]["turbocore_status"] == "simple_update_research", rows["SGDNesterov8bit"]
+    assert rows["RAdamScheduleFree"]["turbocore_status"] == "simple_update_research", rows["RAdamScheduleFree"]
+    assert rows["SGDScheduleFree"]["turbocore_status"] == "simple_update_research", rows["SGDScheduleFree"]
+    assert report["summary"]["simple_formula_native_dispatch_canary_ready_count"] == 2, report
+    assert report["summary"]["simple_formula_native_batch_canary_ready_count"] == 0, report
+    assert report["summary"]["simple_formula_representative_product_training_canary_ready_count"] == 0, report
+    assert report["summary"]["simple_formula_owner_release_hold_ready_count"] == 0, report
+    assert report["summary"]["simple_formula_request_schema_ui_non_exposure_ready_count"] == 0, report
     assert report["summary"]["simple_formula_request_schema_ui_optimizer_count"] == 7, report
     assert report["summary"]["simple_formula_request_schema_ui_forbidden_token_hit_count"] == 0, report
     assert report["summary"]["simple_formula_request_schema_ui_product_native_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_state_machine_reference_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_state_machine_reference_artifact_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_state_machine_replay_matrix_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_state_machine_replay_executor_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_state_machine_replay_executor_artifact_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_native_state_machine_abi_precondition_review_ready_count"] == 0, report
-    assert (
-        report["summary"]["adaptive_lr_native_state_machine_abi_precondition_review_artifact_ready_count"] == 11
-    ), report
-    assert report["summary"]["adaptive_lr_native_state_machine_abi_skeleton_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_native_state_machine_abi_skeleton_artifact_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_native_state_machine_cpu_reference_guard_ready_count"] == 0, report
-    assert (
-        report["summary"]["adaptive_lr_native_state_machine_cpu_reference_guard_artifact_ready_count"] == 11
-    ), report
-    assert report["summary"]["adaptive_lr_native_state_machine_implementation_stub_ready_count"] == 0, report
-    assert (
-        report["summary"]["adaptive_lr_native_state_machine_implementation_stub_artifact_ready_count"] == 11
-    ), report
-    assert report["summary"]["adaptive_lr_cuda_kernel_contract_plan_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_cuda_kernel_contract_plan_artifact_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_cuda_kernel_implementation_ready_row_count"] == 0, report
-    assert report["summary"]["adaptive_lr_training_tensor_binding_canary_ready_row_count"] == 0, report
-    assert report["summary"]["adaptive_lr_runtime_dispatch_shadow_ready_row_count"] == 0, report
-    assert report["summary"]["adaptive_lr_training_loop_canary_ready_row_count"] == 0, report
-    assert report["summary"]["adaptive_lr_e2e_shadow_matrix_ready_row_count"] == 0, report
-    assert report["summary"]["adaptive_lr_canary_rollout_policy_ready_row_count"] == 0, report
-    assert report["summary"]["adaptive_lr_dispatch_integration_review_ready_row_count"] == 0, report
-    assert report["summary"]["adaptive_lr_owner_release_hold_ready_row_count"] == 0, report
-    assert report["summary"]["adaptive_lr_request_schema_ui_non_exposure_ready_row_count"] == 11, report
-    assert report["summary"]["adaptive_lr_state_machine_replay_matrix_artifact_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_state_machine_replay_matrix_implementation_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_state_machine_replay_case_planned_count"] == 66, report
-    assert report["summary"]["adaptive_lr_state_machine_replay_resume_case_planned_count"] == 44, report
-    assert report["summary"]["adaptive_lr_state_machine_replay_executor_reference_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_state_machine_replay_executor_resume_passed_count"] == 11, report
-    assert report["summary"]["adaptive_lr_native_state_machine_abi_precondition_package_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_native_kernel_precondition_review_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_native_state_machine_abi_implementation_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_native_kernel_preconditions_implementation_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_state_machine_entrypoint_contract_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_launch_plan_schema_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_state_buffer_mapping_contract_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_skeleton_state_machine_abi_implementation_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_cpu_guard_valid_launch_plan_passed_count"] == 11, report
-    assert report["summary"]["adaptive_lr_cpu_guard_bad_finite_scalar_rejected_count"] == 11, report
-    assert report["summary"]["adaptive_lr_cpu_guard_bad_dispatch_rejected_count"] == 11, report
-    assert report["summary"]["adaptive_lr_cpu_guard_state_machine_abi_implementation_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_implementation_stub_entrypoint_contract_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_implementation_stub_state_transition_contract_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_implementation_stub_dispatch_disabled_assertion_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_implementation_stub_state_machine_abi_implementation_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_cuda_kernel_contract_runtime_canary_manifest_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_cuda_kernel_implementation_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_cuda_kernel_executed_count"] == 11, report
-    assert report["summary"]["adaptive_lr_cuda_runtime_canary_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_cuda_runtime_canary_hit_count"] == 0, report
-    assert report["summary"]["adaptive_lr_training_tensor_binding_canary_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_training_tensor_binding_parity_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_training_tensor_binding_family_passed_case_count"] == 2, report
-    assert report["summary"]["adaptive_lr_runtime_dispatch_shadow_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_runtime_dispatch_shadow_native_shadow_call_allowed_count"] == 0, report
-    assert report["summary"]["adaptive_lr_training_loop_canary_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_training_loop_family_passed_case_count"] == 2, report
-    assert report["summary"]["adaptive_lr_training_loop_native_step_count"] == 2, report
-    assert report["summary"]["adaptive_lr_training_loop_native_kernel_launch_count"] == 2, report
-    assert report["summary"]["adaptive_lr_e2e_shadow_matrix_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_e2e_shadow_matrix_case_count"] == 22, report
-    assert report["summary"]["adaptive_lr_e2e_shadow_matrix_report_only_case_count"] == 22, report
-    assert report["summary"]["adaptive_lr_canary_rollout_policy_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_canary_rollout_policy_runtime_dispatch_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_canary_rollout_policy_native_dispatch_allowed_count"] == 0, report
-    assert report["summary"]["adaptive_lr_canary_rollout_policy_training_path_enabled_count"] == 0, report
-    assert report["summary"]["adaptive_lr_dispatch_integration_review_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_dispatch_integration_review_product_native_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_owner_release_hold_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_owner_release_hold_product_native_ready_count"] == 0, report
-    assert report["summary"]["adaptive_lr_request_schema_ui_non_exposure_ready_count"] == 11, report
-    assert report["summary"]["adaptive_lr_request_schema_ui_forbidden_token_hit_count"] == 0, report
+    expected_adaptive_lr_counts = {
+        "adaptive_lr_state_machine_reference_ready_count": 11,
+        "adaptive_lr_state_machine_reference_artifact_ready_count": 11,
+        "adaptive_lr_request_schema_ui_non_exposure_ready_count": 11,
+        "adaptive_lr_request_schema_ui_forbidden_token_hit_count": 0,
+    }
+    expected_adaptive_lr_counts.update(
+        {
+            key: 0
+            for key in report["summary"]
+            if key.startswith("adaptive_lr_") and key not in expected_adaptive_lr_counts
+        }
+    )
+    for key, expected in expected_adaptive_lr_counts.items():
+        assert report["summary"][key] == expected, (key, report)
     assert report["summary"]["factored_custom_state_layout_reference_ready_count"] == 3, report
     assert report["summary"]["factored_custom_state_layout_ready_row_count"] == 0, report
     assert report["summary"]["factored_custom_dispatch_integration_review_ready_row_count"] == 0, report
@@ -760,43 +689,38 @@ def _validate_coverage_report(report: dict[str, Any], *, artifact_mode: str) -> 
     assert report["muon_model_shape_aware_e2e_shadow_matrix"]["case_count"] == 2, report
     assert report["muon_model_shape_aware_e2e_shadow_matrix"]["report_only_case_count"] == 2, report
     assert report["muon_model_shape_aware_e2e_shadow_matrix"]["product_native_ready_count"] == 0, report
-    assert report["summary"]["simple_formula_variant_layout_spec_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_native_kernel_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_native_abi_spec_ready_count"] == 5, report
-    assert report["summary"]["simple_formula_variant_quantized_formula_parity_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_native_scratch_kernel_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_runtime_canary_manifest_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_training_loop_canary_manifest_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_training_loop_canary_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_e2e_no_regression_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_product_state_sync_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_rollout_policy_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_dispatch_integration_review_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_owner_approval_hold_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_product_state_sync_review_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_product_optimizer_state_sync_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_quantized_optimizer_state_sync_state_tensor_count"] == 6, report
-    assert report["summary"]["simple_formula_variant_quantized_optimizer_state_sync_parameter_tensor_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_schedule_free_native_canary_ready_count"] == 2, report
-    assert report["summary"]["simple_formula_variant_schedule_free_rollout_policy_ready_count"] == 2, report
-    assert report["summary"]["simple_formula_variant_schedule_free_dispatch_integration_review_ready_count"] == 2, report
-    assert report["summary"]["simple_formula_variant_schedule_free_owner_release_hold_ready_count"] == 2, report
-    assert report["summary"]["simple_formula_variant_quantized_native_canary_pending_count"] == 0, report
-    assert report["simple_optimizer_family_batch"]["variant_quantized_owner_approval_hold_ready_count"] == 3, report
+    for key, value in report["summary"].items():
+        if key.startswith("simple_formula_variant_"):
+            assert value == 0, (key, report)
+    assert report["simple_optimizer_family_batch"]["present"] is False, report
+    assert report["simple_optimizer_family_batch"]["ok"] is False, report
+    assert report["simple_optimizer_family_batch"]["native_dispatch_allowed"] is False, report
+    assert report["simple_optimizer_family_batch"]["training_path_enabled"] is False, report
+    assert report["simple_optimizer_family_batch"]["variant_quantized_owner_approval_hold_ready_count"] == 0, report
     assert report["simple_optimizer_product_training_canary"][
         "representative_product_training_canary_ready_count"
-    ] == 2, report
-    assert report["simple_optimizer_owner_release_hold"]["owner_release_hold_ready"] is True, report
-    assert report["simple_optimizer_owner_release_hold"]["optimizer_count"] == 2, report
+    ] == 0, report
+    assert report["simple_optimizer_product_training_canary"]["present"] is False, report
+    assert report["simple_optimizer_product_training_canary"]["ok"] is False, report
+    assert report["simple_optimizer_owner_release_hold"]["owner_release_hold_ready"] is False, report
+    assert report["simple_optimizer_owner_release_hold"]["optimizer_count"] == 0, report
+    assert report["simple_optimizer_owner_release_hold"]["present"] is False, report
+    assert report["simple_optimizer_owner_release_hold"]["ok"] is False, report
     assert report["simple_optimizer_owner_release_hold"]["product_native_ready_count"] == 0, report
-    assert report["simple_optimizer_schedulefree_rollout_policy"]["canary_rollout_policy_ready"] is True, report
-    assert report["simple_optimizer_schedulefree_rollout_policy"]["optimizer_count"] == 2, report
+    assert report["simple_optimizer_schedulefree_rollout_policy"]["canary_rollout_policy_ready"] is False, report
+    assert report["simple_optimizer_schedulefree_rollout_policy"]["optimizer_count"] == 0, report
+    assert report["simple_optimizer_schedulefree_rollout_policy"]["present"] is False, report
+    assert report["simple_optimizer_schedulefree_rollout_policy"]["ok"] is False, report
     assert report["simple_optimizer_schedulefree_rollout_policy"]["product_native_ready_count"] == 0, report
-    assert report["simple_optimizer_schedulefree_dispatch_review"]["review_gate_ready"] is True, report
-    assert report["simple_optimizer_schedulefree_dispatch_review"]["optimizer_count"] == 2, report
+    assert report["simple_optimizer_schedulefree_dispatch_review"]["review_gate_ready"] is False, report
+    assert report["simple_optimizer_schedulefree_dispatch_review"]["optimizer_count"] == 0, report
+    assert report["simple_optimizer_schedulefree_dispatch_review"]["present"] is False, report
+    assert report["simple_optimizer_schedulefree_dispatch_review"]["ok"] is False, report
     assert report["simple_optimizer_schedulefree_dispatch_review"]["product_native_ready_count"] == 0, report
-    assert report["simple_optimizer_schedulefree_owner_release_hold"]["owner_release_hold_ready"] is True, report
-    assert report["simple_optimizer_schedulefree_owner_release_hold"]["optimizer_count"] == 2, report
+    assert report["simple_optimizer_schedulefree_owner_release_hold"]["owner_release_hold_ready"] is False, report
+    assert report["simple_optimizer_schedulefree_owner_release_hold"]["optimizer_count"] == 0, report
+    assert report["simple_optimizer_schedulefree_owner_release_hold"]["present"] is False, report
+    assert report["simple_optimizer_schedulefree_owner_release_hold"]["ok"] is False, report
     assert report["simple_optimizer_schedulefree_owner_release_hold"]["product_native_ready_count"] == 0, report
     assert report["simple_optimizer_request_schema_ui_non_exposure"][
         "request_schema_ui_non_exposure_ready"
@@ -807,134 +731,26 @@ def _validate_coverage_report(report: dict[str, Any], *, artifact_mode: str) -> 
     assert report["simple_optimizer_request_schema_ui_non_exposure"]["request_fields_emitted"] is False, report
     assert report["simple_optimizer_request_schema_ui_non_exposure"]["schema_exposure_allowed"] is False, report
     assert report["simple_optimizer_request_schema_ui_non_exposure"]["ui_exposure_allowed"] is False, report
-    assert report["summary"]["simple_formula_variant_formula_parity_matrix_artifact_ready_count"] == 5, report
-    assert report["summary"]["simple_formula_variant_formula_parity_matrix_implementation_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_resume_parity_matrix_artifact_ready_count"] == 5, report
-    assert report["summary"]["simple_formula_variant_resume_parity_matrix_implementation_ready_count"] == 5, report
-    assert report["summary"]["simple_formula_variant_quantized_resume_parity_ready_count"] == 3, report
-    assert report["summary"]["simple_formula_variant_schedule_free_resume_parity_ready_count"] == 2, report
-    if simple_state_machine_reference_ready:
-        assert report["summary"]["simple_formula_variant_state_machine_reference_ready_count"] == 2, report
-    assert report["adaptive_lr_state_machine_replay_matrix"]["state_machine_replay_matrix_ready"] is True, report
-    assert report["adaptive_lr_state_machine_replay_matrix"][
-        "state_machine_replay_matrix_artifact_ready_count"
-    ] == 11, report
-    assert report["adaptive_lr_state_machine_replay_matrix"][
-        "state_machine_replay_matrix_implementation_ready_count"
-    ] == 0, report
-    assert report["adaptive_lr_state_machine_replay_matrix"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_state_machine_replay_executor"]["state_machine_replay_executor_ready"] is True, report
-    assert report["adaptive_lr_state_machine_replay_executor"]["reference_replay_executor_ready_count"] == 11, report
-    assert report["adaptive_lr_state_machine_replay_executor"]["resume_next_step_parity_passed_count"] == 11, report
-    assert report["adaptive_lr_state_machine_replay_executor"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_native_state_machine_abi_preconditions"][
-        "native_state_machine_abi_preconditions_ready"
-    ] is True, report
-    assert report["adaptive_lr_native_state_machine_abi_preconditions"][
-        "native_state_machine_abi_precondition_review_ready_count"
-    ] == 11, report
-    assert report["adaptive_lr_native_state_machine_abi_preconditions"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_native_state_machine_abi_skeleton"][
-        "native_state_machine_abi_skeleton_ready"
-    ] is True, report
-    assert report["adaptive_lr_native_state_machine_abi_skeleton"][
-        "native_state_machine_abi_skeleton_ready_count"
-    ] == 11, report
-    assert report["adaptive_lr_native_state_machine_abi_skeleton"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_native_state_machine_cpu_reference_guard"][
-        "native_state_machine_cpu_reference_guard_ready"
-    ] is True, report
-    assert report["adaptive_lr_native_state_machine_cpu_reference_guard"][
-        "cpu_reference_guard_ready_count"
-    ] == 11, report
-    assert report["adaptive_lr_native_state_machine_cpu_reference_guard"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_native_state_machine_implementation_stub"][
-        "native_state_machine_implementation_stub_ready"
-    ] is True, report
-    assert report["adaptive_lr_native_state_machine_implementation_stub"][
-        "implementation_stub_ready_count"
-    ] == 11, report
-    assert report["adaptive_lr_native_state_machine_implementation_stub"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_cuda_kernel_contract_plan"]["cuda_kernel_contract_plan_ready"] is True, report
-    assert report["adaptive_lr_cuda_kernel_contract_plan"]["cuda_kernel_contract_plan_ready_count"] == 11, report
-    assert report["adaptive_lr_cuda_kernel_contract_plan"]["runtime_canary_manifest_ready_count"] == 11, report
-    assert report["adaptive_lr_cuda_kernel_contract_plan"]["cuda_kernel_implementation_ready_count"] == 0, report
-    assert report["adaptive_lr_cuda_kernel_contract_plan"]["runtime_canary_ready_count"] == 0, report
-    assert report["adaptive_lr_cuda_kernel_contract_plan"]["runtime_canary_hit_count"] == 0, report
-    assert report["adaptive_lr_cuda_kernel_contract_plan"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_cuda_kernel_implementation"]["cuda_kernel_implementation_ready"] is True, report
-    assert report["adaptive_lr_cuda_kernel_implementation"]["cuda_kernel_implementation_ready_count"] == 11, report
-    assert report["adaptive_lr_cuda_kernel_implementation"]["kernel_executed_count"] == 11, report
-    assert report["adaptive_lr_cuda_kernel_implementation"]["runtime_canary_ready_count"] == 0, report
-    assert report["adaptive_lr_cuda_kernel_implementation"]["runtime_canary_hit_count"] == 0, report
-    assert report["adaptive_lr_cuda_kernel_implementation"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_training_tensor_binding_canary"]["training_tensor_binding_canary_ready"] is True, report
-    assert report["adaptive_lr_training_tensor_binding_canary"]["training_tensor_binding_canary_ready_count"] == 11, report
-    assert report["adaptive_lr_training_tensor_binding_canary"]["training_tensor_binding_parity_ready_count"] == 11, report
-    assert report["adaptive_lr_training_tensor_binding_canary"]["family_passed_case_count"] == 2, report
-    assert report["adaptive_lr_training_tensor_binding_canary"]["runtime_canary_ready_count"] == 0, report
-    assert report["adaptive_lr_training_tensor_binding_canary"]["runtime_canary_hit_count"] == 0, report
-    assert report["adaptive_lr_training_tensor_binding_canary"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_runtime_dispatch_shadow"]["runtime_dispatch_shadow_ready"] is True, report
-    assert report["adaptive_lr_runtime_dispatch_shadow"]["runtime_dispatch_shadow_ready_count"] == 11, report
-    assert report["adaptive_lr_runtime_dispatch_shadow"]["fallback_backend_authoritative"] is True, report
-    assert report["adaptive_lr_runtime_dispatch_shadow"]["native_shadow_call_allowed"] is False, report
-    assert report["adaptive_lr_runtime_dispatch_shadow"]["native_shadow_call_allowed_count"] == 0, report
-    assert report["adaptive_lr_runtime_dispatch_shadow"]["runtime_dispatch_ready_count"] == 0, report
-    assert report["adaptive_lr_runtime_dispatch_shadow"]["native_dispatch_allowed_count"] == 0, report
-    assert report["adaptive_lr_runtime_dispatch_shadow"]["training_path_enabled_count"] == 0, report
-    assert report["adaptive_lr_runtime_dispatch_shadow"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_training_loop_canary"]["training_loop_canary_ready"] is True, report
-    assert report["adaptive_lr_training_loop_canary"]["training_loop_canary_ready_count"] == 11, report
-    assert report["adaptive_lr_training_loop_canary"]["family_passed_case_count"] == 2, report
-    assert report["adaptive_lr_training_loop_canary"]["native_step_count"] == 2, report
-    assert report["adaptive_lr_training_loop_canary"]["native_kernel_launch_count"] == 2, report
-    assert report["adaptive_lr_training_loop_canary"]["runtime_dispatch_ready_count"] == 0, report
-    assert report["adaptive_lr_training_loop_canary"]["native_dispatch_allowed_count"] == 0, report
-    assert report["adaptive_lr_training_loop_canary"]["training_path_enabled_count"] == 0, report
-    assert report["adaptive_lr_training_loop_canary"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["e2e_shadow_matrix_ready"] is True, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["e2e_shadow_matrix_passed"] is False, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["live_shadow_matrix_executed"] is False, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["e2e_shadow_matrix_ready_count"] == 11, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["case_count"] == 22, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["report_only_case_count"] == 22, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["failed_case_count"] == 0, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["runtime_dispatch_ready_count"] == 0, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["native_dispatch_allowed_count"] == 0, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["training_path_enabled_count"] == 0, report
-    assert report["adaptive_lr_e2e_shadow_matrix"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_canary_rollout_policy"]["canary_rollout_policy_ready"] is True, report
-    assert report["adaptive_lr_canary_rollout_policy"]["manual_review_required"] is True, report
-    assert report["adaptive_lr_canary_rollout_policy"]["canary_auto_enabled"] is False, report
-    assert report["adaptive_lr_canary_rollout_policy"]["canary_rollout_policy_ready_count"] == 11, report
-    assert report["adaptive_lr_canary_rollout_policy"]["runtime_dispatch_ready_count"] == 0, report
-    assert report["adaptive_lr_canary_rollout_policy"]["native_dispatch_allowed_count"] == 0, report
-    assert report["adaptive_lr_canary_rollout_policy"]["training_path_enabled_count"] == 0, report
-    assert report["adaptive_lr_canary_rollout_policy"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_dispatch_integration_review"]["review_gate_ready"] is True, report
-    assert report["adaptive_lr_dispatch_integration_review"]["dispatch_integration_review"] is True, report
-    assert report["adaptive_lr_dispatch_integration_review"]["manual_review_required"] is True, report
-    assert report["adaptive_lr_dispatch_integration_review"]["optimizer_count"] == 11, report
-    assert report["adaptive_lr_dispatch_integration_review"]["runtime_dispatch_ready"] is False, report
-    assert report["adaptive_lr_dispatch_integration_review"]["native_dispatch_allowed"] is False, report
-    assert report["adaptive_lr_dispatch_integration_review"]["training_path_enabled"] is False, report
-    assert report["adaptive_lr_dispatch_integration_review"]["request_fields_emitted"] is False, report
-    assert report["adaptive_lr_dispatch_integration_review"]["schema_exposure_allowed"] is False, report
-    assert report["adaptive_lr_dispatch_integration_review"]["ui_exposure_allowed"] is False, report
-    assert report["adaptive_lr_dispatch_integration_review"]["product_native_ready_count"] == 0, report
-    assert report["adaptive_lr_owner_release_hold"]["owner_release_hold_ready"] is True, report
-    assert report["adaptive_lr_owner_release_hold"]["dispatch_integration_review"] is True, report
-    assert report["adaptive_lr_owner_release_hold"]["owner_approval_recorded"] is False, report
-    assert report["adaptive_lr_owner_release_hold"]["release_approval_recorded"] is False, report
-    assert report["adaptive_lr_owner_release_hold"]["optimizer_count"] == 11, report
-    assert report["adaptive_lr_owner_release_hold"]["runtime_dispatch_ready"] is False, report
-    assert report["adaptive_lr_owner_release_hold"]["native_dispatch_allowed"] is False, report
-    assert report["adaptive_lr_owner_release_hold"]["training_path_enabled"] is False, report
-    assert report["adaptive_lr_owner_release_hold"]["request_fields_emitted"] is False, report
-    assert report["adaptive_lr_owner_release_hold"]["schema_exposure_allowed"] is False, report
-    assert report["adaptive_lr_owner_release_hold"]["ui_exposure_allowed"] is False, report
-    assert report["adaptive_lr_owner_release_hold"]["product_native_ready_count"] == 0, report
+    assert report["adaptive_lr_state_machine_batch"]["present"] is True, report
+    assert report["adaptive_lr_state_machine_batch"]["ok"] is True, report
+    assert report["adaptive_lr_state_machine_batch"]["target_count"] == 11, report
+    assert report["adaptive_lr_state_machine_batch"]["state_machine_reference_ready_count"] == 11, report
+    assert report["adaptive_lr_state_machine_batch"]["native_ready_count"] == 0, report
+    for key, section in report.items():
+        if not key.startswith("adaptive_lr_"):
+            continue
+        if key in {"adaptive_lr_state_machine_batch", "adaptive_lr_request_schema_ui_non_exposure"}:
+            continue
+        if not isinstance(section, dict):
+            continue
+        assert section.get("present") is False, (key, report)
+        assert section.get("ok") is False, (key, report)
+        assert section.get("native_dispatch_allowed") is False, (key, report)
+        assert section.get("training_path_enabled") is False, (key, report)
+        if "runtime_dispatch_ready" in section:
+            assert section["runtime_dispatch_ready"] is False, (key, report)
+        if "product_native_ready_count" in section:
+            assert section["product_native_ready_count"] == 0, (key, report)
     assert report["adaptive_lr_request_schema_ui_non_exposure"]["request_schema_ui_non_exposure_ready"] is True, report
     assert report["adaptive_lr_request_schema_ui_non_exposure"]["owner_release_hold_ready"] is True, report
     assert report["adaptive_lr_request_schema_ui_non_exposure"]["optimizer_count"] == 11, report
@@ -1009,35 +825,41 @@ def _validate_coverage_report(report: dict[str, Any], *, artifact_mode: str) -> 
     assert report["summary"]["adamw_variant_request_schema_ui_non_exposure_ready_count"] == 6, report
     assert report["summary"]["adamw_variant_request_schema_ui_forbidden_token_hit_count"] == 0, report
     assert report["summary"]["adamw_variant_request_schema_ui_product_native_ready_count"] == 0, report
-    assert report["summary"]["adamw_variant_native_canary_stage_evidence_ready_count"] == 6, report
-    assert report["summary"]["adamw_variant_product_native_ready_count"] == 0, report
-    assert report["summary"]["adamw_variant_native_abi_ready_count"] == 1, report
-    assert report["summary"]["adamw_variant_scratch_formula_canary_ready_count"] == 1, report
-    assert report["summary"]["adamw_variant_native_scratch_kernel_ready_count"] == 1, report
-    assert report["summary"]["adamw_variant_runtime_canary_manifest_ready_count"] == 6, report
-    assert report["summary"]["adamw_variant_training_loop_canary_manifest_ready_count"] == 6, report
-    assert report["summary"]["adamw_variant_state_reference_ready_count"] == 6, report
-    assert report["summary"]["adamw_variant_native_canary_manifest_ready_count"] == 6, report
-    assert report["summary"]["adamw_variant_training_loop_canary_ready_count"] == 6, report
-    assert report["summary"]["adamw_variant_schedule_free_native_abi_ready_count"] == 1, report
-    assert report["summary"]["adamw_variant_schedule_free_scratch_formula_canary_ready_count"] == 1, report
-    assert report["summary"]["adamw_variant_schedule_free_native_scratch_kernel_ready_count"] == 1, report
-    assert report["summary"]["adamw_variant_e2e_shadow_matrix_ready"] is True, report
-    assert report["summary"]["adamw_variant_canary_rollout_policy_ready"] is True, report
-    assert report["summary"]["adamw_variant_dispatch_integration_review_ready"] is True, report
-    assert report["adamw_variant_family_batch"]["native_ready_count"] == 6, report
-    assert report["adamw_variant_family_batch"]["native_canary_stage_evidence_ready_count"] == 6, report
+    expected_adamw_variant_default_off_summary = {
+        "adamw_variant_native_canary_stage_evidence_ready_count": 0,
+        "adamw_variant_product_native_ready_count": 0,
+        "adamw_variant_native_abi_ready_count": 0,
+        "adamw_variant_scratch_formula_canary_ready_count": 0,
+        "adamw_variant_native_scratch_kernel_ready_count": 0,
+        "adamw_variant_runtime_canary_manifest_ready_count": 0,
+        "adamw_variant_training_loop_canary_manifest_ready_count": 0,
+        "adamw_variant_state_reference_ready_count": 0,
+        "adamw_variant_native_canary_manifest_ready_count": 0,
+        "adamw_variant_training_loop_canary_ready_count": 0,
+        "adamw_variant_schedule_free_native_abi_ready_count": 0,
+        "adamw_variant_schedule_free_scratch_formula_canary_ready_count": 0,
+        "adamw_variant_schedule_free_native_scratch_kernel_ready_count": 0,
+        "adamw_variant_e2e_shadow_matrix_ready": False,
+        "adamw_variant_canary_rollout_policy_ready": False,
+        "adamw_variant_dispatch_integration_review_ready": False,
+    }
+    for key, expected in expected_adamw_variant_default_off_summary.items():
+        assert report["summary"][key] == expected, (key, report)
+    assert report["adamw_variant_family_batch"]["present"] is False, report
+    assert report["adamw_variant_family_batch"]["ok"] is False, report
+    assert report["adamw_variant_family_batch"]["native_ready_count"] == 0, report
+    assert report["adamw_variant_family_batch"]["native_canary_stage_evidence_ready_count"] == 0, report
     assert report["adamw_variant_family_batch"]["product_native_ready_count"] == 0, report
     assert report["adamw_variant_family_batch"]["exact_adamw_included"] is False, report
-    assert report["adamw_variant_family_batch"]["e2e_shadow_matrix_ready"] is True, report
-    assert report["adamw_variant_family_batch"]["canary_rollout_policy_ready"] is True, report
-    assert report["adamw_variant_family_batch"]["dispatch_integration_review_ready"] is True, report
-    assert report["adamw_variant_family_batch"]["state_reference_ready_count"] == 6, report
-    assert report["adamw_variant_family_batch"]["native_canary_manifest_ready_count"] == 6, report
-    assert report["adamw_variant_family_batch"]["training_loop_canary_ready_count"] == 6, report
-    assert report["adamw_variant_family_batch"]["schedule_free_native_abi_ready_count"] == 1, report
-    assert report["adamw_variant_family_batch"]["schedule_free_scratch_formula_canary_ready_count"] == 1, report
-    assert report["adamw_variant_family_batch"]["schedule_free_native_scratch_kernel_ready_count"] == 1, report
+    assert report["adamw_variant_family_batch"]["e2e_shadow_matrix_ready"] is False, report
+    assert report["adamw_variant_family_batch"]["canary_rollout_policy_ready"] is False, report
+    assert report["adamw_variant_family_batch"]["dispatch_integration_review_ready"] is False, report
+    assert report["adamw_variant_family_batch"]["state_reference_ready_count"] == 0, report
+    assert report["adamw_variant_family_batch"]["native_canary_manifest_ready_count"] == 0, report
+    assert report["adamw_variant_family_batch"]["training_loop_canary_ready_count"] == 0, report
+    assert report["adamw_variant_family_batch"]["schedule_free_native_abi_ready_count"] == 0, report
+    assert report["adamw_variant_family_batch"]["schedule_free_scratch_formula_canary_ready_count"] == 0, report
+    assert report["adamw_variant_family_batch"]["schedule_free_native_scratch_kernel_ready_count"] == 0, report
     assert report["adamw_variant_product_training_canary"][
         "representative_product_training_canary_ready"
     ] is True, report

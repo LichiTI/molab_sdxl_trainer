@@ -9,16 +9,9 @@ from typing import Any, Iterable
 import torch
 
 from core.turbocore_copyback_dispatch_probe import build_copyback_dispatch_probe
-from core.turbocore_owner_native_launch_probe import (
-    DEFAULT_OWNER_NATIVE_LAUNCH_MAX_NUMEL,
-    TurboCoreOwnerNativeLaunchProbe,
-    build_owner_native_launch_probe_skip,
-)
+from core.turbocore_owner_native_launch_probe import DEFAULT_OWNER_NATIVE_LAUNCH_MAX_NUMEL, TurboCoreOwnerNativeLaunchProbe, build_owner_native_launch_probe_skip
 from core.turbocore_update_executor import TurboCoreUpdateExecutor, TurboCoreUpdateExecutorConfig
-from core.turbocore_update_checkpoint_contract import (
-    build_flat_adamw_checkpoint_contract,
-    sync_flat_owner_state_from_optimizer,
-)
+from core.turbocore_update_checkpoint_contract import build_flat_adamw_checkpoint_contract, sync_flat_owner_state_from_optimizer
 from core.turbocore_update_native_binding_probe import build_update_native_binding_probe
 
 
@@ -434,6 +427,9 @@ class TurboCoreUpdateShadow:
                 self.executor.owner,
                 params=self.params,
                 run_roundtrip=bool(self.config.checkpoint_contract),
+                trainer_state_metadata_integrated=True,
+                trainer_state_save_sync_verified=bool(include_owner_state),
+                resume_owner_state_guard_verified=bool(include_owner_state),
             )
             if include_owner_state:
                 owner_state = self.executor.owner.state_dict()
@@ -548,9 +544,7 @@ def build_update_shadow_config(
 
 def _flatten_params(params: Iterable[torch.Tensor]) -> torch.Tensor:
     tensors = [param.detach().float().reshape(-1) for param in params if isinstance(param, torch.Tensor)]
-    if not tensors:
-        return torch.empty(0, dtype=torch.float32)
-    return torch.cat(tensors).contiguous()
+    return torch.cat(tensors).contiguous() if tensors else torch.empty(0, dtype=torch.float32)
 
 
 def _flatten_grads(params: Iterable[torch.Tensor], *, device: torch.device) -> torch.Tensor:
@@ -563,9 +557,7 @@ def _flatten_grads(params: Iterable[torch.Tensor], *, device: torch.device) -> t
             parts.append(torch.zeros(int(param.numel()), device=device, dtype=torch.float32))
         else:
             parts.append(grad.detach().float().reshape(-1).to(device=device))
-    if not parts:
-        return torch.empty(0, device=device, dtype=torch.float32)
-    return torch.cat(parts).contiguous()
+    return torch.cat(parts).contiguous() if parts else torch.empty(0, device=device, dtype=torch.float32)
 
 
 def _flatten_owner_like_params(flat: torch.Tensor, params: Iterable[torch.Tensor]) -> torch.Tensor:
@@ -578,9 +570,7 @@ def _flatten_owner_like_params(flat: torch.Tensor, params: Iterable[torch.Tensor
         part = flat.narrow(0, offset, count).view_as(param).to(dtype=param.dtype).detach().float().reshape(-1)
         parts.append(part)
         offset += count
-    if not parts:
-        return torch.empty(0, dtype=torch.float32, device=flat.device)
-    return torch.cat(parts).contiguous()
+    return torch.cat(parts).contiguous() if parts else torch.empty(0, dtype=torch.float32, device=flat.device)
 
 
 def _flatten_owner_ranges_like_params(flat: torch.Tensor, params: Iterable[torch.Tensor], ranges: Iterable[tuple[int, int]]) -> torch.Tensor:
@@ -588,9 +578,7 @@ def _flatten_owner_ranges_like_params(flat: torch.Tensor, params: Iterable[torch
     for param, (offset, count) in zip(params, ranges):
         part = flat.narrow(0, int(offset), int(count)).view_as(param).to(dtype=param.dtype).detach().float().reshape(-1)
         parts.append(part)
-    if not parts:
-        return torch.empty(0, dtype=torch.float32, device=flat.device)
-    return torch.cat(parts).contiguous()
+    return torch.cat(parts).contiguous() if parts else torch.empty(0, dtype=torch.float32, device=flat.device)
 
 
 def _flatten_ranges_like_params(flat: torch.Tensor, params: Iterable[torch.Tensor], ranges: Iterable[tuple[int, int]]) -> torch.Tensor:
@@ -598,9 +586,7 @@ def _flatten_ranges_like_params(flat: torch.Tensor, params: Iterable[torch.Tenso
     for param, (offset, count) in zip(params, ranges):
         part = flat.narrow(0, int(offset), int(count)).view_as(param).detach().float().reshape(-1)
         parts.append(part)
-    if not parts:
-        return torch.empty(0, dtype=torch.float32, device=flat.device)
-    return torch.cat(parts).contiguous()
+    return torch.cat(parts).contiguous() if parts else torch.empty(0, dtype=torch.float32, device=flat.device)
 
 
 __all__ = ["TurboCoreUpdateShadow", "TurboCoreUpdateShadowConfig", "build_update_shadow_config"]

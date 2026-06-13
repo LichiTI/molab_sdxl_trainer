@@ -37,6 +37,7 @@ class GenerationRequest(BaseRequest):
     tgate_probe: bool = False
     tgate_start_step: int = 0
     tgate_min_block: int = 0
+    tgate_skip: bool = False  # opt-in T-GATE real cross-attention reuse (default off -> parity)
     spectrum_probe: bool = False
     spectrum_window_size: float = 2.0
     spectrum_flex_window: float = 0.25
@@ -164,8 +165,10 @@ class GenerationRequest(BaseRequest):
     @classmethod
     def _validate_cache_seam_backend(cls, value: str) -> str:
         token = str(value or "none").strip().lower().replace("-", "").replace("_", "")
-        if token not in {"none", "spectrum", "smoothcache", "tgate"}:
-            raise ValueError("cache_seam_backend must be one of none|spectrum|smoothcache|tgate")
+        if token not in {"none", "spectrum", "smoothcache", "deepcache", "teacache", "tgate"}:
+            raise ValueError(
+                "cache_seam_backend must be one of none|spectrum|smoothcache|deepcache|teacache|tgate"
+            )
         return token
 
     @field_validator("cache_seam_window_size")
@@ -180,8 +183,10 @@ class GenerationRequest(BaseRequest):
     @classmethod
     def _validate_inference_accel_scheme(cls, value: str) -> str:
         token = str(value or "none").strip().lower().replace("-", "").replace("_", "")
-        if token not in {"none", "spectrum", "smoothcache"}:
-            raise ValueError("inference_accel_scheme must be one of none|spectrum|smoothcache")
+        if token not in {"none", "spectrum", "smoothcache", "deepcache", "teacache"}:
+            raise ValueError(
+                "inference_accel_scheme must be one of none|spectrum|smoothcache|deepcache|teacache"
+            )
         return token
 
     @model_validator(mode="after")

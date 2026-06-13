@@ -92,6 +92,9 @@ def build_flat_adamw_checkpoint_contract(
     optimizer: torch.optim.Optimizer | None = None,
     params: Iterable[torch.nn.Parameter] | None = None,
     run_roundtrip: bool = False,
+    trainer_state_metadata_integrated: bool = False,
+    trainer_state_save_sync_verified: bool = False,
+    resume_owner_state_guard_verified: bool = False,
 ) -> dict[str, Any]:
     """Describe checkpoint readiness without wiring it into trainer saves."""
 
@@ -108,7 +111,14 @@ def build_flat_adamw_checkpoint_contract(
         "contract": "turbocore_flat_adamw_checkpoint_contract_v0",
         "state_dict_available": state_dict_available,
         "load_state_dict_available": load_state_dict_available,
-        "trainer_checkpoint_integration": False,
+        "trainer_state_metadata_integrated": bool(trainer_state_metadata_integrated),
+        "trainer_state_save_sync_verified": bool(trainer_state_save_sync_verified),
+        "resume_owner_state_guard_verified": bool(resume_owner_state_guard_verified),
+        "trainer_checkpoint_integration": bool(
+            trainer_state_metadata_integrated
+            and trainer_state_save_sync_verified
+            and resume_owner_state_guard_verified
+        ),
         "training_path_enabled": False,
         "native_kernel_present": False,
         "roundtrip_checked": False,
@@ -136,7 +146,12 @@ def build_flat_adamw_checkpoint_contract(
         payload.update(_roundtrip_owner_state(state))
     if not payload.get("roundtrip_ok", False):
         blocked.append("roundtrip_not_verified" if not run_roundtrip else "roundtrip_failed")
-    blocked.append("trainer_checkpoint_integration_missing")
+    if not bool(trainer_state_metadata_integrated):
+        blocked.append("trainer_checkpoint_integration_missing")
+    if not bool(trainer_state_save_sync_verified):
+        blocked.append("trainer_state_save_sync_guard_missing")
+    if not bool(resume_owner_state_guard_verified):
+        blocked.append("trainer_resume_owner_state_guard_missing")
     payload["ok"] = bool(state_dict_available and load_state_dict_available and payload.get("roundtrip_ok", False))
     payload["blocked_reasons"] = _dedupe(blocked)
     return payload

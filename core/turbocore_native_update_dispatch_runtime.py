@@ -58,6 +58,8 @@ class TurboCoreNativeUpdateDispatchRuntime:
         native_step_executed = bool(training_executor.get("native_step_executed", False))
         if native_step_executed:
             self._native_steps += 1
+        elif execute_native and training_executor:
+            self.disable_for_run(_training_executor_failure_reason(training_executor))
         final_state = self.snapshot()
         blocked = _blocked_reasons(
             arming=arming,
@@ -196,6 +198,13 @@ def _training_dispatch_skips_diagnostic_probe() -> dict[str, Any]:
         "result": {},
         "blocked_reasons": [],
     }
+
+
+def _training_executor_failure_reason(report: Mapping[str, Any]) -> str:
+    reasons = _strings(report.get("blocked_reasons"))
+    if reasons:
+        return reasons[0]
+    return str(report.get("reason", "") or "native_update_training_executor_failed")
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

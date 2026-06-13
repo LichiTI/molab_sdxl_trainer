@@ -63,6 +63,8 @@ def sample_anima(
     prompt: str,
     *,
     negative_prompt: str = "",
+    prompt_embeds: Optional[torch.Tensor] = None,
+    negative_prompt_embeds: Optional[torch.Tensor] = None,
     num_inference_steps: int = 20,
     guidance_scale: float = 5.0,
     width: int = 1024,
@@ -147,36 +149,49 @@ def sample_anima(
     if vae is None:
         logger.warning("Anima preview unavailable: VAE is None (released after cache build?)")
         return None
-    if text_encoder is None or tokenizer is None:
-        logger.warning(
-            "Anima preview unavailable: text encoder or tokenizer is None "
-            "(released after cache build?)"
+
+    try:
+        from .anima_sampler_native import decode_anima_image, resolve_text_embeds
+    except ImportError:  # pragma: no cover - direct-file smoke fallback.
+        from core.lulynx_trainer.anima_sampler_native import (
+            decode_anima_image,
+            resolve_text_embeds,
         )
-        return None
 
-    # --- encode text ---
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=77,
-        truncation=True,
-        return_tensors="pt",
+    # --- encode text (native Qwen3 prompt_embeds injection, else CLIP) ---
+    text_emb, neg_emb, handled = resolve_text_embeds(
+        prompt_embeds, negative_prompt_embeds,
+        device=device, dtype=dtype, guidance_scale=guidance_scale,
     )
-    text_input_ids = text_inputs.input_ids.to(device)
-    text_emb = text_encoder(text_input_ids, return_dict=True).last_hidden_state.to(dtype=dtype)
-
-    if guidance_scale > 1.0 and negative_prompt:
-        neg_inputs = tokenizer(
-            negative_prompt,
+    if not handled:
+        if text_encoder is None or tokenizer is None:
+            logger.warning(
+                "Anima preview unavailable: text encoder or tokenizer is None "
+                "(released after cache build?)"
+            )
+            return None
+        text_inputs = tokenizer(
+            prompt,
             padding="max_length",
             max_length=77,
             truncation=True,
             return_tensors="pt",
         )
-        neg_input_ids = neg_inputs.input_ids.to(device)
-        neg_emb = text_encoder(neg_input_ids, return_dict=True).last_hidden_state.to(dtype=dtype)
-    else:
-        neg_emb = None
+        text_input_ids = text_inputs.input_ids.to(device)
+        text_emb = text_encoder(text_input_ids, return_dict=True).last_hidden_state.to(dtype=dtype)
+
+        if guidance_scale > 1.0 and negative_prompt:
+            neg_inputs = tokenizer(
+                negative_prompt,
+                padding="max_length",
+                max_length=77,
+                truncation=True,
+                return_tensors="pt",
+            )
+            neg_input_ids = neg_inputs.input_ids.to(device)
+            neg_emb = text_encoder(neg_input_ids, return_dict=True).last_hidden_state.to(dtype=dtype)
+        else:
+            neg_emb = None
 
     # --- prepare latents ---
     # Anima uses patch_size to determine latent spatial dims
@@ -295,7 +310,16 @@ def sample_anima(
         sigma = sigmas[i]
         sigma_next = sigmas[i + 1]
 
-        timestep = (sigma * float(num_train_timesteps)).long()
+        # Native Anima's t_embedder consumes the flow time on the sigma in [0,1]
+        # scale directly (rectified flow; the base velocity probe confirms the
+        # faithful subset wants t=sigma at cos>=0.9). Feeding the [0,1000]
+        # scheduler value collapses the adaLN gates and scrambles the velocity,
+        # so the faithful subset gets t=sigma; the legacy scaffold path keeps the
+        # historical scaled-int timestep. sigmas[i] is 0-dim -> shape to [1].
+        if getattr(dit_model, "anima_faithful", False):
+            timestep = sigma.reshape(1).to(dtype)
+        else:
+            timestep = (sigma * float(num_train_timesteps)).long().reshape(1)
 
         step_context = (
             tgate_context_factory(
@@ -344,10 +368,9 @@ def sample_anima(
             snapshot_smoothcache_probe_stats(),
         )
 
-    # --- decode ---
-    latents = latents / vae_scaling_factor
+    # --- decode (qwen-image inverse-norm + 5D, else standard) ---
     try:
-        image = vae.decode(latents.to(vae.dtype)).sample
+        image = decode_anima_image(vae, latents, vae_scaling_factor)
     except Exception as e:
         logger.error(f"Anima VAE decode failed: {e}")
         return None
@@ -375,6 +398,8 @@ def sample_anima_ersde(
     prompt: str,
     *,
     negative_prompt: str = "",
+    prompt_embeds: Optional[torch.Tensor] = None,
+    negative_prompt_embeds: Optional[torch.Tensor] = None,
     num_inference_steps: int = 20,
     guidance_scale: float = 5.0,
     width: int = 1024,
@@ -428,7 +453,8 @@ def sample_anima_ersde(
 
     dit_model.eval()
     vae.eval()
-    text_encoder.eval()
+    if text_encoder is not None:
+        text_encoder.eval()
 
     # --- CNS recolorer ---
     cns_recolorer = None
@@ -448,29 +474,48 @@ def sample_anima_ersde(
                 f"frequency_bins={cns_recolorer.frequency_bins}"
             )
 
-    # --- encode text ---
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=77,
-        truncation=True,
-        return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids.to(device)
-    text_emb = text_encoder(text_input_ids, return_dict=True).last_hidden_state.to(dtype=dtype)
+    try:
+        from .anima_sampler_native import decode_anima_image, resolve_text_embeds
+    except ImportError:  # pragma: no cover - direct-file smoke fallback.
+        from core.lulynx_trainer.anima_sampler_native import (
+            decode_anima_image,
+            resolve_text_embeds,
+        )
 
-    if guidance_scale > 1.0 and negative_prompt:
-        neg_inputs = tokenizer(
-            negative_prompt,
+    # --- encode text (native Qwen3 prompt_embeds injection, else CLIP) ---
+    text_emb, neg_emb, handled = resolve_text_embeds(
+        prompt_embeds, negative_prompt_embeds,
+        device=device, dtype=dtype, guidance_scale=guidance_scale,
+    )
+    if not handled:
+        if text_encoder is None or tokenizer is None:
+            logger.warning(
+                "Anima ER-SDE preview unavailable: text encoder or tokenizer is "
+                "None (released after cache build?)"
+            )
+            return None
+        text_inputs = tokenizer(
+            prompt,
             padding="max_length",
             max_length=77,
             truncation=True,
             return_tensors="pt",
         )
-        neg_input_ids = neg_inputs.input_ids.to(device)
-        neg_emb = text_encoder(neg_input_ids, return_dict=True).last_hidden_state.to(dtype=dtype)
-    else:
-        neg_emb = None
+        text_input_ids = text_inputs.input_ids.to(device)
+        text_emb = text_encoder(text_input_ids, return_dict=True).last_hidden_state.to(dtype=dtype)
+
+        if guidance_scale > 1.0 and negative_prompt:
+            neg_inputs = tokenizer(
+                negative_prompt,
+                padding="max_length",
+                max_length=77,
+                truncation=True,
+                return_tensors="pt",
+            )
+            neg_input_ids = neg_inputs.input_ids.to(device)
+            neg_emb = text_encoder(neg_input_ids, return_dict=True).last_hidden_state.to(dtype=dtype)
+        else:
+            neg_emb = None
 
     # --- prepare latents ---
     latent_h = height // (vae.config.get("scale_factor", 8) if hasattr(vae, "config") else 8)
@@ -585,7 +630,16 @@ def sample_anima_ersde(
         sigma_next = sigmas[i + 1]
         dt = sigma_next - sigma
 
-        timestep = (sigma * float(num_train_timesteps)).long()
+        # Native Anima's t_embedder consumes the flow time on the sigma in [0,1]
+        # scale directly (rectified flow; the base velocity probe confirms the
+        # faithful subset wants t=sigma at cos>=0.9). Feeding the [0,1000]
+        # scheduler value collapses the adaLN gates and scrambles the velocity,
+        # so the faithful subset gets t=sigma; the legacy scaffold path keeps the
+        # historical scaled-int timestep. sigmas[i] is 0-dim -> shape to [1].
+        if getattr(dit_model, "anima_faithful", False):
+            timestep = sigma.reshape(1).to(dtype)
+        else:
+            timestep = (sigma * float(num_train_timesteps)).long().reshape(1)
 
         step_context = (
             tgate_context_factory(
@@ -663,10 +717,9 @@ def sample_anima_ersde(
             snapshot_smoothcache_probe_stats(),
         )
 
-    # --- decode ---
-    latents = latents / vae_scaling_factor
+    # --- decode (qwen-image inverse-norm + 5D, else standard) ---
     try:
-        image = vae.decode(latents.to(vae.dtype)).sample
+        image = decode_anima_image(vae, latents, vae_scaling_factor)
     except Exception as e:
         logger.error(f"Anima VAE decode failed: {e}")
         return None

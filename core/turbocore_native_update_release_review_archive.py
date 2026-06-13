@@ -38,6 +38,9 @@ DEFAULT_OWNER_RELEASE_REVIEW_RECORD_PATH = (
     REPO_ROOT / "temp" / "turbocore_optimizer" / "native_update_owner_release_review_record.json"
 )
 DEFAULT_ARCHIVE_PATH = REPO_ROOT / "temp" / "turbocore_optimizer" / "native_update_release_review_archive.json"
+DEFAULT_STABLE_FIRST_RELEASE_SCOPE_PATH = (
+    REPO_ROOT / "temp" / "turbocore_optimizer" / "turbocore_optimizer_stable_first_release_scope.json"
+)
 
 UNSAFE_TRUE_FIELDS = (
     "default_behavior_changed",
@@ -81,6 +84,7 @@ def build_native_update_release_review_archive(
     *,
     release_review_package: Mapping[str, Any] | None = None,
     owner_release_review_record: Mapping[str, Any] | None = None,
+    stable_first_release_scope: Mapping[str, Any] | None = None,
     load_owner_release_review_record: bool = True,
     write_artifact: bool = True,
     artifact_path: Path | None = None,
@@ -95,7 +99,8 @@ def build_native_update_release_review_archive(
     )
     summary = _package_summary(package)
     owner_record_summary = _owner_release_review_record_summary(owner_record)
-    blockers = _archive_blockers(summary, owner_record_summary)
+    stable_scope_summary = _stable_first_release_scope_summary(stable_first_release_scope)
+    blockers = _archive_blockers(summary, owner_record_summary, stable_scope_summary)
     archive_ready = not blockers
     waiting_for_recorded_review = (
         bool(summary.get("present"))
@@ -145,6 +150,15 @@ def build_native_update_release_review_archive(
         "post_release_request_fields": {},
         "release_review_package_summary": summary,
         "owner_release_review_record_summary": owner_record_summary,
+        "stable_first_release_scope_summary": stable_scope_summary,
+        "summary": {
+            **_stable_first_release_scope_counts(stable_scope_summary),
+            "archive_ready_count": 1 if archive_ready else 0,
+            "release_review_recorded_count": 1 if summary.get("release_review_recorded") else 0,
+            "training_path_enabled_count": 0,
+            "runtime_dispatch_ready_count": 0,
+            "native_dispatch_allowed_count": 0,
+        },
         "allowed_next_actions": (
             ["await_owner_release_direction"] if archive_ready else ["record_owner_release_review_default_off"]
         ),
@@ -184,6 +198,15 @@ def _load_owner_release_review_record() -> dict[str, Any]:
         return {}
     try:
         return _as_dict(json.loads(DEFAULT_OWNER_RELEASE_REVIEW_RECORD_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        return {}
+
+
+def _load_stable_first_release_scope() -> dict[str, Any]:
+    if not DEFAULT_STABLE_FIRST_RELEASE_SCOPE_PATH.exists():
+        return {}
+    try:
+        return _as_dict(json.loads(DEFAULT_STABLE_FIRST_RELEASE_SCOPE_PATH.read_text(encoding="utf-8")))
     except Exception:
         return {}
 
@@ -232,7 +255,9 @@ def _package_summary(package: Mapping[str, Any]) -> dict[str, Any]:
         "optimizer_family_handoff_counts_match": bool(optimizer_counts and handoff_counts == optimizer_counts),
         "native_update_optimizer_multitensor_release_hold_ok": multitensor.get("ok") is True,
         "native_update_optimizer_multitensor_release_hold_evidence_ready": multitensor.get("evidence_ready") is True,
-        "native_update_optimizer_multitensor_release_hold_ready_for_review": multitensor.get("ready_for_review") is True,
+        "native_update_optimizer_multitensor_release_hold_ready_for_review": (
+            multitensor.get("ready_for_review") is True
+        ),
         "native_update_optimizer_multitensor_release_hold_default_off": multitensor.get("default_off") is True,
         "release_review_template_digest": computed_template_digest,
         "handoff_release_review_template_digest": handoff_template_digest,
@@ -268,6 +293,7 @@ def _owner_release_review_record_summary(record: Mapping[str, Any]) -> dict[str,
 def _archive_blockers(
     summary: Mapping[str, Any],
     owner_record_summary: Mapping[str, Any] | None = None,
+    stable_scope_summary: Mapping[str, Any] | None = None,
 ) -> list[str]:
     blocked: list[str] = []
     if not summary.get("present"):
@@ -325,11 +351,102 @@ def _archive_blockers(
             blocked.append(f"native_update_release_review_archive_{field}_failed")
     blocked.extend(_string_list(summary.get("unsafe_claims")))
     blocked.extend(_string_list(summary.get("promotion_blockers")))
+    blocked.extend(_stable_first_release_scope_blockers(_as_dict(stable_scope_summary)))
     unexpected_blockers = [
         item for item in _string_list(summary.get("blocked_reasons"))
         if item != "native_update_release_owner_review_missing"
     ]
     blocked.extend(unexpected_blockers)
+    return _dedupe(blocked)
+
+
+def _stable_first_release_scope_summary(scope: Mapping[str, Any] | None) -> dict[str, Any]:
+    report = _as_dict(scope) if scope is not None else _load_stable_first_release_scope()
+    nested = _as_dict(report.get("summary"))
+    return {
+        "present": bool(report),
+        "gate": str(report.get("gate") or ""),
+        "ok": report.get("ok") is True,
+        "stable_first_release_scope": str(report.get("stable_first_release_scope") or ""),
+        "stable_first_release_blocked_by_turbocore_optimizer": (
+            report.get("stable_first_release_blocked_by_turbocore_optimizer") is True
+        ),
+        "turbocore_optimizer_default_off_release_scope_ready": (
+            report.get("turbocore_optimizer_default_off_release_scope_ready") is True
+        ),
+        "release_claim_allowed": report.get("release_claim_allowed") is True,
+        "native_training_claim_allowed": report.get("native_training_claim_allowed") is True,
+        "product_exposure_allowed": report.get("product_exposure_allowed") is True,
+        "runtime_dispatch_allowed": report.get("runtime_dispatch_allowed") is True,
+        "native_dispatch_allowed": report.get("native_dispatch_allowed") is True,
+        "training_path_enabled": report.get("training_path_enabled") is True,
+        "blocked_reasons": _string_list(report.get("blocked_reasons")),
+        **_stable_first_release_scope_counts(nested),
+    }
+
+
+def _stable_first_release_scope_counts(summary: Mapping[str, Any]) -> dict[str, int]:
+    return {
+        "stable_first_release_turbocore_optimizer_blocker_count": int(
+            summary.get("stable_first_release_turbocore_optimizer_blocker_count", 0) or 0
+        ),
+        "turbocore_optimizer_default_off_release_scope_ready_count": int(
+            summary.get("turbocore_optimizer_default_off_release_scope_ready_count", 0) or 0
+        ),
+        "owner_release_approval_recorded_count": int(
+            summary.get("owner_release_approval_recorded_count", 0) or 0
+        ),
+        "owner_release_direction_recorded_count": int(
+            summary.get("owner_release_direction_recorded_count", 0) or 0
+        ),
+        "owner_release_direction_approval_recorded_count": int(
+            summary.get("owner_release_direction_approval_recorded_count", 0) or 0
+        ),
+        "product_exposure_decision_recorded_count": int(
+            summary.get("product_exposure_decision_recorded_count", 0) or 0
+        ),
+        "product_training_route_binding_ready_count": int(
+            summary.get("product_training_route_binding_ready_count", 0) or 0
+        ),
+        "run_local_adapter_staged_count": int(summary.get("run_local_adapter_staged_count", 0) or 0),
+        "runtime_config_patch_applied_count": int(summary.get("runtime_config_patch_applied_count", 0) or 0),
+        "training_path_enabled_count": int(summary.get("training_path_enabled_count", 0) or 0),
+    }
+
+
+def _stable_first_release_scope_blockers(summary: Mapping[str, Any]) -> list[str]:
+    if not summary.get("present"):
+        return []
+    blocked = _string_list(summary.get("blocked_reasons"))
+    if summary.get("ok") is not True:
+        blocked.append("native_update_release_review_archive_stable_first_release_scope_not_ok")
+    if summary.get("turbocore_optimizer_default_off_release_scope_ready") is not True:
+        blocked.append("native_update_release_review_archive_default_off_release_scope_not_ready")
+    if summary.get("stable_first_release_blocked_by_turbocore_optimizer") is True:
+        blocked.append("native_update_release_review_archive_stable_first_release_scope_blocked")
+    if int(summary.get("stable_first_release_turbocore_optimizer_blocker_count", 0) or 0) != 0:
+        blocked.append("native_update_release_review_archive_stable_first_release_blockers_present")
+    if int(summary.get("turbocore_optimizer_default_off_release_scope_ready_count", 0) or 0) != 1:
+        blocked.append("native_update_release_review_archive_default_off_release_scope_ready_count_missing")
+    for field in (
+        "native_training_claim_allowed",
+        "product_exposure_allowed",
+        "runtime_dispatch_allowed",
+        "native_dispatch_allowed",
+        "training_path_enabled",
+    ):
+        if summary.get(field) is True:
+            blocked.append(f"native_update_release_review_archive_stable_scope_unsafe:{field}")
+    for field in (
+        "owner_release_approval_recorded_count",
+        "product_exposure_decision_recorded_count",
+        "product_training_route_binding_ready_count",
+        "run_local_adapter_staged_count",
+        "runtime_config_patch_applied_count",
+        "training_path_enabled_count",
+    ):
+        if int(summary.get(field, 0) or 0) != 0:
+            blocked.append(f"native_update_release_review_archive_stable_scope_unsafe:{field}")
     return _dedupe(blocked)
 
 

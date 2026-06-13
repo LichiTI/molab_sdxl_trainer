@@ -42,6 +42,9 @@ def build_shadow_readiness_config(
         **config,
         "direct_grad_lifecycle_integrated": bool(config.get("direct_grad", False)),
         "checkpoint_metadata_integrated": True,
+        "trainer_state_metadata_integrated": True,
+        "trainer_state_save_sync_verified": bool(save_owner_state),
+        "resume_owner_state_guard_verified": bool(save_owner_state),
         "checkpoint_owner_state_enabled": bool(save_owner_state),
         "copyback_scratch_probe_integrated": bool(
             config.get("copyback_probe", False) or copyback.get("scratch_copyback_validated", False)

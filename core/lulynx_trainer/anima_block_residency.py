@@ -14,10 +14,12 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from .dit_residency_planner import (
-    build_dit_residency_plan,
+from .dit_block_prefetch_controller import (
     clear_dit_block_prefetch_controller,
     install_dit_block_prefetch_controller,
+)
+from .dit_residency_planner import (
+    build_dit_residency_plan,
     normalize_dit_block_residency,
 )
 from .pcie_cache_profiler import build_dit_pcie_cache_profile
@@ -139,6 +141,7 @@ def apply_anima_block_residency(
     dtype: torch.dtype | None = None,
     prefetch_enabled: bool = False,
     prefetch_depth: int = 1,
+    prefetch_mode: str = "original",
     transfer_format: str | None = None,
     sparse_swap_enabled: bool = False,
     sparse_swap_budget_mb: float | None = None,
@@ -218,6 +221,7 @@ def apply_anima_block_residency(
             device=device,
             dtype=dtype,
             install_hooks=True,
+            prefetch_mode=prefetch_mode,
         )
         block_owner = getattr(model, "unet", model)
         if controller is not None and block_owner is not model:

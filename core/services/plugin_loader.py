@@ -53,7 +53,6 @@ _BASE_IMPORT_MODULES: frozenset[str] = frozenset({
     "logging", "hashlib", "base64", "uuid", "copy", "textwrap",
     "string", "abc", "contextlib", "statistics", "operator",
     "numbers", "decimal", "fractions", "secrets", "hmac",
-    "__future__",
     "struct", "array", "bisect", "heapq", "queue",
     "pprint",
     # Internal cleanroom packages (allowed)

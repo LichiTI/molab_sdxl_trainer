@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -21,6 +20,13 @@ from core.turbocore_v5_controlled_rollout_policy_evidence_gate_utils import (  #
     event_list as _event_list,
     history_summary as _history_summary,
     string_list as _string_list,
+)
+from core.turbocore_optimizer_v2_approval_preflight_guard import (  # noqa: E402
+    approval_preflight_phase_ready as _approval_preflight_phase_ready,
+    approval_preflight_record_binding as _approval_preflight_record_binding,
+    approval_preflight_record_blockers as _approval_preflight_record_blockers,
+    approval_preflight_signed_digest_match as _approval_preflight_signed_digest_match,
+    digest_payload as _digest_payload,
 )
 
 
@@ -103,6 +109,7 @@ def build_native_update_product_exposure_decision(
     training_launch_contract: Mapping[str, Any] | None = None,
     product_exposure_evidence: Mapping[str, Any] | None = None,
     product_exposure_review: Mapping[str, Any] | None = None,
+    approval_preflight: Mapping[str, Any] | None = None,
     failure_history: Sequence[Any] | None = None,
     rollback_history: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
@@ -110,7 +117,8 @@ def build_native_update_product_exposure_decision(
 
     launch = _training_launch_summary(_as_dict(training_launch_contract))
     exposure = _product_exposure_summary(_as_dict(product_exposure_evidence))
-    review = _review_summary(_as_dict(product_exposure_review))
+    raw_review = _as_dict(product_exposure_review)
+    review = _review_summary(raw_review)
     failure_events = _event_list(failure_history)
     rollback_events = _event_list(rollback_history)
     evidence_blockers = _evidence_blockers(
@@ -119,7 +127,16 @@ def build_native_update_product_exposure_decision(
         failure_events=failure_events,
         rollback_events=rollback_events,
     )
-    review_blockers = _review_blockers(review)
+    review_blockers = _review_blockers(review) + (
+        _approval_preflight_blockers(
+            _as_dict(approval_preflight),
+            phase="phase1",
+            signature_id="product_exposure_review",
+            signed_payload=raw_review,
+        )
+        if review.get("present")
+        else []
+    )
     if evidence_blockers:
         decision = BLOCKED_DECISION
     elif not review.get("present"):
@@ -135,6 +152,11 @@ def build_native_update_product_exposure_decision(
         blockers.append("native_update_product_exposure_owner_review_missing")
     blockers = _dedupe(blockers)
     evidence_ready = not evidence_blockers
+    preflight_binding = _approval_preflight_record_binding(
+        _as_dict(approval_preflight),
+        "product_exposure_review",
+        raw_review,
+    )
     return {
         "schema_version": 1,
         "package": "turbocore_native_update_product_exposure_decision_v0",
@@ -154,15 +176,63 @@ def build_native_update_product_exposure_decision(
         "training_launch_contract_summary": launch,
         "product_exposure_evidence_summary": exposure,
         "product_exposure_review": review,
+        "approval_preflight_present": bool(approval_preflight),
+        "approval_preflight_phase1_ready": _approval_preflight_phase_ready(
+            _as_dict(approval_preflight),
+            phase="phase1",
+        ),
+        "approval_preflight_signed_product_exposure_review_digest_match": _approval_preflight_signed_digest_match(
+            _as_dict(approval_preflight),
+            "product_exposure_review",
+            raw_review,
+        ),
+        **preflight_binding,
         "product_exposure_review_template": _review_template(launch, exposure),
         "progress_gates": {
             "training_launch_contract_ready": bool(launch.get("ready")),
             "product_exposure_evidence_ready": bool(exposure.get("ready")),
+            "approval_execution_preflight_phase1_ready": _approval_preflight_phase_ready(
+                _as_dict(approval_preflight),
+                phase="phase1",
+            ),
+            "approval_execution_preflight_signed_review_digest_match": _approval_preflight_signed_digest_match(
+                _as_dict(approval_preflight),
+                "product_exposure_review",
+                raw_review,
+            ),
             "owner_decision_boundary_default_off_count": exposure.get("owner_boundary_default_off_count", 0),
             "request_adapter_boundary_default_off_count": exposure.get("request_boundary_default_off_count", 0),
             "schema_boundary_default_off_count": exposure.get("schema_boundary_default_off_count", 0),
             "ui_boundary_default_off_count": exposure.get("ui_boundary_default_off_count", 0),
             "signed_product_exposure_review_present": bool(review.get("present")),
+        },
+        "summary": {
+            "product_exposure_decision_recorded_count": 1 if decision == READY_DECISION else 0,
+            "approval_preflight_phase1_ready_count": 1
+            if _approval_preflight_phase_ready(_as_dict(approval_preflight), phase="phase1")
+            else 0,
+            "approval_preflight_signed_review_digest_match_count": 1
+            if _approval_preflight_signed_digest_match(
+                _as_dict(approval_preflight),
+                "product_exposure_review",
+                raw_review,
+            )
+            else 0,
+            "approval_preflight_digest_present_count": 1
+            if preflight_binding["approval_preflight_digest"]
+            else 0,
+            "approval_preflight_signed_payload_digest_present_count": 1
+            if preflight_binding["approval_preflight_signed_payload_digest"]
+            else 0,
+            "approval_preflight_signed_bundle_entry_digest_present_count": 1
+            if preflight_binding["approval_preflight_signed_bundle_entry_digest"]
+            else 0,
+            "approval_preflight_binding_ready_count": 1
+            if preflight_binding["approval_preflight_binding_ready"]
+            else 0,
+            "runtime_dispatch_ready_count": 0,
+            "native_dispatch_allowed_count": 0,
+            "training_path_enabled_count": 0,
         },
         "failure_history_summary": _history_summary(failure_events),
         "rollback_history_summary": _history_summary(rollback_events),
@@ -371,6 +441,22 @@ def _review_blockers(review: Mapping[str, Any]) -> list[str]:
     return _dedupe(blocked)
 
 
+def _approval_preflight_blockers(
+    preflight: Mapping[str, Any],
+    *,
+    phase: str,
+    signature_id: str,
+    signed_payload: Mapping[str, Any],
+) -> list[str]:
+    return _approval_preflight_record_blockers(
+        preflight,
+        phase=phase,
+        signature_id=signature_id,
+        signed_payload=signed_payload,
+        unsafe_blockers=lambda value: _unsafe_claims(value, "approval_execution_preflight"),
+    )
+
+
 def _review_template(launch: Mapping[str, Any], exposure: Mapping[str, Any]) -> dict[str, Any]:
     template = {
         "reviewer": "",
@@ -433,25 +519,19 @@ def _recommended_next_step(decision: str, evidence_ready: bool) -> str:
     return "repair training-launch or product-exposure evidence before owner review"
 
 
-def _digest_payload(value: Mapping[str, Any]) -> str:
-    if not value:
-        return ""
-    payload = {k: v for k, v in value.items() if not str(k).startswith("_source_")}
-    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build native-update default-off product exposure decision.")
     parser.add_argument("--training-launch-contract", required=True)
     parser.add_argument("--product-exposure-evidence", required=True)
     parser.add_argument("--product-exposure-review")
+    parser.add_argument("--approval-preflight")
     parser.add_argument("--out")
     args = parser.parse_args(argv)
     payload = build_native_update_product_exposure_decision(
         training_launch_contract=load_json(args.training_launch_contract),
         product_exposure_evidence=load_json(args.product_exposure_evidence),
         product_exposure_review=load_json(args.product_exposure_review) if args.product_exposure_review else None,
+        approval_preflight=load_json(args.approval_preflight) if args.approval_preflight else None,
     )
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
     if args.out:

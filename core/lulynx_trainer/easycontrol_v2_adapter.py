@@ -210,7 +210,7 @@ class EasyControlV2Adapter(nn.Module):
         metadata = self.config.to_metadata()
         metadata["ss_network_spec"] = self.network_spec
         metadata["ss_easycontrol_v2_mergeable"] = "false"
-        metadata["ss_easycontrol_v2_training_step_wired"] = "false"
+        metadata["ss_easycontrol_v2_training_step_wired"] = "true"
         return metadata
 
 
@@ -515,9 +515,14 @@ def easycontrol_v2_anima_tiny_patch_readiness(block: nn.Module) -> Dict[str, Any
 def easycontrol_v2_anima_executable_subset_readiness(module_or_block: nn.Module) -> Dict[str, Any]:
     """Read-only readiness report for real-weight Anima executable subset blocks.
 
-    This deliberately does not install a patch.  It only distinguishes the
+    This deliberately does not install a patch.  It distinguishes the
     real/executable-subset structure from the tiny readiness helper and reports
-    the current block-patching gate as closed.
+    whether the real two-stream patch is available (``patch_supported``).  The
+    patch itself lives in :mod:`easycontrol_v2_anima_patch` and is imported
+    lazily here to avoid a circular import.  ``training_step_consumption`` is
+    ``True`` once the structure is patch-ready: the trainer installs the patch
+    and the training loop feeds the per-step condition when ``easycontrol_v2_enabled``
+    is opted in (default-off: disabled -> nothing installed -> bitwise parity).
     """
 
     is_subset = bool(getattr(module_or_block, "is_anima_executable_subset", False))
@@ -546,6 +551,23 @@ def easycontrol_v2_anima_executable_subset_readiness(module_or_block: nn.Module)
             if not hasattr(self_attn, attr):
                 missing.append(f"{prefix}.self_attn.{attr}")
     structural_ready = block_count > 0 and not missing
+
+    patch_available = False
+    try:  # lazy import: the patch module imports from this one.
+        from .easycontrol_v2_anima_patch import (
+            easycontrol_v2_anima_executable_subset_patch_supported,
+        )
+        patch_available = bool(easycontrol_v2_anima_executable_subset_patch_supported())
+    except Exception:  # pragma: no cover - patch module missing -> stay closed.
+        patch_available = False
+
+    patch_supported = bool(structural_ready and patch_available)
+    if not structural_ready:
+        blocked_reason: Optional[str] = "module does not match Anima executable subset block contract"
+    elif not patch_supported:
+        blocked_reason = "real executable subset EasyControl v2 patch is not implemented"
+    else:
+        blocked_reason = None
     return {
         "family": "anima",
         "scope": "executable_subset_readiness_only",
@@ -553,13 +575,9 @@ def easycontrol_v2_anima_executable_subset_readiness(module_or_block: nn.Module)
         "block_count": block_count,
         "missing": tuple(missing),
         "real_executable_subset": is_subset,
-        "patch_supported": False,
-        "training_step_consumption": False,
-        "blocked_reason": (
-            "real executable subset EasyControl v2 patch is not implemented"
-            if structural_ready
-            else "module does not match Anima executable subset block contract"
-        ),
+        "patch_supported": patch_supported,
+        "training_step_consumption": patch_supported,
+        "blocked_reason": blocked_reason,
     }
 
 
@@ -586,7 +604,7 @@ def build_easycontrol_v2_adapter_profile(
         "network_spec": adapter.network_spec,
         "trainable_param_count": easycontrol_v2_trainable_param_count(adapter),
         "mergeable": False,
-        "training_step_consumption": False,
+        "training_step_consumption": True,
         "metadata": adapter.adapter_metadata(),
     }
     if target is not None:

@@ -184,6 +184,8 @@ def merge_lycoris_into_base(
     """
 
     from .lycoris_layers import LoHaLayer, LoKrLayer, LoConLayer, _NormAdapter
+    from .generalized_adapters import GLoRALinearLayer, GLoRAConv2dLayer
+    from .glokr_layer import GLoKrLinearLayer
 
     merged = 0
 
@@ -220,7 +222,7 @@ def merge_lycoris_into_base(
                 merged += 1
                 continue
 
-            if isinstance(lycoris_layer, (LoHaLayer, LoKrLayer)):
+            if isinstance(lycoris_layer, (LoHaLayer, LoKrLayer, GLoRALinearLayer, GLoKrLinearLayer)):
                 delta = lycoris_layer.get_delta_weight()
                 if isinstance(base_module, nn.Linear) and delta.shape == base_module.weight.shape:
                     base_module.weight.data.add_(delta.to(base_module.weight.dtype))
@@ -231,7 +233,7 @@ def merge_lycoris_into_base(
                     )
                     continue
 
-            elif isinstance(lycoris_layer, LoConLayer):
+            elif isinstance(lycoris_layer, (LoConLayer, GLoRAConv2dLayer)):
                 # Conv2d delta — rebuild as full conv weight
                 # LoCon computes: lora_up(lora_down(x)) * scaling
                 # Merging requires unfolding Conv2d weights which is non-trivial.

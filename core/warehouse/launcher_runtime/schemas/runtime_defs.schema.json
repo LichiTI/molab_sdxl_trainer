@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RuntimeDef collection",
+  "description": "Array of runtime environment definitions, or an envelope with a 'runtimes' key.",
+  "oneOf": [
+    {
+      "type": "array",
+      "items": { "$ref": "#/$defs/runtime_def" }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "runtimes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/runtime_def" }
+        }
+      },
+      "required": ["runtimes"],
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "runtime_def": {
+      "type": "object",
+      "required": [
+        "id",
+        "name_en",
+        "name_zh",
+        "description_en",
+        "description_zh",
+        "category"
+      ],
+      "properties": {
+        "id":                 { "type": "string" },
+        "name_en":            { "type": "string" },
+        "name_zh":            { "type": "string" },
+        "description_en":     { "type": "string" },
+        "description_zh":     { "type": "string" },
+        "category":           { "type": "string", "enum": ["nvidia", "nvidia_frontier", "intel", "amd", "cpu"] },
+        "experimental":       { "type": "boolean", "default": false },
+        "env_dir_names":      { "type": "array", "items": { "type": "string" }, "default": [] },
+        "python_rel_path":    { "type": "string", "default": "python.exe" },
+        "env_vars":           { "type": "object", "additionalProperties": { "type": "string" }, "default": {} },
+        "install_scripts":    { "type": "array", "items": { "type": "string" }, "default": [] },
+        "attention_policy_default": { "type": "string", "default": "auto" },
+        "extra":              { "type": "object", "default": {} }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -30,7 +30,13 @@ if __package__ in (None, ""):
 
 from core.configs import MixedPrecision, ModelArch, OptimizerType, SchedulerType, UnifiedTrainingConfig
 from core.lulynx_trainer.dataset_discovery import caption_candidates_for_stem
+from core.lulynx_trainer.newbie_targets import get_newbie_targets
 from core.lulynx_trainer.newbie_cache_contract import find_newbie_cache_files, newbie_cache_contract_for_files
+from core.lulynx_trainer.bubble_sd15_lora512_release_gap_readiness import (
+    SD15_CHECKPOINT_CANDIDATES,
+    SD15_MODEL_DIR_NAMES,
+    sd15_checkpoint_candidates,
+)
 from core.lulynx_trainer.trainer import LulynxTrainer
 from core.lulynx_trainer.runtime_feature_summary import load_runtime_feature_summary_from_manifest
 from core.lulynx_trainer.step_phase_profile import build_step_phase_bubble_profile
@@ -46,24 +52,45 @@ BLOCK_RESIDENCY_MODE_CHOICES = (
     "balanced",
     "steaming_offload",
 )
-
-SD15_CHECKPOINT_CANDIDATES = (
-    "v1-5-pruned-emaonly.safetensors",
-    "v1-5-pruned.safetensors",
-    "sd15.safetensors",
-    "model.safetensors",
+NEWBIE_TARGET_SCOPE_CHOICES = ("layer0_attention", "tail8_attention", "minimal", "balanced", "full")
+NEWBIE_LAYER0_ATTENTION_TARGETS = ("layers.0.attention.qkv", "layers.0.attention.out")
+NEWBIE_TAIL8_ATTENTION_TARGETS = tuple(
+    target
+    for layer_index in range(28, 36)
+    for target in (f"layers.{layer_index}.attention.qkv", f"layers.{layer_index}.attention.out")
 )
+DIT_COMPUTE_REDUCER_STRATEGY_CHOICES = ("none", "tread", "diffcr", "blockskip")
+
+
+def _normalize_newbie_target_scope(scope: str | None) -> str:
+    normalized = str(scope or "layer0_attention").strip().lower().replace("-", "_")
+    if normalized in {"layer0", "layer_0", "layer0_attn", "layer_0_attention"}:
+        return "layer0_attention"
+    if normalized in {"tail8", "tail_8", "late_attention", "late8_attention"}:
+        return "tail8_attention"
+    if normalized in NEWBIE_TARGET_SCOPE_CHOICES:
+        return normalized
+    return "layer0_attention"
+
+
+def _newbie_target_modules_for_scope(scope: str | None) -> tuple[str, tuple[str, ...]]:
+    normalized = _normalize_newbie_target_scope(scope)
+    if normalized == "layer0_attention":
+        return normalized, NEWBIE_LAYER0_ATTENTION_TARGETS
+    if normalized == "tail8_attention":
+        return normalized, NEWBIE_TAIL8_ATTENTION_TARGETS
+    unet_targets, _ = get_newbie_targets(normalized)
+    return normalized, tuple(str(target) for target in unet_targets if str(target).strip())
 
 
 def _resolve_sd15_checkpoint(model_root: Path) -> Path:
-    sd15_dir = model_root / "sd15"
-    candidates = [sd15_dir / name for name in SD15_CHECKPOINT_CANDIDATES]
-    candidates.extend(sorted(sd15_dir.glob("*.safetensors")))
+    candidates = sd15_checkpoint_candidates(model_root)
     checkpoint = next((path for path in candidates if path.is_file()), None)
     if checkpoint is None:
         expected = ", ".join(str(path) for path in candidates[: len(SD15_CHECKPOINT_CANDIDATES)])
+        accepted_dirs = ", ".join(f"models/{name}" for name in SD15_MODEL_DIR_NAMES)
         raise FileNotFoundError(
-            "SD15 benchmark requires a local base checkpoint under models/sd15 "
+            f"SD15 benchmark requires a local base checkpoint under one of {accepted_dirs} "
             f"(expected one of: {expected})"
         )
     return checkpoint
@@ -376,6 +403,7 @@ def _common_config(
     train_batch_size: int,
     gradient_accumulation_steps: int,
     learning_rate: float | None,
+    seed: int = 1337,
 ) -> dict[str, Any]:
     mixed_precision, save_precision, _dtype = _precision()
     lr = float(learning_rate) if learning_rate is not None and float(learning_rate) > 0.0 else (1e-5 if family == "newbie" else 1e-4)
@@ -404,7 +432,7 @@ def _common_config(
         "gradient_checkpointing": True,
         "resolution": int(resolution),
         "caption_extension": ".txt",
-        "seed": 1337,
+        "seed": max(int(seed), 0),
         "mem_efficient_save": True,
         "compile_probe_enabled": False,
         "compile_anima_full_core_enabled": False,
@@ -443,6 +471,8 @@ def _make_config(
     train_batch_size: int,
     gradient_accumulation_steps: int,
     learning_rate: float | None,
+    seed: int,
+    checkpoint_policy: str,
     anima_latent_crop_size: int,
     anima_fixed_text_tokens: int,
     anima_fixed_visual_tokens: int,
@@ -452,6 +482,7 @@ def _make_config(
     anima_block_checkpointing_mode: str,
     anima_block_prefetch: bool,
     anima_block_prefetch_depth: int,
+    anima_block_prefetch_mode: str,
     newbie_latent_crop_size: int,
     newbie_fixed_text_tokens: int,
     newbie_fixed_visual_tokens: int,
@@ -461,6 +492,18 @@ def _make_config(
     newbie_block_checkpointing_mode: str,
     newbie_block_prefetch: bool,
     newbie_block_prefetch_depth: int,
+    newbie_safe_fallback: bool,
+    newbie_target_scope: str,
+    dit_compute_reducer_strategy: str,
+    dit_compute_reducer_keep_ratio: float,
+    dit_compute_reducer_min_keep_tokens: int,
+    dit_compute_reducer_compression_ratio: float,
+    dit_compute_reducer_min_tokens: int,
+    dit_compute_reducer_skip_ratio: float,
+    dit_compute_reducer_skip_every: int,
+    dit_compute_reducer_warmup_steps: int,
+    dit_compute_reducer_min_block: int,
+    dit_compute_reducer_score_mode: str,
     phase_profile: bool,
     bubble_controller: Mapping[str, Any] | None,
     turbocore_update_shadow: str,
@@ -498,7 +541,14 @@ def _make_config(
         train_batch_size=train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
+        seed=seed,
     )
+    checkpoint_policy = str(checkpoint_policy or "auto").strip().lower().replace("-", "_")
+    if checkpoint_policy not in {"auto", "off", "full", "offloaded", "selective"}:
+        checkpoint_policy = "auto"
+    common["checkpoint_policy"] = checkpoint_policy
+    if checkpoint_policy == "off":
+        common["gradient_checkpointing"] = False
     bubble = dict(bubble_controller or {})
     if bubble:
         common["bubble_controller_enabled"] = bool(bubble.get("enabled", False))
@@ -510,6 +560,21 @@ def _make_config(
         common["bubble_controller_allow_dataloader_rebuild_current_run"] = bool(
             bubble.get("allow_dataloader_rebuild_current_run", False)
         )
+    common["dit_compute_reducer_strategy"] = str(
+        dit_compute_reducer_strategy or "none"
+    ).strip().lower().replace("-", "_")
+    common["dit_compute_reducer_keep_ratio"] = min(max(float(dit_compute_reducer_keep_ratio), 0.0), 1.0)
+    common["dit_compute_reducer_min_keep_tokens"] = max(int(dit_compute_reducer_min_keep_tokens), 1)
+    common["dit_compute_reducer_compression_ratio"] = min(
+        max(float(dit_compute_reducer_compression_ratio), 0.0),
+        1.0,
+    )
+    common["dit_compute_reducer_min_tokens"] = max(int(dit_compute_reducer_min_tokens), 1)
+    common["dit_compute_reducer_skip_ratio"] = min(max(float(dit_compute_reducer_skip_ratio), 0.0), 0.95)
+    common["dit_compute_reducer_skip_every"] = max(int(dit_compute_reducer_skip_every), 0)
+    common["dit_compute_reducer_warmup_steps"] = max(int(dit_compute_reducer_warmup_steps), 0)
+    common["dit_compute_reducer_min_block"] = max(int(dit_compute_reducer_min_block), 0)
+    common["dit_compute_reducer_score_mode"] = str(dit_compute_reducer_score_mode or "l2").strip().lower()
     common["turbocore_update_shadow_mode"] = str(turbocore_update_shadow or "off")
     common["turbocore_update_shadow_direct_grad"] = bool(turbocore_update_shadow_direct_grad)
     common["turbocore_update_shadow_compare_interval"] = 1
@@ -611,19 +676,21 @@ def _make_config(
             anima_block_checkpointing_mode=str(anima_block_checkpointing_mode or "block"),
             anima_block_prefetch=bool(anima_block_prefetch),
             anima_block_prefetch_depth=max(int(anima_block_prefetch_depth), 0),
+            anima_block_prefetch_mode=str(anima_block_prefetch_mode or "original"),
             anima_native_block_count=28,
             **common,
         )
     if family == "newbie":
         common["step_phase_profile_enabled"] = bool(phase_profile)
         newbie_dir = model_root / "newbie"
+        newbie_target_scope, newbie_target_modules = _newbie_target_modules_for_scope(newbie_target_scope)
         return UnifiedTrainingConfig(
             model_type=ModelArch.NEWBIE,
             pretrained_model_name_or_path=str(newbie_dir),
             attention_backend="auto",
             trust_remote_code=True,
             use_cache=True,
-            newbie_safe_fallback=torch.cuda.is_available(),
+            newbie_safe_fallback=bool(newbie_safe_fallback),
             newbie_run_native_smoke=False,
             newbie_transformer_path=str(newbie_dir / "transformer"),
             newbie_gemma_model_path=str(newbie_dir / "text_encoder"),
@@ -641,7 +708,8 @@ def _make_config(
             newbie_block_checkpointing_mode=str(newbie_block_checkpointing_mode or "block"),
             newbie_block_prefetch=bool(newbie_block_prefetch),
             newbie_block_prefetch_depth=max(int(newbie_block_prefetch_depth), 0),
-            newbie_target_modules="layers.0.attention.qkv\nlayers.0.attention.out",
+            newbie_target_modules="\n".join(newbie_target_modules),
+            newbie_target_scope=newbie_target_scope,
             **common,
         )
     raise ValueError(f"Unsupported family: {family}")
@@ -662,7 +730,9 @@ def _run_profile(
     train_batch_size: int,
     gradient_accumulation_steps: int,
     learning_rate: float | None,
+    seed: int,
     sample_count: int,
+    checkpoint_policy: str,
     fused_adamw: bool,
     attention_backend: str,
     sdpa_backend_policy: str,
@@ -680,6 +750,7 @@ def _run_profile(
     anima_block_checkpointing_mode: str,
     anima_block_prefetch: bool,
     anima_block_prefetch_depth: int,
+    anima_block_prefetch_mode: str,
     newbie_latent_crop_size: int,
     newbie_fixed_text_tokens: int,
     newbie_fixed_visual_tokens: int,
@@ -689,6 +760,30 @@ def _run_profile(
     newbie_block_checkpointing_mode: str,
     newbie_block_prefetch: bool,
     newbie_block_prefetch_depth: int,
+    newbie_safe_fallback: bool,
+    newbie_backward_op_profile: bool,
+    newbie_backward_op_profile_top_k: int,
+    newbie_backward_op_profile_max_samples: int,
+    newbie_backward_op_profile_record_shapes: bool,
+    newbie_module_timing_profile: bool,
+    newbie_module_timing_profile_top_k: int,
+    newbie_module_timing_profile_max_samples: int,
+    newbie_target_scope: str,
+    dit_compute_reducer_strategy: str,
+    dit_compute_reducer_keep_ratio: float,
+    dit_compute_reducer_min_keep_tokens: int,
+    dit_compute_reducer_compression_ratio: float,
+    dit_compute_reducer_min_tokens: int,
+    dit_compute_reducer_skip_ratio: float,
+    dit_compute_reducer_skip_every: int,
+    dit_compute_reducer_warmup_steps: int,
+    dit_compute_reducer_min_block: int,
+    dit_compute_reducer_score_mode: str,
+    triton_ops: bool,
+    triton_ops_inject_lora: bool,
+    triton_ops_inject_qkv: bool,
+    triton_ops_inject_adaln: bool,
+    triton_ops_fp32_backward: bool,
     lora_activation_recompute: str,
     phase_profile: bool,
     bubble_controller: Mapping[str, Any] | None,
@@ -759,6 +854,8 @@ def _run_profile(
         train_batch_size=train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
+        seed=seed,
+        checkpoint_policy=checkpoint_policy,
         anima_latent_crop_size=anima_latent_crop_size,
         anima_fixed_text_tokens=anima_fixed_text_tokens,
         anima_fixed_visual_tokens=anima_fixed_visual_tokens,
@@ -768,6 +865,7 @@ def _run_profile(
         anima_block_checkpointing_mode=anima_block_checkpointing_mode,
         anima_block_prefetch=anima_block_prefetch,
         anima_block_prefetch_depth=anima_block_prefetch_depth,
+        anima_block_prefetch_mode=anima_block_prefetch_mode,
         newbie_latent_crop_size=newbie_latent_crop_size,
         newbie_fixed_text_tokens=newbie_fixed_text_tokens,
         newbie_fixed_visual_tokens=newbie_fixed_visual_tokens,
@@ -777,6 +875,18 @@ def _run_profile(
         newbie_block_checkpointing_mode=newbie_block_checkpointing_mode,
         newbie_block_prefetch=newbie_block_prefetch,
         newbie_block_prefetch_depth=newbie_block_prefetch_depth,
+        newbie_safe_fallback=bool(newbie_safe_fallback),
+        newbie_target_scope=newbie_target_scope,
+        dit_compute_reducer_strategy=dit_compute_reducer_strategy,
+        dit_compute_reducer_keep_ratio=dit_compute_reducer_keep_ratio,
+        dit_compute_reducer_min_keep_tokens=dit_compute_reducer_min_keep_tokens,
+        dit_compute_reducer_compression_ratio=dit_compute_reducer_compression_ratio,
+        dit_compute_reducer_min_tokens=dit_compute_reducer_min_tokens,
+        dit_compute_reducer_skip_ratio=dit_compute_reducer_skip_ratio,
+        dit_compute_reducer_skip_every=dit_compute_reducer_skip_every,
+        dit_compute_reducer_warmup_steps=dit_compute_reducer_warmup_steps,
+        dit_compute_reducer_min_block=dit_compute_reducer_min_block,
+        dit_compute_reducer_score_mode=dit_compute_reducer_score_mode,
         phase_profile=phase_profile,
         bubble_controller=bubble_controller,
         turbocore_update_shadow=turbocore_update_shadow,
@@ -833,6 +943,8 @@ def _run_profile(
     if cfg.torch_compile:
         scope = str(torch_compile_scope or "per_block").strip().lower().replace("-", "_")
         cfg.torch_compile_scope = scope if scope in {"per_block", "full", "full_core"} else "per_block"
+        if family in {"anima", "newbie"}:
+            cfg.anima_compile_scope = cfg.torch_compile_scope
         cfg.torch_compile_backend = str(torch_compile_backend or "inductor")
         cfg.torch_compile_mode = str(torch_compile_mode or "default")
         cfg.torch_compile_dynamic = bool(torch_compile_dynamic)
@@ -851,6 +963,19 @@ def _run_profile(
         cfg.lora_activation_recompute = True
     elif recompute_mode in {"off", "false", "0", "no"}:
         cfg.lora_activation_recompute = False
+    if family == "newbie":
+        cfg.newbie_backward_op_profile_enabled = bool(newbie_backward_op_profile)
+        cfg.newbie_backward_op_profile_top_k = max(int(newbie_backward_op_profile_top_k or 0), 1)
+        cfg.newbie_backward_op_profile_max_samples = max(int(newbie_backward_op_profile_max_samples or 0), 1)
+        cfg.newbie_backward_op_profile_record_shapes = bool(newbie_backward_op_profile_record_shapes)
+        cfg.newbie_module_timing_profile_enabled = bool(newbie_module_timing_profile)
+        cfg.newbie_module_timing_profile_top_k = max(int(newbie_module_timing_profile_top_k or 0), 1)
+        cfg.newbie_module_timing_profile_max_samples = max(int(newbie_module_timing_profile_max_samples or 0), 1)
+    cfg.triton_ops_enabled = bool(triton_ops)
+    cfg.triton_ops_inject_lora = bool(triton_ops_inject_lora)
+    cfg.triton_ops_inject_qkv = bool(triton_ops_inject_qkv)
+    cfg.triton_ops_inject_adaln = bool(triton_ops_inject_adaln)
+    cfg.triton_ops_fp32_backward = bool(triton_ops_fp32_backward)
     benchmark_stall_ms = max(float(bubble_controller_benchmark_data_wait_stall_ms or 0.0), 0.0)
     cfg.bubble_controller_benchmark_data_wait_stall_ms = benchmark_stall_ms
     cfg.bubble_controller_benchmark_data_wait_direct_action = bool(
@@ -1137,6 +1262,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=0.0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1337,
+        help="Benchmark seed passed through the normal trainer request config.",
+    )
+    parser.add_argument(
+        "--checkpoint-policy",
+        choices=("auto", "off", "full", "offloaded", "selective"),
+        default="auto",
+        help="Probe-only: override checkpoint_policy through the normal trainer runtime contract.",
+    )
     parser.add_argument("--dataloader-workers", type=int, default=0)
     parser.add_argument("--dataloader-prefetch-factor", type=int, default=2)
     parser.add_argument("--no-pin-memory", action="store_true")
@@ -1259,6 +1396,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--anima-block-checkpointing-mode", default="block", choices=("block",))
     parser.add_argument("--anima-block-prefetch", action="store_true", help="Async prefetch CPU-pinned Anima DiT Linear weights for streaming_offload.")
     parser.add_argument("--anima-block-prefetch-depth", type=int, default=1)
+    parser.add_argument("--anima-block-prefetch-mode", default="original", choices=("original", "adaptive"))
     parser.add_argument("--newbie-latent-crop-size", type=int, default=4, help="Newbie cached latent crop size. Use 0 for full cached latents.")
     parser.add_argument("--newbie-fixed-text-tokens", type=int, default=64)
     parser.add_argument("--newbie-fixed-visual-tokens", type=int, default=4, help="Use 0 to avoid fixed-token padding.")
@@ -1268,6 +1406,56 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--newbie-block-checkpointing-mode", default="block", choices=("block",))
     parser.add_argument("--newbie-block-prefetch", action="store_true", help="Async prefetch CPU-pinned Newbie DiT Linear weights for streaming_offload.")
     parser.add_argument("--newbie-block-prefetch-depth", type=int, default=1)
+    parser.add_argument(
+        "--newbie-disable-safe-fallback",
+        action="store_true",
+        help="Probe-only: disable Newbie safe fallback so compile-contract probes can test the static graph path.",
+    )
+    parser.add_argument(
+        "--newbie-backward-op-profile",
+        action="store_true",
+        help="Probe-only: capture one compact torch.profiler op summary around Newbie loss.backward().",
+    )
+    parser.add_argument("--newbie-backward-op-profile-top-k", type=int, default=12)
+    parser.add_argument("--newbie-backward-op-profile-max-samples", type=int, default=1)
+    parser.add_argument(
+        "--newbie-backward-op-profile-shapes",
+        action="store_true",
+        help="Probe-only: record compact input-shape groups for Newbie backward matmul attribution.",
+    )
+    parser.add_argument(
+        "--newbie-module-timing-profile",
+        action="store_true",
+        help="Probe-only: attach temporary hooks for one compact Newbie module timing sample.",
+    )
+    parser.add_argument("--newbie-module-timing-profile-top-k", type=int, default=12)
+    parser.add_argument("--newbie-module-timing-profile-max-samples", type=int, default=1)
+    parser.add_argument(
+        "--newbie-target-scope",
+        default="layer0_attention",
+        choices=NEWBIE_TARGET_SCOPE_CHOICES,
+        help="Probe-only: choose Newbie LoRA target scope; default preserves the historical layer0 attention axis.",
+    )
+    parser.add_argument(
+        "--dit-compute-reducer-strategy",
+        choices=DIT_COMPUTE_REDUCER_STRATEGY_CHOICES,
+        default="none",
+        help="Probe-only: enable a default-off DiT block compute reducer through the trainer runtime contract.",
+    )
+    parser.add_argument("--dit-compute-reducer-keep-ratio", type=float, default=1.0)
+    parser.add_argument("--dit-compute-reducer-min-keep-tokens", type=int, default=1)
+    parser.add_argument("--dit-compute-reducer-compression-ratio", type=float, default=1.0)
+    parser.add_argument("--dit-compute-reducer-min-tokens", type=int, default=1)
+    parser.add_argument("--dit-compute-reducer-skip-ratio", type=float, default=0.0)
+    parser.add_argument("--dit-compute-reducer-skip-every", type=int, default=0)
+    parser.add_argument("--dit-compute-reducer-warmup-steps", type=int, default=0)
+    parser.add_argument("--dit-compute-reducer-min-block", type=int, default=0)
+    parser.add_argument("--dit-compute-reducer-score-mode", default="l2")
+    parser.add_argument("--triton-ops", action="store_true", help="Probe-only: enable default-off fused Triton adapter kernels.")
+    parser.add_argument("--triton-ops-no-lora", action="store_true", help="Probe-only: keep Triton ops enabled but skip standard LoRA patching.")
+    parser.add_argument("--triton-ops-no-qkv", action="store_true", help="Probe-only: skip Triton q/k/v adapter patching.")
+    parser.add_argument("--triton-ops-no-adaln", action="store_true", help="Probe-only: skip Triton AdaLN patching.")
+    parser.add_argument("--triton-ops-fp32-backward", action="store_true", help="Probe-only: use fp32 LoRA backward in Triton adapter path.")
     parser.add_argument("--source-data", type=Path, default=None, help="Optional dataset/cache source directory.")
     parser.add_argument("--profiles", nargs="+", choices=("standard", "aggressive"), default=("standard", "aggressive"))
     parser.add_argument(
@@ -1366,7 +1554,9 @@ def main(argv: list[str] | None = None) -> int:
             train_batch_size=max(int(args.train_batch_size), 1),
             gradient_accumulation_steps=max(int(args.gradient_accumulation_steps), 1),
             learning_rate=float(args.learning_rate) if float(args.learning_rate) > 0.0 else None,
+            seed=max(int(args.seed), 0),
             sample_count=max(args.samples, 1),
+            checkpoint_policy=str(args.checkpoint_policy or "auto"),
             fused_adamw=bool(args.fused_adamw),
             attention_backend=str(args.attention_backend or "auto"),
             sdpa_backend_policy=str(args.sdpa_backend_policy or "cutlass"),
@@ -1384,6 +1574,7 @@ def main(argv: list[str] | None = None) -> int:
             anima_block_checkpointing_mode=str(args.anima_block_checkpointing_mode),
             anima_block_prefetch=bool(args.anima_block_prefetch),
             anima_block_prefetch_depth=max(int(args.anima_block_prefetch_depth), 0),
+            anima_block_prefetch_mode=str(args.anima_block_prefetch_mode or "original"),
             newbie_latent_crop_size=max(int(args.newbie_latent_crop_size), 0),
             newbie_fixed_text_tokens=max(int(args.newbie_fixed_text_tokens), 0),
             newbie_fixed_visual_tokens=newbie_fixed_visual_tokens,
@@ -1393,6 +1584,33 @@ def main(argv: list[str] | None = None) -> int:
             newbie_block_checkpointing_mode=str(args.newbie_block_checkpointing_mode),
             newbie_block_prefetch=bool(args.newbie_block_prefetch),
             newbie_block_prefetch_depth=max(int(args.newbie_block_prefetch_depth), 0),
+            newbie_safe_fallback=torch.cuda.is_available() and not bool(args.newbie_disable_safe_fallback),
+            newbie_backward_op_profile=bool(args.newbie_backward_op_profile),
+            newbie_backward_op_profile_top_k=max(int(args.newbie_backward_op_profile_top_k), 1),
+            newbie_backward_op_profile_max_samples=max(int(args.newbie_backward_op_profile_max_samples), 1),
+            newbie_backward_op_profile_record_shapes=bool(args.newbie_backward_op_profile_shapes),
+            newbie_module_timing_profile=bool(args.newbie_module_timing_profile),
+            newbie_module_timing_profile_top_k=max(int(args.newbie_module_timing_profile_top_k), 1),
+            newbie_module_timing_profile_max_samples=max(int(args.newbie_module_timing_profile_max_samples), 1),
+            newbie_target_scope=_normalize_newbie_target_scope(args.newbie_target_scope),
+            dit_compute_reducer_strategy=str(args.dit_compute_reducer_strategy or "none"),
+            dit_compute_reducer_keep_ratio=min(max(float(args.dit_compute_reducer_keep_ratio), 0.0), 1.0),
+            dit_compute_reducer_min_keep_tokens=max(int(args.dit_compute_reducer_min_keep_tokens), 1),
+            dit_compute_reducer_compression_ratio=min(
+                max(float(args.dit_compute_reducer_compression_ratio), 0.0),
+                1.0,
+            ),
+            dit_compute_reducer_min_tokens=max(int(args.dit_compute_reducer_min_tokens), 1),
+            dit_compute_reducer_skip_ratio=min(max(float(args.dit_compute_reducer_skip_ratio), 0.0), 0.95),
+            dit_compute_reducer_skip_every=max(int(args.dit_compute_reducer_skip_every), 0),
+            dit_compute_reducer_warmup_steps=max(int(args.dit_compute_reducer_warmup_steps), 0),
+            dit_compute_reducer_min_block=max(int(args.dit_compute_reducer_min_block), 0),
+            dit_compute_reducer_score_mode=str(args.dit_compute_reducer_score_mode or "l2"),
+            triton_ops=bool(args.triton_ops),
+            triton_ops_inject_lora=not bool(args.triton_ops_no_lora),
+            triton_ops_inject_qkv=not bool(args.triton_ops_no_qkv),
+            triton_ops_inject_adaln=not bool(args.triton_ops_no_adaln),
+            triton_ops_fp32_backward=bool(args.triton_ops_fp32_backward),
             lora_activation_recompute=str(args.lora_activation_recompute),
             phase_profile=bool(args.phase_profile),
             bubble_controller=bubble_controller,
@@ -1486,6 +1704,7 @@ def main(argv: list[str] | None = None) -> int:
             "resolution": resolution,
             "train_batch_size": max(int(args.train_batch_size), 1),
             "gradient_accumulation_steps": max(int(args.gradient_accumulation_steps), 1),
+            "checkpoint_policy": str(args.checkpoint_policy or "auto"),
             "learning_rate": float(args.learning_rate) if float(args.learning_rate) > 0.0 else (1e-5 if args.family == "newbie" else 1e-4),
             "dataloader_workers": max(int(args.dataloader_workers), 0),
             "dataloader_prefetch_factor": max(int(args.dataloader_prefetch_factor), 1),
@@ -1591,6 +1810,7 @@ def main(argv: list[str] | None = None) -> int:
             "anima_block_checkpointing_mode": str(args.anima_block_checkpointing_mode),
             "anima_block_prefetch": bool(args.anima_block_prefetch),
             "anima_block_prefetch_depth": max(int(args.anima_block_prefetch_depth), 0),
+            "anima_block_prefetch_mode": str(args.anima_block_prefetch_mode or "original"),
             "newbie_latent_crop_size": max(int(args.newbie_latent_crop_size), 0),
             "newbie_fixed_text_tokens": max(int(args.newbie_fixed_text_tokens), 0),
             "newbie_fixed_visual_tokens": newbie_fixed_visual_tokens,
@@ -1602,6 +1822,32 @@ def main(argv: list[str] | None = None) -> int:
             "newbie_block_checkpointing_mode": str(args.newbie_block_checkpointing_mode),
             "newbie_block_prefetch": bool(args.newbie_block_prefetch),
             "newbie_block_prefetch_depth": max(int(args.newbie_block_prefetch_depth), 0),
+            "newbie_backward_op_profile": bool(args.newbie_backward_op_profile),
+            "newbie_backward_op_profile_top_k": max(int(args.newbie_backward_op_profile_top_k), 1),
+            "newbie_backward_op_profile_max_samples": max(int(args.newbie_backward_op_profile_max_samples), 1),
+            "newbie_backward_op_profile_record_shapes": bool(args.newbie_backward_op_profile_shapes),
+            "newbie_module_timing_profile": bool(args.newbie_module_timing_profile),
+            "newbie_module_timing_profile_top_k": max(int(args.newbie_module_timing_profile_top_k), 1),
+            "newbie_module_timing_profile_max_samples": max(int(args.newbie_module_timing_profile_max_samples), 1),
+            "newbie_target_scope": _normalize_newbie_target_scope(args.newbie_target_scope),
+            "dit_compute_reducer_strategy": str(args.dit_compute_reducer_strategy or "none"),
+            "dit_compute_reducer_keep_ratio": min(max(float(args.dit_compute_reducer_keep_ratio), 0.0), 1.0),
+            "dit_compute_reducer_min_keep_tokens": max(int(args.dit_compute_reducer_min_keep_tokens), 1),
+            "dit_compute_reducer_compression_ratio": min(
+                max(float(args.dit_compute_reducer_compression_ratio), 0.0),
+                1.0,
+            ),
+            "dit_compute_reducer_min_tokens": max(int(args.dit_compute_reducer_min_tokens), 1),
+            "dit_compute_reducer_skip_ratio": min(max(float(args.dit_compute_reducer_skip_ratio), 0.0), 0.95),
+            "dit_compute_reducer_skip_every": max(int(args.dit_compute_reducer_skip_every), 0),
+            "dit_compute_reducer_warmup_steps": max(int(args.dit_compute_reducer_warmup_steps), 0),
+            "dit_compute_reducer_min_block": max(int(args.dit_compute_reducer_min_block), 0),
+            "dit_compute_reducer_score_mode": str(args.dit_compute_reducer_score_mode or "l2"),
+            "triton_ops": bool(args.triton_ops),
+            "triton_ops_inject_lora": not bool(args.triton_ops_no_lora),
+            "triton_ops_inject_qkv": not bool(args.triton_ops_no_qkv),
+            "triton_ops_inject_adaln": not bool(args.triton_ops_no_adaln),
+            "triton_ops_fp32_backward": bool(args.triton_ops_fp32_backward),
             "lora_activation_recompute": str(args.lora_activation_recompute),
             "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
             "torch": torch.__version__,

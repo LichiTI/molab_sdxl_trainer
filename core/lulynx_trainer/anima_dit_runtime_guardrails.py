@@ -19,6 +19,7 @@ def apply_anima_dit_runtime_guardrails(
     device: Any,
     dtype: Any,
     checkpoint_auto_recommended: bool = False,
+    checkpoint_auto_reason: str = "",
     log: LogFn | None = None,
 ) -> Dict[str, Any]:
     """Apply Anima DiT checkpoint/residency knobs and return profiles."""
@@ -38,6 +39,10 @@ def apply_anima_dit_runtime_guardrails(
     residency_mode = str(getattr(config, "anima_block_residency", "resident") or "resident")
     checkpoint_requested = bool(getattr(config, "anima_block_checkpointing", False))
     checkpoint_mode = str(getattr(config, "anima_block_checkpointing_mode", "block") or "block")
+    try:
+        checkpoint_interval = max(int(getattr(config, "anima_block_checkpointing_interval", 1) or 1), 1)
+    except Exception:
+        checkpoint_interval = 1
     checkpoint_source = "anima_block_checkpointing"
     if not checkpoint_requested and bool(checkpoint_auto_recommended):
         checkpoint_requested = True
@@ -47,9 +52,12 @@ def apply_anima_dit_runtime_guardrails(
             result["config_updates"]["anima_block_checkpointing"] = True
         except Exception:
             pass
+        reason = str(checkpoint_auto_reason or "").strip() or (
+            "non-resident 1024/4096-token DiT paths need activation recompute"
+        )
         _log(
             "Anima block checkpointing auto-enabled for "
-            f"residency={residency_mode}; non-resident 1024/4096-token DiT paths need activation recompute."
+            f"residency={residency_mode}; {reason}."
         )
 
     if checkpoint_requested:
@@ -57,12 +65,25 @@ def apply_anima_dit_runtime_guardrails(
             setter = getattr(model.unet, "set_anima_block_checkpointing", None)
             if not callable(setter):
                 raise RuntimeError("native Anima DiT does not expose set_anima_block_checkpointing")
-            profile = dict(setter(True, checkpoint_mode))
+            if checkpoint_interval > 1:
+                try:
+                    profile = dict(setter(True, checkpoint_mode, interval=checkpoint_interval))
+                except TypeError:
+                    # Older native modules predate the interval knob: fall back to
+                    # every-block checkpointing instead of failing the run.
+                    profile = dict(setter(True, checkpoint_mode))
+                    _log(
+                        "Anima block checkpointing interval ignored: native setter "
+                        "does not accept interval; checkpointing every block."
+                    )
+            else:
+                profile = dict(setter(True, checkpoint_mode))
             profile["source"] = checkpoint_source
             result["checkpoint_profile"] = profile
             _log(
                 "Anima block checkpointing: "
                 f"mode={profile.get('mode', 'block')}, "
+                f"interval={profile.get('interval', 1)}, "
                 f"checkpointed_blocks={profile.get('checkpointed_blocks', 0)}/{profile.get('block_count', 0)}, "
                 f"source={checkpoint_source}"
             )
@@ -83,6 +104,7 @@ def apply_anima_dit_runtime_guardrails(
         min_params = max(int(getattr(config, "anima_block_residency_min_params", 0) or 0), 0)
         prefetch_enabled = bool(getattr(config, "anima_block_prefetch", False))
         prefetch_depth = max(int(getattr(config, "anima_block_prefetch_depth", 1) or 0), 0)
+        prefetch_mode = str(getattr(config, "anima_block_prefetch_mode", "original") or "original")
         pcie_transfer_format = str(getattr(config, "pcie_transfer_format", "off") or "off").strip().lower()
         if pcie_transfer_format in {"off", "none", "disabled"}:
             pcie_transfer_format = ""
@@ -100,6 +122,7 @@ def apply_anima_dit_runtime_guardrails(
             dtype=dtype,
             prefetch_enabled=prefetch_enabled,
             prefetch_depth=prefetch_depth,
+            prefetch_mode=prefetch_mode,
             transfer_format=pcie_transfer_format or None,
             sparse_swap_enabled=sparse_swap_enabled,
             sparse_swap_budget_mb=sparse_swap_budget_mb or None,
@@ -113,7 +136,10 @@ def apply_anima_dit_runtime_guardrails(
         prefetch = profile.get("prefetch", {})
         prefetch_tail = (
             f", prefetch={'on' if prefetch.get('enabled') else 'off'}"
+            f" mode={prefetch.get('policy', prefetch_mode)}"
             f" depth={prefetch.get('depth', prefetch_depth)}"
+            f" adaptive_depth={prefetch.get('adaptive_depth', prefetch.get('depth', prefetch_depth))}"
+            f" skipped_blockskip={prefetch.get('skipped_blockskip', 0)}"
             f" reason={prefetch.get('reason', '')}"
         )
         cache_profile = profile.get("pcie_delta_cache", {})

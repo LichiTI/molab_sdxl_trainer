@@ -372,6 +372,9 @@ class StepPhaseProfiler:
         optimizer_step_micro_profile = self._optimizer_step_micro_profile(
             optimizer_step_ms=optimizer_step_ms,
         )
+        train_step_compute_breakdown = self._train_step_compute_breakdown(
+            step_wall_ms=step_wall_ms,
+        )
         unaccounted_share_of_step = round(optimizer_update_unaccounted_ms / max(step_wall_ms, 1e-9), 6)
         unaccounted_share_of_update = (
             round(optimizer_update_unaccounted_ms / max(update_total_ms, 1e-9), 6)
@@ -448,6 +451,7 @@ class StepPhaseProfiler:
             "optimizer_plus_zero_grad_share": round(optimizer_plus_zero_ms / denom, 6),
             "optimizer_update_share": round(update_total_ms / denom, 6),
             "optimizer_update_breakdown": optimizer_update_breakdown,
+            "train_step_compute_breakdown": train_step_compute_breakdown,
         }
         self._history.append(dict(snapshot))
         if len(self._history) > self.history_size:
@@ -504,6 +508,70 @@ class StepPhaseProfiler:
             "residual_bucket_labels": [
                 "optimizer_update_boundary_sync_gap",
                 "outer_phase_record_overhead",
+            ],
+            "runtime_default_change": False,
+        }
+
+    def _train_step_compute_breakdown(self, *, step_wall_ms: float) -> Dict[str, Any]:
+        prefix = "train_step_compute_substage."
+        outer_labels = ("train_batch_prepare", "forward_total", "loss_total", "backward_total")
+        outer_ms = {
+            label: float(self._phases_ms.get(label, 0.0) or 0.0)
+            for label in outer_labels
+        }
+        substage_ms = {
+            label[len(prefix) :]: float(value or 0.0)
+            for label, value in sorted(self._phases_ms.items())
+            if str(label).startswith(prefix)
+        }
+        substage_counts = {
+            label[len(prefix) :]: int(value or 0)
+            for label, value in sorted(self._counts.items())
+            if str(label).startswith(prefix)
+        }
+        outer_total_ms = sum(outer_ms.values())
+        profiled_total_ms = sum(substage_ms.values())
+        unaccounted_ms = max(outer_total_ms - profiled_total_ms, 0.0)
+        accounted_exceeds_outer_ms = max(profiled_total_ms - outer_total_ms, 0.0)
+        dominant_outer_phase = max(outer_ms.items(), key=lambda item: item[1])[0] if outer_ms else ""
+        dominant_profiled_substage = (
+            max(substage_ms.items(), key=lambda item: item[1])[0] if substage_ms else ""
+        )
+        denom = max(float(step_wall_ms or 0.0), 1e-9)
+        outer_total_share = round(outer_total_ms / denom, 6)
+        profiled_share = round(profiled_total_ms / denom, 6)
+        unaccounted_share = round(unaccounted_ms / denom, 6)
+        return {
+            "schema_version": 1,
+            "profile": "train_step_compute_breakdown_v0",
+            "source": "step_phase_profile.phases_ms",
+            "outer_phase_labels": list(outer_labels),
+            "label_prefix": prefix,
+            "has_outer_phase": any(label in self._phases_ms for label in outer_labels),
+            "has_subphase_profile": bool(substage_ms),
+            "outer_phase_ms": {label: round(value, 4) for label, value in outer_ms.items()},
+            "outer_phase_share": {
+                label: round(value / denom, 6) for label, value in outer_ms.items()
+            },
+            "outer_total_ms": round(outer_total_ms, 4),
+            "outer_total_share": outer_total_share,
+            "profiled_substage_labels": list(substage_ms),
+            "profiled_substage_count": len(substage_ms),
+            "profiled_substage_ms": {
+                label: round(value, 4) for label, value in substage_ms.items()
+            },
+            "profiled_substage_counts": substage_counts,
+            "profiled_substage_total_ms": round(profiled_total_ms, 4),
+            "profiled_substage_share": profiled_share,
+            "unaccounted_train_step_compute_ms": round(unaccounted_ms, 4),
+            "unaccounted_train_step_compute_share": unaccounted_share,
+            "accounted_exceeds_outer_ms": round(accounted_exceeds_outer_ms, 4),
+            "dominant_outer_phase": dominant_outer_phase,
+            "dominant_profiled_substage": dominant_profiled_substage,
+            "residual_bucket_labels": [
+                "model_kernel_or_autograd_internal_gap",
+                "phase_record_overhead",
+                "unprofiled_python_hook_or_runtime_sync",
             ],
             "runtime_default_change": False,
         }

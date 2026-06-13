@@ -628,6 +628,7 @@ class LoRAInjector:
         target_modules: List[str],
         prefix: str = "",
         apply_policy: bool = False,
+        exclude_name_substrings: Optional[List[str]] = None,
     ) -> Dict[str, LoRALinear]:
         """Backward-compatible explicit target injection entrypoint.
 
@@ -636,23 +637,36 @@ class LoRAInjector:
         (``apply_policy=True``) so an active adapter target policy also governs
         the explicit-target path, matching ``inject_unet``. When the policy is
         inactive (default ``"all"``) this stays a strict no-op.
+
+        ``exclude_name_substrings`` skips any module whose qualified name contains
+        one of the substrings, regardless of target match. Needed because target
+        suffixes like ``self_attn.q_proj`` substring-match a frozen sibling subtree
+        (e.g. ``anima_llm_adapter.blocks.N.self_attn.q_proj``) that must not receive
+        an adapter. Defaults to None (no exclusion) so all legacy paths are unchanged.
         """
         return self._inject_model(
-            model, target_modules, prefix=prefix, apply_policy=apply_policy
+            model, target_modules, prefix=prefix, apply_policy=apply_policy,
+            exclude_name_substrings=exclude_name_substrings,
         )
-    
+
     def _inject_model(
         self,
         model: nn.Module,
         target_names: List[str],
         prefix: str = "",
         apply_policy: bool = False,
+        exclude_name_substrings: Optional[List[str]] = None,
     ) -> Dict[str, LoRALinear]:
         """向模型注入 LoRA 层"""
         injected = {}
         policy_active = bool(self._adapter_target_policy_active and apply_policy)
+        excludes = tuple(s for s in (exclude_name_substrings or ()) if s)
 
         for name, module in model.named_modules():
+            # Skip frozen sibling subtrees whose names substring-collide with a
+            # target suffix (e.g. anima_llm_adapter when llm_adapter is not trained).
+            if excludes and any(s in name for s in excludes):
+                continue
             # Native Conv2d LoRA is intentionally limited to PiSSA conv init.
             is_linear_target = isinstance(module, nn.Linear)
             is_pissa_conv_target = (
@@ -688,8 +702,14 @@ class LoRAInjector:
                 and matched_target not in self._adapter_target_selected
             ):
                 continue
+            # Rank lookup prefers the full module path (true per-layer rank, e.g.
+            # FG-LoRA orthogonal redistribution), then the matched target type
+            # (legacy per-type rank), then the uniform rank. Backward compatible:
+            # a per-type map carries no full-path keys, so it resolves exactly as
+            # before; only a full-path map activates per-layer rank.
             layer_rank = (
-                max(int(self._adapter_target_rank_map.get(matched_target, self.rank)), 1)
+                max(int(self._adapter_target_rank_map.get(
+                    name, self._adapter_target_rank_map.get(matched_target, self.rank))), 1)
                 if (policy_active and self._adapter_target_rank_map)
                 else self.rank
             )

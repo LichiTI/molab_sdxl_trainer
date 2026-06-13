@@ -230,6 +230,24 @@ class DiTComputeReducerSeam:
             return output
         return inner(tokens)
 
+    def should_skip_block(self, block_index: int) -> bool:
+        """Whether blockskip's deterministic plan elects to skip this block.
+
+        Token-preserving identity skip: when ``True`` the caller passes ``x``
+        through unchanged. This lets the faithful native forward drive blockskip
+        from its own block loop (bypassing :meth:`run_block`) so ``rope_emb`` and
+        native block-checkpointing both stay intact — TREAD/DiffCR cannot do this
+        because they change the token count. Always ``False`` for non-blockskip
+        strategies (and when disabled), so the seam is inert under faithful unless
+        blockskip is the active strategy.
+        """
+        if not self.enabled or self.strategy != "blockskip":
+            return False
+        plan = self._ensure_blockskip_plan()
+        if plan is None or int(block_index) >= len(plan.decisions):
+            return False
+        return bool(plan.decisions[int(block_index)].skip)
+
     def clear(self) -> None:
         self._blockskip_plan = None
         self._blockskip_dirty = True

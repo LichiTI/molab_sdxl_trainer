@@ -42,6 +42,25 @@ def test_checkpoint_contract_roundtrip() -> None:
     assert contract["roundtrip_ok"] is True, contract
     assert contract["training_path_enabled"] is False, contract
     assert "trainer_checkpoint_integration_missing" in contract["blocked_reasons"], contract
+    assert "trainer_state_save_sync_guard_missing" in contract["blocked_reasons"], contract
+    assert "trainer_resume_owner_state_guard_missing" in contract["blocked_reasons"], contract
+
+    verified = build_flat_adamw_checkpoint_contract(
+        owner,
+        optimizer=optimizer,
+        params=[param],
+        run_roundtrip=True,
+        trainer_state_metadata_integrated=True,
+        trainer_state_save_sync_verified=True,
+        resume_owner_state_guard_verified=True,
+    )
+    assert verified["trainer_checkpoint_integration"] is True, verified
+    assert verified["trainer_state_metadata_integrated"] is True, verified
+    assert verified["trainer_state_save_sync_verified"] is True, verified
+    assert verified["resume_owner_state_guard_verified"] is True, verified
+    assert "trainer_checkpoint_integration_missing" not in verified["blocked_reasons"], verified
+    assert "trainer_state_save_sync_guard_missing" not in verified["blocked_reasons"], verified
+    assert "trainer_resume_owner_state_guard_missing" not in verified["blocked_reasons"], verified
 
 
 def main() -> int:

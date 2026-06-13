@@ -24,9 +24,11 @@ EXCLUDED_DIRS = {
     "docs",
     "examples",
     "devtools",
-    "warehouse",
     "data",
 }
+# NOTE: core/warehouse 不能排除。config_adapter.py 依赖
+# `core.warehouse.training_features.flux_preflight`，是 entry_train 的硬依赖；
+# 排除后运行会报 "No module named 'core.warehouse'"。
 
 EXCLUDED_SUFFIXES = {
     ".pyc",

@@ -189,10 +189,13 @@ class OffloadedCheckpointContext:
             cpu_tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
 
         if self._transfer_stream is not None:
+            current_stream = torch.cuda.current_stream(tensor.device)
+            self._transfer_stream.wait_stream(current_stream)
             with torch.cuda.stream(self._transfer_stream):
                 cpu_tensor.copy_(tensor, non_blocking=True)
             event = self._transfer_stream.record_event()
             self._saved_tensor_events[id(cpu_tensor)] = event
+            tensor.record_stream(self._transfer_stream)
         else:
             cpu_tensor.copy_(tensor)
 

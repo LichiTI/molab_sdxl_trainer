@@ -236,6 +236,9 @@ def main():
         from core.lulynx_trainer import LulynxTrainer, LulynxConfig, ConfigAdapter
         from core.lulynx_trainer.ip_adapter_trainer import IPAdapterTrainer
         from core.lulynx_trainer.controlnet_trainer import ControlNetTrainer
+        from core.turbocore_optimizer_product_training_route_binding_runtime_applier import (
+            apply_optimizer_product_training_route_binding_runtime_patch,
+        )
     except ImportError as e:
         logger.error(f"FAILED: Missing dependencies: {e}")
         sys.exit(1)
@@ -286,6 +289,14 @@ def main():
                     float(vram_limit_gb),
                     memory_fraction,
                 )
+
+        apply_optimizer_product_training_route_binding_runtime_patch(
+            config_dict,
+            artifact_dir=run_dir,
+            report_path=run_dir / "turbocore_optimizer_route_binding_applier.json",
+            refresh_config_adapter_artifact=False,
+            write_artifact=True,
+        )
 
         # Convert dict to LulynxConfig
         training_type = config_dict.get("training_type", "lora")

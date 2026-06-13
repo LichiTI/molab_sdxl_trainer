@@ -63,6 +63,7 @@ def build_bubble_runtime_followup_plan(
         categories = _string_list(family.get("blocking_categories"))
         next_actions = _string_list(family.get("next_actions"))
         reasons = _string_list(family.get("blocked_reasons"))
+        gpu_rerun_plan = dict(_mapping(family.get("gpu_rerun_plan")))
         if not categories and reasons:
             categories = ["other"]
         for category in categories or ["missing_evidence"]:
@@ -76,6 +77,7 @@ def build_bubble_runtime_followup_plan(
                     "reasons": reasons,
                     "candidate_count": family.get("candidate_count"),
                     "accepted_candidate_count": family.get("accepted_candidate_count"),
+                    "gpu_rerun_plan": gpu_rerun_plan,
                 }
             )
 
@@ -95,6 +97,7 @@ def build_bubble_runtime_followup_plan(
         "blocked_natural_claim_count": len(blocked_natural_claims),
         "items": items,
         "blocker_summary": dict(_mapping(natural_load_canary.get("blocker_summary"))),
+        "gpu_rerun_plan": dict(_mapping(natural_load_canary.get("gpu_rerun_plan"))),
     }
 
 

@@ -270,6 +270,85 @@ def __(mo, nvidia_smi_button, subprocess):
     return smi_output,
 
 
+
+@app.cell
+def __(mo):
+    mo.md("## 1B. 手动安装 / 更新运行时")
+
+    runtime_install_profile_dropdown = mo.ui.dropdown(
+        options=[
+            "blackwell_sageattention_recommended",
+            "blackwell_cu128_sdpa_stable",
+            "sageattention_only",
+            "base_requirements_only",
+        ],
+        value="blackwell_sageattention_recommended",
+        label="安装方案",
+    )
+    runtime_install_show_only_checkbox = mo.ui.checkbox(
+        value=True,
+        label="只显示命令，不执行；确认无误后取消勾选再点安装",
+    )
+    runtime_install_button = mo.ui.run_button(label="执行所选安装方案")
+
+    mo.vstack(
+        [
+            mo.callout(
+                "推荐 RTX PRO 6000 / Blackwell 使用 `blackwell_sageattention_recommended`。如果安装 SageAttention 失败，改用 `blackwell_cu128_sdpa_stable`。安装/替换 torch 后建议重启 notebook runtime 再继续训练。",
+                kind="warn",
+            ),
+            mo.hstack([runtime_install_profile_dropdown, runtime_install_show_only_checkbox]),
+            runtime_install_button,
+        ]
+    )
+    return runtime_install_button, runtime_install_profile_dropdown, runtime_install_show_only_checkbox
+
+
+@app.cell
+def __(blackwell_install_command, install_command, mo, runtime_install_button, runtime_install_profile_dropdown, runtime_install_show_only_checkbox, sage_install_command, sage_requirements, subprocess, sys):
+    runtime_install_profile = str(runtime_install_profile_dropdown.value or "blackwell_sageattention_recommended")
+    runtime_install_commands = {
+        "blackwell_sageattention_recommended": sage_install_command,
+        "blackwell_cu128_sdpa_stable": blackwell_install_command,
+        "sageattention_only": f"{sys.executable} -m pip install -r {sage_requirements}",
+        "base_requirements_only": install_command,
+    }
+    runtime_install_command_text = runtime_install_commands.get(runtime_install_profile, sage_install_command)
+    runtime_install_message = ""
+
+    if runtime_install_button.value:
+        if runtime_install_show_only_checkbox.value:
+            runtime_install_message = (
+                "当前为只显示命令模式，未执行安装。取消勾选后再次点击按钮即可执行。\n\n"
+                f"```bash\n{runtime_install_command_text}\n```"
+            )
+        else:
+            runtime_install_result = subprocess.run(
+                runtime_install_command_text,
+                shell=True,
+                text=True,
+                capture_output=True,
+                timeout=7200,
+            )
+            runtime_install_stdout = (runtime_install_result.stdout or "")[-8000:]
+            runtime_install_stderr = (runtime_install_result.stderr or "")[-8000:]
+            runtime_install_message = (
+                f"安装方案：`{runtime_install_profile}`\n\n"
+                f"退出码：`{runtime_install_result.returncode}`\n\n"
+                "安装/替换 torch 后，请重启 notebook runtime 或重新打开 notebook，再重新运行环境检查。\n\n"
+                f"执行命令：\n```bash\n{runtime_install_command_text}\n```\n\n"
+                f"stdout/stderr 尾部：\n```text\n{runtime_install_stdout}\n{runtime_install_stderr}\n```"
+            )
+    else:
+        runtime_install_message = (
+            "选择安装方案后点击按钮。当前方案对应命令：\n\n"
+            f"```bash\n{runtime_install_command_text}\n```"
+        )
+
+    mo.md(runtime_install_message)
+    return runtime_install_command_text, runtime_install_message, runtime_install_profile
+
+
 @app.cell
 def __(mo, repo):
     mo.md("## 2. 模型/数据集路径")
@@ -388,30 +467,62 @@ def __(Path, dataset_extract_name_input, dataset_overwrite_checkbox, dataset_rep
                     target_path.write_bytes(source_handle.read())
 
     def normalize_dataset_root(extract_dir: Path, repeats: int) -> Path:
+        import re
         import shutil
 
         image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-        visible_children = [p for p in extract_dir.iterdir() if not p.name.startswith(".") and p.name != "__MACOSX"]
-        dir_children = [p for p in visible_children if p.is_dir()]
-        file_children = [p for p in visible_children if p.is_file()]
+        subset_pattern = re.compile(r"^\d+_.+")
 
-        # If zip contains a single top-level directory, use it as dataset root.
-        dataset_root = dir_children[0] if len(dir_children) == 1 and not file_children else extract_dir
+        def visible_entries(directory: Path) -> list[Path]:
+            return [p for p in directory.iterdir() if not p.name.startswith(".") and p.name != "__MACOSX"]
 
-        root_images = [p for p in dataset_root.iterdir() if p.is_file() and p.suffix.lower() in image_exts]
-        has_subset_dirs = any(p.is_dir() for p in dataset_root.iterdir())
-        if root_images and not has_subset_dirs:
-            subset_dir = dataset_root / f"{int(repeats)}_default"
+        def has_direct_images(directory: Path) -> bool:
+            return any(p.is_file() and p.suffix.lower() in image_exts for p in directory.iterdir())
+
+        def has_subset_dirs(directory: Path) -> bool:
+            return any(p.is_dir() and subset_pattern.match(p.name) for p in directory.iterdir())
+
+        def organize_into_subset(directory: Path) -> None:
+            subset_dir = directory / f"{int(repeats)}_default"
             subset_dir.mkdir(parents=True, exist_ok=True)
             sidecar_suffixes = [".txt", ".json", ".caption"]
+            root_images = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in image_exts]
             for image_path in root_images:
                 shutil.move(str(image_path), str(subset_dir / image_path.name))
                 for suffix in sidecar_suffixes:
                     sidecar = image_path.with_suffix(suffix)
                     if sidecar.exists():
                         shutil.move(str(sidecar), str(subset_dir / sidecar.name))
-            dataset_root = dataset_root
-        return dataset_root
+
+        # Case A: extract_dir already contains subset dirs like 10_xxx -> use extract_dir as is.
+        if has_subset_dirs(extract_dir):
+            return extract_dir
+
+        visible_children = visible_entries(extract_dir)
+        dir_children = [p for p in visible_children if p.is_dir()]
+        file_children = [p for p in visible_children if p.is_file()]
+
+        # Case B: a single top-level directory inside the zip.
+        if len(dir_children) == 1 and not file_children:
+            inner = dir_children[0]
+            # B1: inner is already a subset dir (e.g. 5_xt) -> extract_dir is the dataset root.
+            if subset_pattern.match(inner.name):
+                return extract_dir
+            # B2: inner already contains subset dirs -> inner is the dataset root.
+            if has_subset_dirs(inner):
+                return inner
+            # B3: inner directly holds images -> organize into <repeats>_default under inner.
+            if has_direct_images(inner):
+                organize_into_subset(inner)
+                return inner
+            return inner
+
+        # Case C: zip root directly holds images (no subset dirs) -> organize under extract_dir.
+        if has_direct_images(extract_dir):
+            organize_into_subset(extract_dir)
+            return extract_dir
+
+        return extract_dir
 
     dataset_zip_message = ""
     zip_train_data_dir = str(dataset_extract_name_input.value or "my_lora")
@@ -671,9 +782,19 @@ def __(mo):
         value="1024,1024",
         label="基础分辨率",
     )
-    rank_input = mo.ui.number(value=16, start=1, stop=512, step=1, label="LoRA rank / network_dim")
-    alpha_input = mo.ui.number(value=8, start=1, stop=512, step=1, label="LoRA alpha")
-    dropout_input = mo.ui.number(value=0.0, start=0.0, stop=1.0, step=0.01, label="LoRA dropout")
+    adapter_type_dropdown = mo.ui.dropdown(
+        options=["lora", "lokr", "loha", "locon", "dora"],
+        value="lora",
+        label="Adapter 类型（lokr/loha/locon/dora 走 LyCORIS）",
+    )
+    lokr_factor_input = mo.ui.number(value=8, start=-1, stop=64, step=1, label="LoKr factor（仅 lokr，-1=自动）")
+    lokr_full_matrix_checkbox = mo.ui.checkbox(value=False, label="LoKr full matrix（强制全矩阵，不退回分解）")
+    rank_input = mo.ui.number(value=16, start=1, stop=4096, step=1, label="rank / network_dim")
+    alpha_input = mo.ui.number(value=8, start=0, stop=4096, step=1, label="alpha")
+    dropout_input = mo.ui.number(value=0.0, start=0.0, stop=1.0, step=0.01, label="dropout")
+    conv_dim_input = mo.ui.number(value=0, start=0, stop=4096, step=1, label="LyCORIS conv_dim（0=同 rank，仅 LyCORIS）")
+    conv_alpha_input = mo.ui.number(value=0, start=0, stop=4096, step=1, label="LyCORIS conv_alpha（0=同 alpha）")
+    train_norm_checkbox = mo.ui.checkbox(value=False, label="训练 Norm 层（LyCORIS train_norm）")
 
     epochs_input = mo.ui.number(value=10, start=1, stop=1000, step=1, label="Epochs")
     max_steps_input = mo.ui.number(value=0, start=0, stop=1_000_000, step=100, label="最大 steps，0 表示按 epoch")
@@ -695,16 +816,21 @@ def __(mo):
     )
     warmup_steps_input = mo.ui.number(value=0, start=0, stop=100000, step=10, label="Warmup steps")
     seed_input = mo.ui.number(value=42, start=0, stop=2**31 - 1, step=1, label="Seed")
+    prodigy_d0_input = mo.ui.text(value="1e-6", label="Prodigy d0（仅 Prodigy，默认 1e-6）", full_width=True)
+    prodigy_d_coef_input = mo.ui.text(value="1.0", label="Prodigy d_coef（仅 Prodigy，默认 1.0）", full_width=True)
 
     mo.vstack(
         [
+            mo.hstack([adapter_type_dropdown, lokr_factor_input, lokr_full_matrix_checkbox]),
+            mo.hstack([conv_dim_input, conv_alpha_input, train_norm_checkbox]),
             mo.hstack([resolution_dropdown, rank_input, alpha_input, dropout_input]),
             mo.hstack([epochs_input, max_steps_input, batch_size_input, grad_accum_input]),
             mo.hstack([lr_input, unet_lr_input, text_encoder_lr_input]),
             mo.hstack([optimizer_dropdown, scheduler_dropdown, warmup_steps_input, seed_input]),
+            mo.hstack([prodigy_d0_input, prodigy_d_coef_input]),
         ]
     )
-    return alpha_input, batch_size_input, dropout_input, epochs_input, grad_accum_input, lr_input, max_steps_input, optimizer_dropdown, rank_input, resolution_dropdown, scheduler_dropdown, seed_input, text_encoder_lr_input, unet_lr_input, warmup_steps_input
+    return adapter_type_dropdown, alpha_input, batch_size_input, conv_alpha_input, conv_dim_input, dropout_input, epochs_input, grad_accum_input, lokr_factor_input, lokr_full_matrix_checkbox, lr_input, max_steps_input, optimizer_dropdown, prodigy_d0_input, prodigy_d_coef_input, rank_input, resolution_dropdown, scheduler_dropdown, seed_input, text_encoder_lr_input, train_norm_checkbox, unet_lr_input, warmup_steps_input
 
 
 @app.cell
@@ -784,7 +910,13 @@ def __(mo):
 def __(Path, repo):
     def resolve_repo_path(value: str) -> Path:
         p = Path(str(value or "").strip())
-        return p if p.is_absolute() else repo / p
+        if p.is_absolute():
+            return p
+        # 防止路径重复：如果输入以仓库名开头（例如 lulynx-sdxl-trainer/work/...），去掉该前缀。
+        parts = p.parts
+        if parts and parts[0] == repo.name:
+            p = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+        return repo / p
 
     def count_dataset(train_dir: Path, caption_ext: str = ".txt") -> dict[str, object]:
         image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -807,7 +939,7 @@ def __(Path, repo):
 
 
 @app.cell
-def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_size_input, bucket_step_input, cache_latents_checkbox, cache_latents_disk_checkbox, cache_text_encoder_checkbox, caption_ext_input, color_aug_checkbox, config_name_input, dropout_input, effective_train_data_dir, enable_bucket_checkbox, epochs_input, flip_aug_checkbox, grad_accum_input, grad_ckpt_checkbox, json, keep_last_input, keep_tokens_input, logging_dir_input, low_vram_dropdown, lr_input, max_bucket_input, max_steps_input, max_token_length_input, min_bucket_input, mixed_precision_dropdown, model_path_input, optimizer_dropdown, output_dir_input, output_name_input, rank_input, resolution_dropdown, sample_every_checkbox, sample_every_epochs_input, sample_negative_input, sample_prompt_input, save_every_epoch_input, save_every_steps_input, save_precision_dropdown, save_state_checkbox, save_state_end_checkbox, scheduler_dropdown, seed_input, shuffle_caption_checkbox, text_encoder_lr_input, torch_compile_checkbox, train_data_dir_input, unet_lr_input, vae_path_input, warmup_steps_input, xformers_checkbox):
+def __(Any, adapter_type_dropdown, advanced_json_input, alpha_input, attention_backend_dropdown, batch_size_input, bucket_step_input, cache_latents_checkbox, cache_latents_disk_checkbox, cache_text_encoder_checkbox, caption_ext_input, color_aug_checkbox, config_name_input, conv_alpha_input, conv_dim_input, dropout_input, effective_train_data_dir, enable_bucket_checkbox, epochs_input, flip_aug_checkbox, grad_accum_input, grad_ckpt_checkbox, json, keep_last_input, keep_tokens_input, logging_dir_input, lokr_factor_input, lokr_full_matrix_checkbox, low_vram_dropdown, lr_input, max_bucket_input, max_steps_input, max_token_length_input, min_bucket_input, mixed_precision_dropdown, model_path_input, optimizer_dropdown, output_dir_input, output_name_input, prodigy_d0_input, prodigy_d_coef_input, rank_input, resolution_dropdown, sample_every_checkbox, sample_every_epochs_input, sample_negative_input, sample_prompt_input, save_every_epoch_input, save_every_steps_input, save_precision_dropdown, save_state_checkbox, save_state_end_checkbox, scheduler_dropdown, seed_input, shuffle_caption_checkbox, text_encoder_lr_input, torch_compile_checkbox, train_data_dir_input, train_norm_checkbox, unet_lr_input, vae_path_input, warmup_steps_input, xformers_checkbox):
     advanced_error = ""
     try:
         advanced_overrides: dict[str, Any] = json.loads(advanced_json_input.value or "{}")
@@ -818,8 +950,44 @@ def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_
         advanced_overrides = {}
         advanced_error = f"高级 JSON 解析失败：{type(advanced_json_error).__name__}: {advanced_json_error}"
 
+    # marimo 的 number 输入框被清空时 value 会变成 None，int(None)/float(None) 会报 TypeError。
+    def _ival(widget, default=0):
+        try:
+            v = widget.value
+            return int(v) if v is not None else int(default)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _fval(widget, default=0.0):
+        try:
+            v = widget.value
+            return float(v) if v is not None else float(default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _fval_text(widget, default=0.0):
+        try:
+            text = str(widget.value).strip()
+            return float(text) if text else float(default)
+        except (TypeError, ValueError):
+            return float(default)
+
     attention_backend = str(attention_backend_dropdown.value)
     selected_train_data_dir = str(effective_train_data_dir or train_data_dir_input.value or "").strip()
+
+    adapter_type = str(adapter_type_dropdown.value or "lora").strip().lower()
+    # lora -> sd-scripts networks.lora; 其余走 LyCORIS。
+    _lycoris_algo_map = {"lokr": "lokr", "loha": "loha", "locon": "locon", "dora": "dora"}
+    if adapter_type == "lora":
+        adapter_network_module = "networks.lora"
+        adapter_lycoris_algo = ""
+    else:
+        adapter_network_module = "lycoris.locon"
+        adapter_lycoris_algo = _lycoris_algo_map.get(adapter_type, "lokr")
+
+    is_lycoris_adapter = adapter_type != "lora"
+    optimizer_is_prodigy = str(optimizer_dropdown.value or "").strip().lower() == "prodigy"
+
     config = {
         "schema_id": "sdxl-lora",
         "training_type": "lora",
@@ -831,35 +999,35 @@ def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_
         "output_dir": str(output_dir_input.value).strip(),
         "logging_dir": str(logging_dir_input.value).strip(),
         "output_name": str(output_name_input.value).strip() or "my_sdxl_lora",
-        "network_module": "networks.lora",
-        "network_dim": int(rank_input.value),
-        "network_alpha": int(alpha_input.value),
-        "network_dropout": float(dropout_input.value),
+        "network_module": adapter_network_module,
+        "network_dim": _ival(rank_input, 16),
+        "network_alpha": _ival(alpha_input, 8),
+        "network_dropout": _fval(dropout_input, 0.0),
         "network_train_unet_only": False,
         "network_train_text_encoder_only": False,
         "resolution": str(resolution_dropdown.value),
         "enable_bucket": bool(enable_bucket_checkbox.value),
-        "min_bucket_reso": int(min_bucket_input.value),
-        "max_bucket_reso": int(max_bucket_input.value),
-        "bucket_reso_steps": int(bucket_step_input.value),
+        "min_bucket_reso": _ival(min_bucket_input, 512),
+        "max_bucket_reso": _ival(max_bucket_input, 1536),
+        "bucket_reso_steps": _ival(bucket_step_input, 64),
         "bucket_no_upscale": False,
         "caption_extension": str(caption_ext_input.value or ".txt"),
         "shuffle_caption": bool(shuffle_caption_checkbox.value),
-        "keep_tokens": int(keep_tokens_input.value),
-        "max_token_length": int(max_token_length_input.value),
+        "keep_tokens": _ival(keep_tokens_input, 0),
+        "max_token_length": _ival(max_token_length_input, 225),
         "flip_aug": bool(flip_aug_checkbox.value),
         "color_aug": bool(color_aug_checkbox.value),
-        "train_batch_size": int(batch_size_input.value),
-        "gradient_accumulation_steps": int(grad_accum_input.value),
-        "max_train_epochs": int(epochs_input.value),
-        "max_train_steps": int(max_steps_input.value),
-        "learning_rate": float(lr_input.value),
-        "unet_lr": float(unet_lr_input.value),
-        "text_encoder_lr": float(text_encoder_lr_input.value),
+        "train_batch_size": _ival(batch_size_input, 1),
+        "gradient_accumulation_steps": _ival(grad_accum_input, 1),
+        "max_train_epochs": _ival(epochs_input, 10),
+        "max_train_steps": _ival(max_steps_input, 0),
+        "learning_rate": _fval(lr_input, 1e-4),
+        "unet_lr": _fval(unet_lr_input, 1e-4),
+        "text_encoder_lr": _fval(text_encoder_lr_input, 1e-5),
         "optimizer_type": str(optimizer_dropdown.value),
         "optimizer_args": "",
         "lr_scheduler": str(scheduler_dropdown.value),
-        "lr_warmup_steps": int(warmup_steps_input.value),
+        "lr_warmup_steps": _ival(warmup_steps_input, 0),
         "lr_scheduler_num_cycles": 1,
         "weight_decay": 0.01,
         "max_grad_norm": 1.0,
@@ -876,20 +1044,42 @@ def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_
         "xformers": bool(xformers_checkbox.value) or attention_backend == "xformers",
         "torch_compile": bool(torch_compile_checkbox.value),
         "save_model_as": "safetensors",
-        "save_every_n_epochs": int(save_every_epoch_input.value),
-        "save_every_n_steps": int(save_every_steps_input.value),
-        "checkpoint_keep_last": int(keep_last_input.value),
+        "save_every_n_epochs": _ival(save_every_epoch_input, 1),
+        "save_every_n_steps": _ival(save_every_steps_input, 0),
+        "checkpoint_keep_last": _ival(keep_last_input, 0),
         "save_state": bool(save_state_checkbox.value),
         "save_state_on_train_end": bool(save_state_end_checkbox.value),
-        "seed": int(seed_input.value),
+        "seed": _ival(seed_input, 42),
         "sample_every": bool(sample_every_checkbox.value),
-        "sample_every_n_epochs": int(sample_every_epochs_input.value) if sample_every_checkbox.value else 0,
+        "sample_every_n_epochs": _ival(sample_every_epochs_input, 0) if sample_every_checkbox.value else 0,
         "sample_prompts": str(sample_prompt_input.value or ""),
         "sample_negative": str(sample_negative_input.value or ""),
         "low_vram_profile": str(low_vram_dropdown.value),
         "sdxl_low_vram_optimization": str(low_vram_dropdown.value) != "off",
+        "adapter_type": adapter_type,
+        "lycoris_algo": adapter_lycoris_algo,
+        "lycoris_lokr_factor": _ival(lokr_factor_input, 8) if adapter_type == "lokr" else 0,
+        "lokr_full_matrix": bool(lokr_full_matrix_checkbox.value) and adapter_type == "lokr",
+        "lycoris_train_norm": bool(train_norm_checkbox.value) and is_lycoris_adapter,
+        "lycoris_conv_dim": _ival(conv_dim_input, 0),
+        "lycoris_conv_alpha": _fval(conv_alpha_input, 0.0),
+        "prodigy_d0": _fval_text(prodigy_d0_input, 1e-6),
+        "prodigy_d_coef": _fval_text(prodigy_d_coef_input, 1.0),
         "execution_core": "standard",
     }
+    if not adapter_lycoris_algo:
+        config.pop("lycoris_algo", None)
+        config.pop("lycoris_lokr_factor", None)
+    if adapter_type != "lokr":
+        config.pop("lokr_full_matrix", None)
+    if not is_lycoris_adapter:
+        # LoRA 路线不传 LyCORIS 专属字段，避免误导。
+        config.pop("lycoris_train_norm", None)
+        config.pop("lycoris_conv_dim", None)
+        config.pop("lycoris_conv_alpha", None)
+    if not optimizer_is_prodigy:
+        config.pop("prodigy_d0", None)
+        config.pop("prodigy_d_coef", None)
     config.update(advanced_overrides)
     return advanced_error, advanced_overrides, config
 
@@ -944,9 +1134,16 @@ def __(config, config_path, json, mo, write_config_button):
 
 
 @app.cell
-def __(advanced_error, config, config_path, json, mo, q):
+def __(advanced_error, config, config_path, json, mo, q, repo):
     config_preview = json.dumps(config, ensure_ascii=False, indent=2)
-    command = f"python scripts/run_sdxl_train.py --config {q(config_path)}"
+    # 展示「从仓库父目录运行」的命令：python <仓库名>/scripts/run_sdxl_train.py --config configs/xxx.json。
+    # run_sdxl_train.py 内部会把相对 --config 按脚本所在仓库根解析，与当前 cwd 无关。
+    script_rel = f"{repo.name}/scripts/run_sdxl_train.py"
+    try:
+        config_rel = config_path.relative_to(repo).as_posix()
+    except ValueError:
+        config_rel = config_path.as_posix()
+    command = f"python {q(script_rel)} --config {q(config_rel)}"
     warning = f"\n\n> ⚠️ {advanced_error}" if advanced_error else ""
     mo.md(
         f"""

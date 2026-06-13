@@ -11,6 +11,9 @@ from typing import Any
 from backend.core.services.bubble_closed_loop_history_service import (
     attach_recent_bubble_closed_loop_action_history,
 )
+from backend.core.turbocore_optimizer_product_training_route_binding_run_local_staging import (
+    build_optimizer_product_training_route_binding_run_local_staging,
+)
 
 
 def now_iso() -> str:
@@ -125,6 +128,11 @@ def prepare_queue_run_artifacts(
     (run_dir / "resolved_execution.json").write_text(
         json.dumps(resolved_execution, ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+    build_optimizer_product_training_route_binding_run_local_staging(
+        run_dir=run_dir,
+        refresh_config_adapter_artifact=False,
+        write_artifact=False,
     )
 
     run = QueuedTrainingRun(

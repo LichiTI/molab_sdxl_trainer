@@ -788,6 +788,7 @@ class AnimaNativeExecutableSubset:
         block_indices: Sequence[int] = (0,),
         device: str = "cpu",
         dtype: Optional[Any] = None,
+        faithful: bool = False,
     ) -> Any:
         try:
             import torch
@@ -795,6 +796,16 @@ class AnimaNativeExecutableSubset:
             import torch.nn.functional as F
         except ImportError as exc:
             raise ImportError("PyTorch is required for AnimaNativeExecutableSubset") from exc
+
+        # Faithful forward adds parameter-free 3D RoPE to self-attention. Default
+        # off -> the stub forward is bitwise unchanged (trainer parity preserved).
+        _apply_rope = None
+        if faithful:
+            try:
+                from .anima_native_faithful import AnimaRope3D
+            except ImportError:  # pragma: no cover - direct-file usage
+                from core.lulynx_trainer.anima_native_faithful import AnimaRope3D
+            _apply_rope = AnimaRope3D.apply
 
         class _RmsNorm(nn.Module):
             def __init__(self, width: int, eps: float = 1e-6, affine: bool = True):
@@ -841,11 +852,16 @@ class AnimaNativeExecutableSubset:
                 batch, _heads, tokens, _head_dim = tensor.shape
                 return tensor.transpose(1, 2).reshape(batch, tokens, self.hidden_dim)
 
-            def forward(self, x: Any, context: Optional[Any] = None) -> Any:
+            def forward(self, x: Any, context: Optional[Any] = None, rope_emb: Optional[Any] = None) -> Any:
                 source = x if context is None else context
                 q = self.q_norm(self._split_heads(self.q_proj(x)))
                 k = self.k_norm(self._split_heads(self.k_proj(source)))
                 v = self._split_heads(self.v_proj(source))
+                # Self-attention only: rotate q/k with 3D RoPE (faithful forward).
+                # q/k are [B, heads, tokens, head_dim] — exactly AnimaRope3D.apply's layout.
+                if context is None and rope_emb is not None and _apply_rope is not None:
+                    q = _apply_rope(q, rope_emb)
+                    k = _apply_rope(k, rope_emb)
                 attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
                 return self.output_proj(self._merge_heads(attn))
 
@@ -868,7 +884,7 @@ class AnimaNativeExecutableSubset:
                     raise ValueError(f"Incomplete MLP shapes for {prefix}")
 
             def forward(self, x: Any) -> Any:
-                return self.layer2(F.silu(self.layer1(x)))
+                return self.layer2(F.gelu(self.layer1(x)))
 
         class _AdaLn(nn.Module):
             def __init__(self, prefix: str, chunks: int):
@@ -911,14 +927,15 @@ class AnimaNativeExecutableSubset:
                 normalized = F.layer_norm(x.float(), (x.shape[-1],)).to(dtype=x.dtype)
                 return normalized * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-            def _forward_impl(self, x: Any, emb: Any, context: Any, adaln_lora: Optional[Any] = None) -> Any:
+            def _forward_impl(self, x: Any, emb: Any, context: Any, adaln_lora: Optional[Any] = None,
+                              rope_emb: Optional[Any] = None) -> Any:
                 if emb.dim() == 3:
                     emb = emb[:, 0]
                 shift, scale, gate = self._with_adaln_lora(
                     self.adaln_modulation_self_attn(emb),
                     adaln_lora,
                 )
-                x = x + gate.unsqueeze(1) * self.self_attn(self._apply_adaln(x, shift, scale))
+                x = x + gate.unsqueeze(1) * self.self_attn(self._apply_adaln(x, shift, scale), rope_emb=rope_emb)
                 shift, scale, gate = self._with_adaln_lora(
                     self.adaln_modulation_cross_attn(emb),
                     adaln_lora,
@@ -931,8 +948,9 @@ class AnimaNativeExecutableSubset:
                 x = x + gate.unsqueeze(1) * self.mlp(self._apply_adaln(x, shift, scale))
                 return x
 
-            def forward(self, x: Any, emb: Any, context: Any, adaln_lora: Optional[Any] = None) -> Any:
-                return self._forward_impl(x, emb, context, adaln_lora)
+            def forward(self, x: Any, emb: Any, context: Any, adaln_lora: Optional[Any] = None,
+                        rope_emb: Optional[Any] = None) -> Any:
+                return self._forward_impl(x, emb, context, adaln_lora, rope_emb)
 
             def _with_adaln_lora(self, chunks: Tuple[Any, ...], adaln_lora: Optional[Any]) -> Tuple[Any, Any, Any]:
                 if adaln_lora is None:
@@ -1059,21 +1077,41 @@ class AnimaNativeExecutableSubset:
                 self.is_anima_executable_subset = True
                 self.anima_block_checkpointing = False
                 self.anima_block_checkpointing_mode = "off"
+                self.anima_block_checkpointing_interval = 1
                 self.anima_block_checkpointed_blocks = 0
                 self.net = _Net()
+                # Faithful forward: parameter-free 3D RoPE on self-attention.
+                # head_dim is read from the first block's self-attn projection.
+                self.anima_faithful = bool(faithful)
+                self.rope = None
+                if faithful:
+                    head_dim = int(self.net.blocks[0].self_attn.head_dim)
+                    self.rope = AnimaRope3D(head_dim)
 
-            def set_anima_block_checkpointing(self, enabled: bool, mode: str = "block") -> Dict[str, Any]:
+            def set_anima_block_checkpointing(
+                self, enabled: bool, mode: str = "block", interval: int = 1
+            ) -> Dict[str, Any]:
                 normalized = str(mode or "block").strip().lower().replace("-", "_")
                 if normalized in {"", "on", "true"}:
                     normalized = "block"
                 active = bool(enabled) and normalized in {"block", "selective"}
+                try:
+                    interval_n = max(int(interval or 1), 1)
+                except Exception:
+                    interval_n = 1
+                block_count = len(self.net.blocks)
                 self.anima_block_checkpointing = active
                 self.anima_block_checkpointing_mode = normalized if active else "off"
-                self.anima_block_checkpointed_blocks = len(self.net.blocks) if active else 0
+                self.anima_block_checkpointing_interval = interval_n
+                # interval N -> blocks 0, N, 2N, ... are checkpointed (ceil division).
+                self.anima_block_checkpointed_blocks = (
+                    (block_count + interval_n - 1) // interval_n if active else 0
+                )
                 return {
                     "enabled": active,
                     "mode": self.anima_block_checkpointing_mode,
-                    "block_count": len(self.net.blocks),
+                    "interval": interval_n,
+                    "block_count": block_count,
                     "checkpointed_blocks": self.anima_block_checkpointed_blocks,
                 }
 
@@ -1084,7 +1122,13 @@ class AnimaNativeExecutableSubset:
                 emb: Any,
                 context: Any,
                 adaln_lora: Optional[Any],
+                rope_emb: Optional[Any] = None,
             ) -> Any:
+                # ``rope_emb`` is captured by closure (constant per forward, no grad)
+                # rather than passed as a checkpoint arg: under faithful mode the
+                # recomputed block_forward must still apply 3D RoPE, so it forwards
+                # rope_emb to block(...). The same tensor stays alive across the
+                # backward recompute, so the recomputed forward is RoPE-consistent.
                 from torch.utils.checkpoint import checkpoint
                 context_fn = None
                 if str(getattr(self, "anima_block_checkpointing_mode", "") or "") == "selective":
@@ -1096,7 +1140,7 @@ class AnimaNativeExecutableSubset:
 
                 if adaln_lora is None:
                     def block_forward(x_arg: Any, emb_arg: Any, context_arg: Any) -> Any:
-                        return block(x_arg, emb_arg, context_arg, None)
+                        return block(x_arg, emb_arg, context_arg, None, rope_emb)
 
                     kwargs = {
                         "use_reentrant": False,
@@ -1107,7 +1151,7 @@ class AnimaNativeExecutableSubset:
                     return checkpoint(block_forward, x, emb, context, **kwargs)
 
                 def block_forward(x_arg: Any, emb_arg: Any, context_arg: Any, adaln_arg: Any) -> Any:
-                    return block(x_arg, emb_arg, context_arg, adaln_arg)
+                    return block(x_arg, emb_arg, context_arg, adaln_arg, rope_emb)
 
                 kwargs = {
                     "use_reentrant": False,
@@ -1123,11 +1167,30 @@ class AnimaNativeExecutableSubset:
                 emb: Any,
                 context: Any,
                 adaln_lora: Optional[Any] = None,
+                rope_emb: Optional[Any] = None,
             ) -> Any:
+                # #147 / #166: the faithful native forward (3D RoPE) threads
+                # ``rope_emb`` through both the plain ``block(..., rope_emb)`` branch
+                # AND the checkpoint branch (``_checkpoint_block`` now forwards rope_emb
+                # to the recomputed block). The cache and the TREAD/DiffCR reducer
+                # run_block paths still carry no rope_emb (and TREAD/DiffCR change the
+                # token count, mis-aligning per-position RoPE), so they remain forced
+                # off under faithful mode below. BlockSkip is the exception: it skips
+                # whole blocks via token-preserving identity passthrough, so it is
+                # driven from this loop directly (``faithful_skip`` below) and now runs
+                # under faithful — and coexists with block-checkpointing.
+                faithful_mode = bool(getattr(self, "anima_faithful", False))
                 use_checkpoint = (
                     bool(getattr(self, "anima_block_checkpointing", False))
                     and self.training
                     and torch.is_grad_enabled()
+                )
+                # interval N: only blocks 0, N, 2N, ... recompute; the rest run plain
+                # (seam/reducer are already forced off whenever use_checkpoint is set,
+                # so non-checkpointed blocks fall through to the rope_emb-threading
+                # plain branch and the forward stays bitwise identical).
+                checkpoint_interval = max(
+                    int(getattr(self, "anima_block_checkpointing_interval", 1) or 1), 1
                 )
                 controller = getattr(self, "_lulynx_dit_prefetch_controller", None)
                 try:
@@ -1138,6 +1201,7 @@ class AnimaNativeExecutableSubset:
                     )
                     from .unified_cache_seam import get_active_cache_seam
                     from .dit_compute_reducer_seam import get_active_compute_reducer_seam
+                    from .anima_feature_capture import get_active_feature_capture
                 except ImportError:  # pragma: no cover - direct-file smoke fallback.
                     from core.lulynx_trainer.spectrum_probe import has_spectrum_step_context, observe_block_call
                     from core.lulynx_trainer.smoothcache import (
@@ -1146,16 +1210,41 @@ class AnimaNativeExecutableSubset:
                     )
                     from core.lulynx_trainer.unified_cache_seam import get_active_cache_seam
                     from core.lulynx_trainer.dit_compute_reducer_seam import get_active_compute_reducer_seam
+                    from core.lulynx_trainer.anima_feature_capture import get_active_feature_capture
+
+                # Opt-in feature capture (default None -> no observe -> parity).
+                feature_capture = get_active_feature_capture()
 
                 # Opt-in cache execution seam (default off -> bitwise parity).
-                # Never cache during a checkpointed training forward.
-                seam = None if use_checkpoint else get_active_cache_seam()
+                # Never cache during a checkpointed forward, nor under faithful RoPE
+                # (the cache run_block path carries no rope_emb -> would drop it).
+                seam = None if (use_checkpoint or faithful_mode) else get_active_cache_seam()
                 seam_backend = seam.backend if seam is not None else ""
                 # Opt-in block compute-reducer seam (TREAD/DiffCR/BlockSkip).
                 # Default off -> get_active_compute_reducer_seam() is None ->
                 # the plain block(...) path runs and the forward is bitwise
-                # identical.  Never reduce during a checkpointed forward.
-                reducer = None if use_checkpoint else get_active_compute_reducer_seam()
+                # identical. TREAD/DiffCR change the token count, so they are never
+                # reduced under checkpointing or faithful RoPE (BlockSkip is handled
+                # separately via ``faithful_skip`` below).
+                reducer = None if (use_checkpoint or faithful_mode) else get_active_compute_reducer_seam()
+
+                # BlockSkip under faithful: token-preserving identity skip, so it can
+                # be driven from this loop without threading tokens through run_block,
+                # which keeps rope_emb intact AND lets it coexist with native block-
+                # checkpointing (skipped blocks are pure passthrough -> no compute, no
+                # checkpoint, no backward recompute). Only engages when blockskip is
+                # the active strategy (``should_skip_block`` is False otherwise).
+                faithful_skip = None
+                if faithful_mode:
+                    _rs = get_active_compute_reducer_seam()
+                    if _rs is not None and getattr(_rs, "strategy", "") == "blockskip":
+                        faithful_skip = _rs
+
+                # With faithful_mode the cache and TREAD/DiffCR reducer seams are forced
+                # off (no rope_emb / token-count change), but the checkpoint branch and
+                # the plain branch both thread rope_emb, and BlockSkip rides this loop
+                # as identity passthrough — so the forward always applies positional
+                # encoding. No path drops RoPE.
 
                 for block_index, block in enumerate(self.net.blocks):
                     # The active seam backend observes inside its run_with_* call,
@@ -1166,14 +1255,19 @@ class AnimaNativeExecutableSubset:
                         observe_smoothcache_block_call(block_index=block_index)
                     if controller is not None and hasattr(controller, "before_block"):
                         controller.before_block(block_index, x, emb, context, adaln_lora)
-                    if use_checkpoint:
-                        x = self._checkpoint_block(block, x, emb, context, adaln_lora)
+                    if faithful_skip is not None and faithful_skip.should_skip_block(block_index):
+                        # Token-preserving identity skip: leave x unchanged.
+                        continue
+                    if use_checkpoint and block_index % checkpoint_interval == 0:
+                        x = self._checkpoint_block(block, x, emb, context, adaln_lora, rope_emb)
                     elif seam is not None:
                         x = seam.run_block(block, block_index, x, emb, context, adaln_lora)
                     elif reducer is not None:
-                        x = reducer.run_block(block, block_index, x, emb, context, adaln_lora)
+                        x = reducer.run_block(block, block_index, x, emb, context, adaln_lora, rope_emb)
                     else:
-                        x = block(x, emb, context, adaln_lora)
+                        x = block(x, emb, context, adaln_lora, rope_emb)
+                    if feature_capture is not None:
+                        feature_capture.observe(block_index, x)
                 return x
 
             def forward(
@@ -1191,12 +1285,18 @@ class AnimaNativeExecutableSubset:
                 timesteps = timestep.to(device=x.device, dtype=x.dtype)
                 emb, adaln_lora = self.net.t_embedder(timesteps)
                 emb = self.net.t_embedding_norm(emb)
-                x = self._run_blocks(x, emb, context, adaln_lora)
+                # Faithful self-attn positions: image latents are a single temporal
+                # frame (T=1); RoPE token order (t,h,w) row-major matches unfold.
+                rope_emb = None
+                if self.anima_faithful and self.rope is not None:
+                    rope_emb = self.rope.generate(1, patch_h, patch_w, device=x.device)
+                x = self._run_blocks(x, emb, context, adaln_lora, rope_emb)
                 patch_values = self.net.final_layer(x, emb, adaln_lora)
                 output = unpatchify_anima_latents(
                     patch_values,
                     patch_h=patch_h,
                     patch_w=patch_w,
+                    faithful=self.anima_faithful,
                 )
                 return SimpleNamespace(sample=output)
 
@@ -1214,8 +1314,14 @@ def load_anima_native_executable_subset(
     device: str = "cpu",
     dtype: Optional[Any] = None,
     disable_mmap: bool = False,
+    faithful: bool = False,
 ) -> Tuple[Any, AnimaNativeWeightLoadReport]:
-    """Load a real-weight executable Anima subset for forward smokes."""
+    """Load a real-weight executable Anima subset for forward smokes.
+
+    ``faithful=True`` enables the parameter-free 3D RoPE on self-attention
+    (the faithful native forward); default off keeps the stub forward bitwise
+    identical so the trainer path stays a strict parity match.
+    """
 
     prefixes = ["net.x_embedder.", "net.t_embedder.", "net.t_embedding_norm.", "net.final_layer."]
     for index in block_indices:
@@ -1246,6 +1352,7 @@ def load_anima_native_executable_subset(
         block_indices=block_indices,
         device=device,
         dtype=dtype,
+        faithful=faithful,
     )
     incompatible = module.load_state_dict(selected_tensors, strict=True, assign=True)
     module_keys = set(module.state_dict().keys())
@@ -1321,8 +1428,19 @@ def unpatchify_anima_latents(
     patch_w: int,
     latent_channels: int = 16,
     patch_size: int = 2,
+    faithful: bool = False,
 ) -> Any:
-    """Fold Anima final-layer patch values back to BCHW latents."""
+    """Fold Anima final-layer patch values back to BCHW latents.
+
+    ``faithful`` selects the native feature ordering.  The native final layer
+    emits each token's ``patch_size*patch_size*latent_channels`` features in
+    ``(p1, p2, C)`` order (spatial sub-patch outermost, **channel innermost**;
+    temporal patch is 1 for the image subset).  ``F.fold`` instead consumes
+    ``(C, kh, kw)`` (channel outermost) — the exact transpose — so the legacy
+    stub path scrambles channel against sub-patch position.  The stub default
+    keeps ``F.fold`` so the trainer path stays a byte-for-byte parity match;
+    inference flips ``faithful=True`` for the structurally correct decode.
+    """
 
     try:
         import torch
@@ -1340,6 +1458,16 @@ def unpatchify_anima_latents(
     if patch_values.shape[2] != expected_features:
         raise ValueError(
             f"Expected {expected_features} patch features, got {patch_values.shape[2]}"
+        )
+    if faithful:
+        # (B, H_tok, W_tok, p1, p2, C) -> (B, C, H_tok, p1, W_tok, p2) -> (B, C, H, W)
+        batch = patch_values.shape[0]
+        grid = patch_values.reshape(
+            batch, patch_h, patch_w, patch_size, patch_size, latent_channels
+        )
+        grid = grid.permute(0, 5, 1, 3, 2, 4)
+        return grid.reshape(
+            batch, latent_channels, patch_h * patch_size, patch_w * patch_size
         )
     return torch.nn.functional.fold(
         patch_values.transpose(1, 2),

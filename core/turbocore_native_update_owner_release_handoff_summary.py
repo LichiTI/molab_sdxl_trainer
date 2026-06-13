@@ -29,8 +29,22 @@ TRAINING_LOOP_ROUTE_CONTRACT_ARTIFACT = (
     ARTIFACT_DIR / "turbocore_optimizer_product_training_route_binding_training_loop_contract.json"
 )
 CONFIG_ADAPTER_ARTIFACT = ARTIFACT_DIR / "turbocore_optimizer_product_training_route_binding_config_adapter.json"
+PRODUCT_ROUTE_ADAPTER_ARTIFACT = (
+    ARTIFACT_DIR / "turbocore_optimizer_product_training_route_binding_product_route_adapter.json"
+)
+RUNTIME_APPLIER_ARTIFACT = (
+    ARTIFACT_DIR / "turbocore_optimizer_product_training_route_binding_runtime_applier.json"
+)
+RUN_LOCAL_STAGING_ARTIFACT = (
+    ARTIFACT_DIR / "turbocore_optimizer_product_training_route_binding_run_local_staging.json"
+)
+STABLE_FIRST_RELEASE_SCOPE_ARTIFACT = (
+    ARTIFACT_DIR / "turbocore_optimizer_stable_first_release_scope.json"
+)
+OWNER_RELEASE_DIRECTION_RECORD_ARTIFACT = ARTIFACT_DIR / "native_update_owner_release_direction_record.json"
+OWNER_RELEASE_DIRECTION_ARTIFACT = ARTIFACT_DIR / "native_update_owner_release_direction_packet.json"
 ARTIFACT = ARTIFACT_DIR / "native_update_owner_release_handoff_summary.json"
-ROADMAP = "devtools/docs/turbocore_optimizer_backend_design.md"
+ROADMAP = "devtools/docs/turbocore_optimizer_backend_design_v2.md"
 
 
 def build_native_update_owner_release_handoff_summary(
@@ -54,6 +68,11 @@ def build_native_update_owner_release_handoff_summary(
     route_preflight = _product_route_preflight_summary(artifact_dir=artifact_dir)
     training_loop_route = _training_loop_route_contract_summary(artifact_dir=artifact_dir)
     config_adapter = _config_adapter_summary(artifact_dir=artifact_dir)
+    product_route_adapter = _product_route_adapter_summary(artifact_dir=artifact_dir)
+    runtime_applier = _runtime_applier_summary(artifact_dir=artifact_dir)
+    run_local_staging = _run_local_staging_summary(artifact_dir=artifact_dir)
+    stable_first_release = _stable_first_release_scope_summary(artifact_dir=artifact_dir)
+    owner_release_direction = _owner_release_direction_summary(artifact_dir=artifact_dir)
     blocked_reasons = _strings(package.get("blocked_reasons"))
     required_review_fields = _strings(handoff.get("required_review_fields"))
     must_remain_false = _strings(handoff.get("must_remain_false"))
@@ -145,6 +164,19 @@ def build_native_update_owner_release_handoff_summary(
         "product_route_binding_owner_approval_recorded_count": int(
             route_preflight.get("owner_release_approval_recorded_count", 0) or 0
         ),
+        "owner_release_direction_ready_for_signature_count": int(
+            owner_release_direction.get("owner_release_direction_ready_for_signature_count", 0) or 0
+        ),
+        "owner_release_direction_recorded_count": int(
+            owner_release_direction.get("owner_release_direction_recorded_count", 0) or 0
+        ),
+        "owner_release_direction_approval_recorded_count": int(
+            _first_count(
+                owner_release_direction,
+                "owner_release_direction_approval_recorded_count",
+                "owner_release_approval_recorded_count",
+            )
+        ),
         "product_route_binding_exposure_decision_recorded_count": int(
             route_preflight.get("product_exposure_decision_recorded_count", 0) or 0
         ),
@@ -171,6 +203,30 @@ def build_native_update_owner_release_handoff_summary(
         ),
         "route_binding_kwargs_patch_field_count": int(
             config_adapter.get("training_loop_kwargs_patch_field_count", 0) or 0
+        ),
+        "product_route_binding_product_route_count": int(
+            product_route_adapter.get("product_training_route_count", 0) or 0
+        ),
+        "product_route_binding_kwargs_wired_count": int(
+            product_route_adapter.get("product_training_route_binding_kwargs_wired_count", 0) or 0
+        ),
+        "route_binding_runtime_config_patch_applied_count": int(
+            runtime_applier.get("runtime_config_patch_applied_count", 0) or 0
+        ),
+        "route_binding_runtime_config_patch_field_count": int(
+            runtime_applier.get("runtime_config_patch_field_count", 0) or 0
+        ),
+        "route_binding_run_local_adapter_staged_count": int(
+            run_local_staging.get("run_local_adapter_staged_count", 0) or 0
+        ),
+        "product_launch_staging_wired_count": int(
+            run_local_staging.get("product_launch_staging_wired_count", 0) or 0
+        ),
+        "stable_first_release_turbocore_optimizer_blocker_count": int(
+            stable_first_release.get("stable_first_release_turbocore_optimizer_blocker_count", 0) or 0
+        ),
+        "turbocore_optimizer_default_off_release_scope_ready_count": int(
+            stable_first_release.get("turbocore_optimizer_default_off_release_scope_ready_count", 0) or 0
         ),
     }
     payload = {
@@ -330,6 +386,59 @@ def _config_adapter_summary(*, artifact_dir: str | Path | None) -> dict[str, Any
     return _as_dict(_read_json(source).get("summary"))
 
 
+def _product_route_adapter_summary(*, artifact_dir: str | Path | None) -> dict[str, Any]:
+    source = (
+        PRODUCT_ROUTE_ADAPTER_ARTIFACT
+        if artifact_dir is None
+        else Path(artifact_dir) / PRODUCT_ROUTE_ADAPTER_ARTIFACT.name
+    )
+    if not source.exists():
+        return {}
+    return _as_dict(_read_json(source).get("summary"))
+
+
+def _runtime_applier_summary(*, artifact_dir: str | Path | None) -> dict[str, Any]:
+    source = RUNTIME_APPLIER_ARTIFACT if artifact_dir is None else Path(artifact_dir) / RUNTIME_APPLIER_ARTIFACT.name
+    if not source.exists():
+        return {}
+    return _as_dict(_read_json(source).get("summary"))
+
+
+def _run_local_staging_summary(*, artifact_dir: str | Path | None) -> dict[str, Any]:
+    source = (
+        RUN_LOCAL_STAGING_ARTIFACT
+        if artifact_dir is None
+        else Path(artifact_dir) / RUN_LOCAL_STAGING_ARTIFACT.name
+    )
+    if not source.exists():
+        return {}
+    return _as_dict(_read_json(source).get("summary"))
+
+
+def _stable_first_release_scope_summary(*, artifact_dir: str | Path | None) -> dict[str, Any]:
+    source = (
+        STABLE_FIRST_RELEASE_SCOPE_ARTIFACT
+        if artifact_dir is None
+        else Path(artifact_dir) / STABLE_FIRST_RELEASE_SCOPE_ARTIFACT.name
+    )
+    if not source.exists():
+        return {}
+    return _as_dict(_read_json(source).get("summary"))
+
+
+def _owner_release_direction_summary(*, artifact_dir: str | Path | None) -> dict[str, Any]:
+    directory = ARTIFACT_DIR if artifact_dir is None else Path(artifact_dir)
+    record_source = directory / OWNER_RELEASE_DIRECTION_RECORD_ARTIFACT.name
+    if record_source.exists():
+        summary = _as_dict(_read_json(record_source).get("summary"))
+        if summary:
+            return summary
+    source = directory / OWNER_RELEASE_DIRECTION_ARTIFACT.name
+    if not source.exists():
+        return {}
+    return _as_dict(_read_json(source).get("summary"))
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return _as_dict(payload)
@@ -337,6 +446,13 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _first_count(value: Mapping[str, Any], *keys: str) -> int:
+    for key in keys:
+        if key in value:
+            return int(value.get(key, 0) or 0)
+    return 0
 
 
 def _strings(value: Any) -> list[str]:

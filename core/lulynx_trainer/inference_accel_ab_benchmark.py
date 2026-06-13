@@ -25,10 +25,14 @@ Each arm flips one scheme against an exact-compute anchor:
   * ``baseline``   : scheme none, every block computed (exact trajectory anchor)
   * ``spectrum``   : Spectrum block-cache linear extrapolation (probe + seam on)
   * ``smoothcache``: SmoothCache error-guided cache reuse (probe + seam on)
+  * ``deepcache``  : DeepCache interval deep-block reuse (self-contained seam, no probe)
+  * ``teacache``   : TeaCache rel-L1 accumulator reuse (self-contained seam, no probe)
 
-A real skip needs BOTH the per-step decision probe (built here exactly as
-``sample_anima`` builds it) AND the execution seam (``cache_seam_context``); the
-``resolve_inference_accel_scheme`` helper flips them together per scheme.
+A real skip for spectrum/smoothcache needs BOTH the per-step decision probe (built
+here exactly as ``sample_anima`` builds it) AND the execution seam
+(``cache_seam_context``); deepcache/teacache are self-contained (they recover step
+boundaries from the block-index wrap-around) so they need the seam alone. The
+``resolve_inference_accel_scheme`` helper flips the right switches per scheme.
 
 Run:
   backend/env/python-flashattention/python.exe \
@@ -71,8 +75,14 @@ from core.lulynx_trainer.real_model_training_smoke import (
     _resolve_session_parent,
 )
 
-ARMS = ("baseline", "spectrum", "smoothcache")
-SCHEME_BY_ARM = {"baseline": "none", "spectrum": "spectrum", "smoothcache": "smoothcache"}
+ARMS = ("baseline", "spectrum", "smoothcache", "deepcache", "teacache")
+SCHEME_BY_ARM = {
+    "baseline": "none",
+    "spectrum": "spectrum",
+    "smoothcache": "smoothcache",
+    "deepcache": "deepcache",
+    "teacache": "teacache",
+}
 
 
 @dataclass

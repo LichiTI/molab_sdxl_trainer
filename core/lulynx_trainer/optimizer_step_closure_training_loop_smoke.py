@@ -22,7 +22,9 @@ from core.lulynx_trainer.optimizer_step_contracts import (
     optimizer_requires_step_closure,
     optimizer_step_closure_requires_initial_backward,
 )
+from core.lulynx_trainer.training_pipeline_trace import LulynxTrainingPipelineTrace
 from core.lulynx_trainer.training_loop import TrainingLoop
+from core.turbocore_native_update_dispatch_runtime import TurboCoreNativeUpdateDispatchRuntime
 
 
 class _NoopProfiler:
@@ -34,10 +36,22 @@ class _NoopProfiler:
     def start(self) -> float:
         return 0.0
 
+    def start_cpu(self) -> float:
+        return 0.0
+
     def record(self, *_args, **_kwargs) -> None:
         return None
 
+    def record_optimizer_update_substage(self, *_args, **_kwargs) -> float:
+        return 0.0
+
     def snapshot(self, *_args, **_kwargs) -> dict[str, Any]:
+        return {}
+
+    def latest_snapshot(self) -> dict[str, Any]:
+        return {}
+
+    def latest_bubble_profile(self) -> dict[str, Any]:
         return {}
 
 
@@ -66,6 +80,7 @@ class _TinyInjector:
 class _ClosureLoop(TrainingLoop):
     def __init__(self, optimizer: torch.optim.Optimizer, param: torch.nn.Parameter) -> None:
         self.param = param
+        self.unet = torch.nn.Identity()
         self.optimizer = optimizer
         self.lora_injector = _TinyInjector(param)
         self.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=1)
@@ -102,6 +117,7 @@ class _ClosureLoop(TrainingLoop):
         self.adapter_cpu_residency = None
         self.safeguard = None
         self.auditor = None
+        self.auditor_interval = 100
         self.on_before_train_step = None
         self.on_before_optimizer_step = None
         self.on_step_end = None
@@ -115,12 +131,23 @@ class _ClosureLoop(TrainingLoop):
         self._drift_monitor = None
         self._drift_check_interval = 100
         self._layer_monitor_enabled = False
+        self._layer_monitor_interval = 100
+        self._layer_monitor_max_layers = 0
+        self._layer_monitor_sparsity_epsilon = 0.0
+        self._layer_monitor_mode = "off"
+        self._layer_monitor_sample_size = 0
         self._grad_tracker = None
         self._gradient_release_manager = None
+        self._pipeline_trace = LulynxTrainingPipelineTrace()
+        self._last_pipeline_trace = None
         self._turbocore_update_shadow = type("_Shadow", (), {"enabled": False})()
         self._turbocore_native_update_gate = _NoopGate()
         self._turbocore_native_update_dispatch_armer = _NoopArmer()
+        self._turbocore_native_update_dispatch_runtime = TurboCoreNativeUpdateDispatchRuntime()
+        self._turbocore_native_update_readiness: dict[str, Any] = {}
+        self._turbocore_native_update_runtime_profile: dict[str, Any] = {}
         self._turbocore_native_update_diagnostic_executor_replay = False
+        self._turbocore_native_update_defer_state_sync = False
         self._turbocore_direct_grad_lifecycle_report: dict[str, Any] = {}
         self._step_phase_profiler = _NoopProfiler()
         self.memory_optimization_state: dict[str, Any] = {}
@@ -183,6 +210,15 @@ class _ClosureLoop(TrainingLoop):
 
     def _turbocore_native_update_runtime_context(self) -> dict[str, Any]:
         return {"training_path_enabled": False}
+
+    def _sync_turbocore_native_update_training_executor_to_pytorch(self, reason: str) -> dict[str, Any]:
+        return {"synced": False, "reason": reason, "training_path_enabled": False}
+
+    def _close_turbocore_native_update_training_executor(self, reason: str = "manual_close") -> dict[str, Any]:
+        return {"closed": False, "reason": reason, "training_path_enabled": False}
+
+    def _run_audit(self) -> None:
+        return None
 
 
 def _make_lbfgs_optimizer(param: torch.nn.Parameter) -> torch.optim.Optimizer:

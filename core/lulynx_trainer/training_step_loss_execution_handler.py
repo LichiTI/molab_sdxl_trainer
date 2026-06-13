@@ -77,6 +77,7 @@ def run_lulynx_loss_execution_stage_handler(
         prompt_embeds=prompt_embeds,
         noise_pred=noise_pred,
         noisy_latents=noisy_latents,
+        target=target,
         timesteps=timesteps,
         loss=loss,
         do_backward=do_backward,
@@ -119,12 +120,22 @@ def _compute_core_loss(
             ).clamp_min(1.0)
         else:
             loss = loss.mean(dim=list(range(1, loss.dim())))
+        # Recover sigma from the model timesteps: the faithful native forward
+        # feeds t = sigma in [0, 1] (num_train_timesteps=1), the legacy path
+        # feeds sigma * 1000. A fixed /1000 here would crush faithful sigmas to
+        # ~0 and silently break every weighting scheme (#1 量纲 fix).
+        sigma_scale = 1.0 if bool(getattr(owner, "anima_faithful_forward", False)) else 1000.0
+        sigmas = timesteps.float() / sigma_scale
         weighting = compute_anima_loss_weighting(
-            timesteps.float() / 1000.0,
+            sigmas,
             owner.anima_weighting_scheme,
             mode_scale=owner.anima_mode_scale,
         ).to(device=loss.device, dtype=loss.dtype)
-        return owner._weighted_mean_loss(loss * weighting, batch)
+        loss = loss * weighting
+        uncertainty_weighter = getattr(owner, "flow_uncertainty_weighter", None)
+        if uncertainty_weighter is not None:
+            loss = uncertainty_weighter(loss, sigmas)
+        return owner._weighted_mean_loss(loss, batch)
 
     if uses_sdxl_flow and owner._sdxl_flow_sigmas is not None:
         from .sdxl_flow import compute_sdxl_loss_weighting
@@ -237,12 +248,38 @@ def _apply_prior_loss(
         reg_images = reg_batch["images"].to(owner.device, dtype=owner.dtype)
         reg_latents = owner._encode_latents_with_vae(reg_images)
         reg_noise = torch.randn_like(reg_latents)
+        arch = str(getattr(owner, "_model_arch", "") or "").strip().lower()
         if uses_flow_matching:
-            reg_t = torch.rand((reg_latents.shape[0],), device=owner.device, dtype=reg_latents.dtype)
-            reg_view_t = reg_t.view(reg_latents.shape[0], *([1] * (reg_latents.dim() - 1)))
-            reg_noisy = (1.0 - reg_view_t) * reg_latents + reg_view_t * reg_noise
-            reg_timesteps = (reg_t * 1000.0).to(device=owner.device, dtype=reg_latents.dtype)
-            reg_target = reg_noise - reg_latents
+            if arch == "anima":
+                # Follow the main anima branch: honor the configured timestep
+                # sampling/shift and the faithful timestep scale, instead of a
+                # hardcoded uniform + sigma*1000 (which feeds the faithful
+                # t_embedder inputs 1000x too large).
+                from .anima_flow import AnimaFlowConfig, build_anima_flow_inputs, sample_anima_sigmas
+
+                reg_cfg = AnimaFlowConfig(
+                    timestep_sampling=owner.anima_timestep_sampling,
+                    sigmoid_scale=owner.anima_sigmoid_scale,
+                    discrete_flow_shift=owner.anima_discrete_flow_shift,
+                    logit_mean=owner.flow_logit_mean,
+                    logit_std=owner.flow_logit_std,
+                )
+                reg_sigmas = sample_anima_sigmas(
+                    reg_latents.shape[0], device=owner.device, dtype=reg_latents.dtype, config=reg_cfg
+                )
+                reg_noisy, reg_target, reg_timesteps = build_anima_flow_inputs(
+                    reg_latents,
+                    reg_noise,
+                    reg_sigmas,
+                    num_train_timesteps=1 if bool(getattr(owner, "anima_faithful_forward", False)) else 1000,
+                    model_prediction_type=owner.anima_model_prediction_type or "velocity",
+                )
+            else:
+                reg_t = torch.rand((reg_latents.shape[0],), device=owner.device, dtype=reg_latents.dtype)
+                reg_view_t = reg_t.view(reg_latents.shape[0], *([1] * (reg_latents.dim() - 1)))
+                reg_noisy = (1.0 - reg_view_t) * reg_latents + reg_view_t * reg_noise
+                reg_timesteps = (reg_t * 1000.0).to(device=owner.device, dtype=reg_latents.dtype)
+                reg_target = reg_noise - reg_latents
         else:
             reg_timesteps = torch.randint(
                 0,
@@ -253,12 +290,31 @@ def _apply_prior_loss(
             reg_noisy = owner.noise_scheduler.add_noise(reg_latents, reg_noise, reg_timesteps)
             reg_target = owner._velocity_target(reg_latents, reg_noise, reg_timesteps) if owner.v_parameterization else reg_noise
         reg_prompt_embeds = owner._encode_prompt(reg_batch.get("captions", [""] * reg_latents.shape[0]))
+        reg_unet_kwargs: dict[str, Any] = {
+            "sample": reg_noisy,
+            "timestep": reg_timesteps,
+            "encoder_hidden_states": reg_prompt_embeds["encoder_hidden_states"],
+        }
+        if arch == "anima":
+            # Mirror the main forward conditioning: raw Qwen3 hidden states on
+            # the legacy path, frozen llm_adapter context on the faithful path.
+            qwen3_hs = reg_prompt_embeds.get("qwen3_hidden_states")
+            if qwen3_hs is not None:
+                reg_unet_kwargs["qwen3_hidden_states"] = qwen3_hs
+                qwen3_mask = reg_prompt_embeds.get("qwen3_attention_mask")
+                if qwen3_mask is not None:
+                    reg_unet_kwargs["qwen3_attention_mask"] = qwen3_mask
+            anima_llm_adapter = getattr(owner.unet, "anima_llm_adapter", None)
+            if bool(getattr(owner, "anima_faithful_forward", False)) and anima_llm_adapter is not None:
+                from .anima_faithful_train_context import resolve_anima_faithful_context
+
+                reg_unet_kwargs["encoder_hidden_states"] = resolve_anima_faithful_context(
+                    reg_prompt_embeds, reg_batch, anima_llm_adapter, owner.device, owner.dtype
+                )
+                reg_unet_kwargs.pop("qwen3_hidden_states", None)
+                reg_unet_kwargs.pop("qwen3_attention_mask", None)
         with torch.autocast(device_type="cuda", dtype=owner.dtype):
-            reg_pred = owner.unet(
-                sample=reg_noisy,
-                timestep=reg_timesteps,
-                encoder_hidden_states=reg_prompt_embeds["encoder_hidden_states"],
-            ).sample
+            reg_pred = owner.unet(**reg_unet_kwargs).sample
         reg_loss_pred, reg_loss_target = owner._loss_operands(reg_pred, reg_target)
         reg_loss = owner._compute_diffusion_loss(reg_loss_pred, reg_loss_target, timesteps=reg_timesteps)
         loss = loss + owner.prior_loss_weight * reg_loss
@@ -275,6 +331,7 @@ def _apply_auxiliary_losses(
     prompt_embeds: dict[str, Any],
     noise_pred: Any,
     noisy_latents: Any,
+    target: Any,
     timesteps: Any,
     loss: Any,
     do_backward: bool,
@@ -323,6 +380,37 @@ def _apply_auxiliary_losses(
         if b_tier_loss is not None:
             loss = loss + b_tier_loss.to(loss.device)
             tracker_value = _record_loss_delta(tracker, loss_scalars, "b_tier", tracker_value, loss)
+    # JLT-style EMA feature self-distillation alignment (default-off reserve).
+    # Student features are captured during the main forward (forward handler)
+    # and consumed here once, then cleared so they never leak across steps.
+    student_features = getattr(owner, "_ema_feat_student_features", None)
+    owner._ema_feat_student_features = None
+    if (
+        do_backward
+        and getattr(owner, "anima_ema_feat_align_enabled", False)
+        and float(getattr(owner, "anima_ema_feat_align_weight", 0.0) or 0.0) > 0.0
+        and str(getattr(owner, "_model_arch", "") or "").strip().lower() == "anima"
+        and student_features
+    ):
+        try:
+            from .anima_ema_feature_align import compute_ema_feat_align_loss
+
+            feat_loss = compute_ema_feat_align_loss(
+                owner=owner,
+                student_features=student_features,
+                prompt_embeds=prompt_embeds,
+                batch=batch,
+                noisy_latents=noisy_latents,
+                target=target,
+                timesteps=timesteps,
+            )
+            weight = float(owner.anima_ema_feat_align_weight)
+            loss = loss + weight * feat_loss.to(loss.device)
+            tracker_value = _record_loss_delta(
+                tracker, loss_scalars, "ema_feat_align", tracker_value, loss, scale=weight
+            )
+        except Exception as exc:  # never break the core step on the reserve path
+            owner._ema_feat_align_last_error = str(exc)
     return loss, tracker_value
 
 

@@ -19,6 +19,7 @@ from .ip_adapter_injector import IPAdapterInjector
 from .ip_adapter_layers import ImageProjModel, Resampler
 from .dataset_loader import CaptionDataset, create_dataloader
 from .training_loop import TrainingLoop
+from .turbocore_native_update_route_binding import build_turbocore_native_update_training_loop_kwargs
 from .runtime_optimizations import build_runtime_optimization_plan
 
 logger = logging.getLogger(__name__)
@@ -333,6 +334,7 @@ class IPAdapterTrainer(LulynxTrainer):
             training_type="ip-adapter",
             deepspeed=bool(getattr(self.config, "deepspeed", False)),
             model_arch=getattr(self.config.model_arch, "value", self.config.model_arch),
+            **build_turbocore_native_update_training_loop_kwargs(self.config),
             image_encoder=self.image_encoder,
             image_proj_model=self.image_proj_model,
         )

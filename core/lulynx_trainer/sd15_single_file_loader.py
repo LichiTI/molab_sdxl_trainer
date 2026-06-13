@@ -29,6 +29,21 @@ from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 logger = logging.getLogger(__name__)
 
+
+class _CLIPTextModelProxy:
+    """Compatibility view for diffusers ckpt conversion on newer transformers."""
+
+    def __init__(self, text_encoder: CLIPTextModel) -> None:
+        self.embeddings = text_encoder.embeddings
+        self.encoder = text_encoder.encoder
+        self.final_layer_norm = text_encoder.final_layer_norm
+
+
+def _ensure_legacy_clip_text_model_attr(text_encoder: CLIPTextModel) -> CLIPTextModel:
+    if not hasattr(text_encoder, "text_model"):
+        object.__setattr__(text_encoder, "text_model", _CLIPTextModelProxy(text_encoder))
+    return text_encoder
+
 # ── defaults ───────────────────────────────────────────────────────────
 DEFAULT_CONTEXT_LENGTH = 77
 DEFAULT_BETA_START = 0.00085
@@ -320,7 +335,7 @@ def load_sd15_single_file_components(
 
     # ── 2. build components from checkpoint ────────────────────────────
     clip_config = _build_clip_config_from_checkpoint(checkpoint)
-    text_encoder = CLIPTextModel(clip_config)
+    text_encoder = _ensure_legacy_clip_text_model_attr(CLIPTextModel(clip_config))
 
     # SD1.5 uses the standard CLIP tokenizer (49408-token vocab).
     # Try loading from local HF cache first; fall back to None if unavailable.

@@ -18,6 +18,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from core.turbocore_native_update_readiness import build_native_update_readiness_report  # noqa: E402
 
 
+def _checkpoint_ready() -> dict[str, bool]:
+    return {
+        "checkpoint_metadata_integrated": True,
+        "trainer_state_metadata_integrated": True,
+        "trainer_state_save_sync_verified": True,
+        "resume_owner_state_guard_verified": True,
+        "checkpoint_owner_state_enabled": True,
+    }
+
+
 def test_readiness_reports_conservative_blockers() -> None:
     param = torch.nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.float32))
     optimizer = torch.optim.AdamW([param], lr=1e-3)
@@ -67,7 +77,46 @@ def test_readiness_reports_conservative_blockers() -> None:
     assert report["native_checks"]["runtime_recovery_policy_defined"] is True, report
     assert report["native_checks"]["runtime_recovery_dispatch_integrated"] is True, report
     assert "trainer_checkpoint_integration_missing" in reasons, report
+    assert "trainer_state_save_sync_guard_missing" in reasons, report
+    assert "trainer_resume_owner_state_guard_missing" in reasons, report
     assert "parameter_owner_copyback_not_integrated" in reasons, report
+
+
+def test_readiness_requires_explicit_checkpoint_guards_after_metadata() -> None:
+    param = torch.nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.float32))
+    optimizer = torch.optim.AdamW([param], lr=1e-3)
+    report = build_native_update_readiness_report(
+        optimizer=optimizer,
+        params=[param],
+        runtime_context={
+            "num_processes": 1,
+            "native_update_training_dispatch_enabled": True,
+            "training_path_enabled": True,
+        },
+        shadow_config={
+            "mode": "shadow",
+            "direct_grad": True,
+            "direct_grad_lifecycle_integrated": True,
+            "checkpoint_metadata_integrated": True,
+            "checkpoint_owner_state_enabled": True,
+            "copyback_scratch_probe_integrated": True,
+            "copyback_dispatch_experimental_enabled": True,
+            "copyback_dispatch_validated": True,
+        },
+        native_update_mode="native_experimental",
+    )
+    reasons = set(report["blocked_reasons"])
+    owner = report["owner_checks"]
+    assert owner["trainer_checkpoint_metadata_integrated"] is True, report
+    assert owner["trainer_state_metadata_integrated"] is True, report
+    assert owner["trainer_state_save_sync_verified"] is False, report
+    assert owner["resume_owner_state_guard_verified"] is False, report
+    assert owner["trainer_checkpoint_integration"] is False, report
+    assert owner["owner_gradient_sync_training_integrated"] is False, report
+    assert "trainer_checkpoint_integration_missing" not in reasons, report
+    assert "trainer_state_save_sync_guard_missing" in reasons, report
+    assert "trainer_resume_owner_state_guard_missing" in reasons, report
+    assert "owner_gradient_sync_not_training_integrated" in reasons, report
 
 
 def test_readiness_reports_copyback_probe_without_dispatch() -> None:
@@ -81,8 +130,7 @@ def test_readiness_reports_copyback_probe_without_dispatch() -> None:
             "mode": "shadow",
             "direct_grad": True,
             "direct_grad_lifecycle_integrated": True,
-            "checkpoint_metadata_integrated": True,
-            "checkpoint_owner_state_enabled": True,
+            **_checkpoint_ready(),
             "copyback_scratch_probe_integrated": True,
             "native_tensor_binding_probe_integrated": True,
         },
@@ -109,8 +157,7 @@ def test_readiness_reports_copyback_dispatch_experimental_contract() -> None:
             "mode": "shadow",
             "direct_grad": True,
             "direct_grad_lifecycle_integrated": True,
-            "checkpoint_metadata_integrated": True,
-            "checkpoint_owner_state_enabled": True,
+            **_checkpoint_ready(),
             "copyback_scratch_probe_integrated": True,
             "copyback_dispatch_experimental_enabled": True,
             "copyback_dispatch_validated": True,
@@ -148,8 +195,7 @@ def test_readiness_keeps_promotion_blockers_when_training_context_is_explicit() 
             "mode": "shadow",
             "direct_grad": True,
             "direct_grad_lifecycle_integrated": True,
-            "checkpoint_metadata_integrated": True,
-            "checkpoint_owner_state_enabled": True,
+            **_checkpoint_ready(),
             "copyback_scratch_probe_integrated": True,
             "copyback_dispatch_experimental_enabled": True,
             "copyback_dispatch_validated": True,
@@ -183,8 +229,7 @@ def test_readiness_refines_stream_lifetime_when_event_chain_is_verified() -> Non
             "mode": "shadow",
             "direct_grad": True,
             "direct_grad_lifecycle_integrated": True,
-            "checkpoint_metadata_integrated": True,
-            "checkpoint_owner_state_enabled": True,
+            **_checkpoint_ready(),
             "copyback_scratch_probe_integrated": True,
             "copyback_dispatch_experimental_enabled": True,
             "copyback_dispatch_validated": True,
@@ -223,8 +268,7 @@ def test_readiness_blocks_unvalidated_copyback_dispatch() -> None:
         shadow_config={
             "mode": "shadow",
             "direct_grad_lifecycle_integrated": True,
-            "checkpoint_metadata_integrated": True,
-            "checkpoint_owner_state_enabled": True,
+            **_checkpoint_ready(),
             "copyback_scratch_probe_integrated": True,
             "copyback_dispatch_experimental_enabled": True,
             "copyback_dispatch_validated": False,
@@ -254,6 +298,7 @@ def test_readiness_blocks_bad_static_context() -> None:
 
 def main() -> int:
     test_readiness_reports_conservative_blockers()
+    test_readiness_requires_explicit_checkpoint_guards_after_metadata()
     test_readiness_reports_copyback_probe_without_dispatch()
     test_readiness_reports_copyback_dispatch_experimental_contract()
     test_readiness_keeps_promotion_blockers_when_training_context_is_explicit()

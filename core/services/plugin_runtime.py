@@ -125,7 +125,6 @@ class PluginRuntime:
         self._manifests: dict[str, PluginManifest] = {}
         self._package_hashes: dict[str, str] = {}
         self._last_results: list[dict[str, Any]] = []
-        self._has_scanned = False
         self._snapshot_path = self._config_root / "training_hooks_snapshot.json"
         self._settings_path = self._config_root / "settings.json"
         self._settings_store = PluginSettingsStore(self._settings_path)
@@ -177,7 +176,6 @@ class PluginRuntime:
 
         # Step 10: Return summary
         self._last_results = list(results)
-        self._has_scanned = True
         return {
             "plugin_count": len(results),
             "active_count": sum(1 for r in results if r.get("active")),
@@ -269,17 +267,11 @@ class PluginRuntime:
         )
 
         result["tier"] = policy.required_tier
-        result["approval"] = approval_result
-        result["trust"] = trust_result
         result["policy"] = {
             "enabled": policy.enabled,
             "reasons": list(policy.reasons),
             "approved": policy.approved,
             "trust_ok": policy.trust_ok,
-            "requires_user_approval": policy.requires_approval,
-            "requires_trust_verification": policy.requires_trust,
-            "unknown_capabilities": list(policy.unknown_capabilities),
-            "unknown_hooks": list(policy.unknown_hooks),
         }
 
         if not policy.enabled:
@@ -381,11 +373,6 @@ class PluginRuntime:
             approved_by=approved_by,
         )
         runner_records = self._grant_plugin_runner_approvals(plugin_id, approved_by=approved_by)
-        enable_record = self._enabled.set_override(
-            plugin_id,
-            enabled=True,
-            updated_by=approved_by,
-        )
         self._audit.append(
             event_type="plugin_approved",
             plugin_id=plugin_id,
@@ -395,11 +382,9 @@ class PluginRuntime:
                 "capabilities": list(record.get("capabilities") or []),
                 "runner_approval_count": len(runner_records),
                 "runner_approval_keys": [str(item.get("approval_key") or "") for item in runner_records],
-                "enabled": True,
             },
         )
-        self._has_scanned = False
-        return {"success": True, "record": record, "runner_records": runner_records, "enabled_record": enable_record}
+        return {"success": True, "record": record, "runner_records": runner_records}
 
     def approve_plugin_runner(
         self,
@@ -425,7 +410,6 @@ class PluginRuntime:
                 "capabilities": list(record.get("capabilities") or []),
             },
         )
-        self._has_scanned = False
         return {"success": True, "record": record}
 
     def revoke_plugin(self, plugin_id: str) -> dict[str, Any]:
@@ -436,7 +420,6 @@ class PluginRuntime:
             plugin_id=plugin_id,
             payload={"records_removed": removed},
         )
-        self._has_scanned = False
         return {"success": True, "records_removed": removed}
 
     def set_plugin_enabled(
@@ -454,7 +437,6 @@ class PluginRuntime:
             plugin_id=plugin_id,
             payload={"enabled": enabled, "updated_by": updated_by},
         )
-        self._has_scanned = False
         return {"success": True, "record": record}
 
     def reset_plugin_enabled(self, plugin_id: str) -> dict[str, Any]:
@@ -465,7 +447,6 @@ class PluginRuntime:
             plugin_id=plugin_id,
             payload={"records_removed": removed},
         )
-        self._has_scanned = False
         return {"success": True, "records_removed": removed}
 
     def toggle_developer_mode(self, enabled: bool) -> dict[str, Any]:
@@ -475,7 +456,6 @@ class PluginRuntime:
             event_type="developer_mode_toggled",
             payload={"enabled": self._developer_mode},
         )
-        self._has_scanned = False
         return {"success": True, "developer_mode": self._developer_mode}
 
     # ── Event dispatch ─────────────────────────────────────────────────
@@ -503,31 +483,21 @@ class PluginRuntime:
     # ── Queries ────────────────────────────────────────────────────────
 
     def snapshot(self) -> dict[str, Any]:
-        """Return a point-in-time snapshot of the runtime state.
-
-        The UI opens the plugin page by calling this endpoint first.  Older
-        behavior returned an empty snapshot until the user manually pressed
-        "reload", which made installed plugins look undetected.  Do a single
-        lazy scan on the first snapshot so the list is populated immediately,
-        while keeping explicit reload as the way to rescan later.
-        """
-        with self._lock:
-            if not self._has_scanned:
-                self._reload_unlocked()
-            orch_snap = self._orchestrator.snapshot()
-            plugins = list(self._last_results)
-            plugin_count = len(plugins) if plugins else int(orch_snap.get("plugin_count") or 0)
-            active_count = sum(1 for p in plugins if p.get("active")) if plugins else int(orch_snap.get("active_count") or 0)
-            return {
-                "developer_mode": self._developer_mode,
-                "plugin_root": str(self._plugin_root),
-                "config_root": str(self._config_root),
-                "plugin_count": plugin_count,
-                "active_count": active_count,
-                "plugins": plugins,
-                "orchestrator": orch_snap,
-                "diagnostics": self._diagnostics.summary(),
-            }
+        """Return a point-in-time snapshot of the runtime state."""
+        orch_snap = self._orchestrator.snapshot()
+        plugins = list(self._last_results)
+        plugin_count = len(plugins) if plugins else int(orch_snap.get("plugin_count") or 0)
+        active_count = sum(1 for p in plugins if p.get("active")) if plugins else int(orch_snap.get("active_count") or 0)
+        return {
+            "developer_mode": self._developer_mode,
+            "plugin_root": str(self._plugin_root),
+            "config_root": str(self._config_root),
+            "plugin_count": plugin_count,
+            "active_count": active_count,
+            "plugins": plugins,
+            "orchestrator": orch_snap,
+            "diagnostics": self._diagnostics.summary(),
+        }
 
     def project_root(self) -> Path:
         return _PROJECT_ROOT

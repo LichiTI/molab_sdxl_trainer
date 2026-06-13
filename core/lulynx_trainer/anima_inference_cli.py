@@ -60,7 +60,8 @@ def _detect_arch(model_path: str) -> str:
     return "anima"
 
 
-def _load_model(model_path: str, arch: str, device: str, dtype: torch.dtype):
+def _load_model(model_path: str, arch: str, device: str, dtype: torch.dtype,
+                model_extra: Optional[Mapping[str, Any]] = None):
     if arch == "newbie":
         from .newbie_loader import load_newbie_from_config
 
@@ -79,6 +80,35 @@ def _load_model(model_path: str, arch: str, device: str, dtype: torch.dtype):
         ))()
         return load_newbie_from_config(cfg, device=device, dtype=dtype)
 
+    # Native-Anima inference stack (real 28-block DiT + qwen-image VAE + Qwen3),
+    # the same components #132 trained on. The legacy ``load_anima_model`` builds
+    # a scaffold DiT that cannot render, so it stays only as a last-resort fallback.
+    from .anima_native_inference import load_native_anima_for_inference, resolve_native_anima_paths
+
+    dit_path, vae_path, qwen3_path = resolve_native_anima_paths(model_path, model_extra)
+    if dit_path and vae_path and qwen3_path:
+        _extra = dict(model_extra or {})
+        block_count = int(_extra.get("anima_native_block_count", 28) or 28)
+        # Faithful native forward (3D RoPE + llm_adapter) lets the base model
+        # render. Tri-state: key absent -> "auto" (enable when the checkpoint
+        # carries the adapter + a T5 tokenizer resolves, else degrade to the stub
+        # with a loud warning); an explicit on/off bool forces it. Default auto so
+        # native-Anima renders out of the box wherever the faithful assets exist.
+        faithful = _extra["anima_faithful"] if "anima_faithful" in _extra else "auto"
+        t5_dir = str(_extra.get("anima_t5_tokenizer_dir") or "").strip() or None
+        bundle = load_native_anima_for_inference(
+            dit_path, vae_path, qwen3_path,
+            block_count=block_count, device=device, dtype=dtype,
+            faithful=faithful, t5_tokenizer_dir=t5_dir,
+        )
+        logger.info("native-anima inference bundle ready: %s", bundle.load_report)
+        return bundle
+
+    logger.warning(
+        "native-anima paths incomplete (dit=%s vae=%s qwen3=%s); falling back to "
+        "legacy scaffold loader (render likely unavailable)",
+        bool(dit_path), bool(vae_path), bool(qwen3_path),
+    )
     from .anima_loader import load_anima_model
     model, report = load_anima_model(model_path=model_path, device=device, dtype=dtype)
     logger.info("Anima load report: %s", report.summary())
@@ -118,6 +148,7 @@ def _generate(model, *, prompt, negative_prompt, width, height, steps,
               tgate_probe: bool = False,
               tgate_start_step: int = 0,
               tgate_min_block: int = 0,
+              tgate_skip: bool = False,
               spectrum_probe: bool = False,
               spectrum_window_size: float = 2.0,
               spectrum_flex_window: float = 0.25,
@@ -127,62 +158,91 @@ def _generate(model, *, prompt, negative_prompt, width, height, steps,
               smoothcache_error_threshold: float = 0.08,
               smoothcache_warmup_steps: int = 2,
               cache_seam_backend: str = "none",
-              cache_seam_window_size: float = 3.0):
+              cache_seam_window_size: float = 3.0,
+              control_image_path: str = "",
+              colorize_mode: str = "asis",
+              easycontrol_v2: str = "auto",
+              adapter_path: str = ""):
     from .model_family import get_model_family
     from .unified_cache_seam import build_cache_seam, cache_seam_context
+    from .tgate import tgate_execution_context
     family = get_model_family(arch)
     _accel_backend = str(cache_seam_backend or "none")
     _accel_enabled = _accel_backend.lower() not in {"", "none"}
     images = []
-    for idx in range(batch_size):
-        img_seed = (seed + idx) if seed is not None else None
-        # Fresh cache per image: seeds differ, so caches must not bleed across images.
-        _seam = build_cache_seam(
-            enabled=_accel_enabled, backend=_accel_backend,
-            spectrum_window_size=int(cache_seam_window_size or 3),
-        )
-        kwargs = dict(
-            num_inference_steps=steps, guidance_scale=guidance_scale,
-            width=width, height=height, seed=img_seed, device=device,
-            dtype=dtype, sampler_name=sampler_name,
-            latent_channels=family.latent_channels,
-            vae_scaling_factor=family.vae_scaling_factor,
-            smc_cfg=smc_cfg,
-            smc_cfg_lambda=smc_cfg_lambda,
-            smc_cfg_alpha=smc_cfg_alpha,
-            tgate_probe=tgate_probe,
-            tgate_start_step=tgate_start_step,
-            tgate_min_block=tgate_min_block,
-            spectrum_probe=spectrum_probe,
-            spectrum_window_size=spectrum_window_size,
-            spectrum_flex_window=spectrum_flex_window,
-            spectrum_warmup_steps=spectrum_warmup_steps,
-            spectrum_stop_caching_step=spectrum_stop_caching_step,
-            smoothcache_probe=smoothcache_probe,
-            smoothcache_error_threshold=smoothcache_error_threshold,
-            smoothcache_warmup_steps=smoothcache_warmup_steps,
-        )
-        with cache_seam_context(_seam):
-            if arch == "newbie":
-                from .newbie_sampler import sample_newbie
-                img = sample_newbie(
-                    dit_model=model.unet, vae=model.vae,
-                    text_encoder_1=model.text_encoder_1, text_encoder_2=model.text_encoder_2,
-                    tokenizer_1=model.tokenizer_1, tokenizer_2=model.tokenizer_2,
-                    prompt=prompt, negative_prompt=negative_prompt, **kwargs,
-                    latent_scale_factor=newbie_latent_scale_factor,
-                )
-            else:
-                from .anima_sampler import sample_anima
-                img = sample_anima(
-                    dit_model=model.unet, vae=model.vae,
-                    text_encoder=model.text_encoder_1, tokenizer=model.tokenizer_1,
-                    prompt=prompt, negative_prompt=negative_prompt, **kwargs,
-                )
-        if img is not None:
-            images.append(img)
+    # Native-Anima: encode the prompt once (constant across the batch) and inject
+    # via sample_anima's additive prompt_embeds seam. The faithful bundle runs the
+    # llm_adapter (Qwen3 hidden + T5 ids -> crossattn_emb); the stub bundle uses
+    # raw Qwen3 hidden. Legacy models keep the CLIP path inside sample_anima.
+    _native_embeds: dict = {}
+    if arch != "newbie" and getattr(model, "is_native_qwen3", False):
+        if getattr(model, "is_faithful", False):
+            from .anima_native_inference import encode_native_condition as _encode_cond
         else:
-            logger.warning("Sample %d returned None", idx)
+            from .anima_native_inference import encode_qwen3_prompt as _encode_cond
+
+        _native_embeds["prompt_embeds"] = _encode_cond(model, prompt)
+        if guidance_scale > 1.0:
+            _native_embeds["negative_prompt_embeds"] = _encode_cond(model, negative_prompt or "")
+    # EasyControl v2 colorize: condition every DiT forward on the control image.
+    # A pure no-op (parity) unless native arch + control image + easycontrol_v2.* adapter.
+    from .anima_colorize_inference import colorize_render_scope
+    with colorize_render_scope(
+        model, arch=arch, adapter_path=adapter_path,
+        control_image_path=control_image_path, colorize_mode=colorize_mode,
+        easycontrol_mode=easycontrol_v2, device=device, dtype=dtype,
+        num_inference_steps=steps, guidance_scale=guidance_scale,
+    ):
+        for idx in range(batch_size):
+            img_seed = (seed + idx) if seed is not None else None
+            # Fresh cache per image: seeds differ, so caches must not bleed across images.
+            _seam = build_cache_seam(
+                enabled=_accel_enabled, backend=_accel_backend,
+                spectrum_window_size=int(cache_seam_window_size or 3),
+            )
+            kwargs = dict(
+                num_inference_steps=steps, guidance_scale=guidance_scale,
+                width=width, height=height, seed=img_seed, device=device,
+                dtype=dtype, sampler_name=sampler_name,
+                latent_channels=family.latent_channels,
+                vae_scaling_factor=family.vae_scaling_factor,
+                smc_cfg=smc_cfg,
+                smc_cfg_lambda=smc_cfg_lambda,
+                smc_cfg_alpha=smc_cfg_alpha,
+                tgate_probe=tgate_probe or tgate_skip,
+                tgate_start_step=tgate_start_step,
+                tgate_min_block=tgate_min_block,
+                spectrum_probe=spectrum_probe,
+                spectrum_window_size=spectrum_window_size,
+                spectrum_flex_window=spectrum_flex_window,
+                spectrum_warmup_steps=spectrum_warmup_steps,
+                spectrum_stop_caching_step=spectrum_stop_caching_step,
+                smoothcache_probe=smoothcache_probe,
+                smoothcache_error_threshold=smoothcache_error_threshold,
+                smoothcache_warmup_steps=smoothcache_warmup_steps,
+            )
+            with cache_seam_context(_seam), tgate_execution_context(enabled=tgate_skip):
+                if arch == "newbie":
+                    from .newbie_sampler import sample_newbie
+                    img = sample_newbie(
+                        dit_model=model.unet, vae=model.vae,
+                        text_encoder_1=model.text_encoder_1, text_encoder_2=model.text_encoder_2,
+                        tokenizer_1=model.tokenizer_1, tokenizer_2=model.tokenizer_2,
+                        prompt=prompt, negative_prompt=negative_prompt, **kwargs,
+                        latent_scale_factor=newbie_latent_scale_factor,
+                    )
+                else:
+                    from .anima_sampler import sample_anima
+                    img = sample_anima(
+                        dit_model=model.unet, vae=model.vae,
+                        text_encoder=model.text_encoder_1, tokenizer=model.tokenizer_1,
+                        prompt=prompt, negative_prompt=negative_prompt,
+                        **_native_embeds, **kwargs,
+                    )
+            if img is not None:
+                images.append(img)
+            else:
+                logger.warning("Sample %d returned None", idx)
     return images
 
 
@@ -269,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tgate_probe", action="store_true", help="Observe T-GATE cross-attention skip eligibility without skipping")
     p.add_argument("--tgate_start_step", type=int, default=0, help="T-GATE probe warmup step threshold")
     p.add_argument("--tgate_min_block", type=int, default=0, help="T-GATE probe minimum block index")
+    p.add_argument("--tgate_skip", action="store_true", help="Enable T-GATE real cross-attention reuse on eligible late-step/deep-block calls (default off)")
     p.add_argument("--spectrum_probe", action="store_true", help="Observe Spectrum block-cache eligibility without skipping")
     p.add_argument("--spectrum_window_size", type=float, default=2.0, help="Spectrum probe base cache window size")
     p.add_argument("--spectrum_flex_window", type=float, default=0.25, help="Spectrum probe adaptive window growth")
@@ -277,8 +338,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", default="bf16", help="fp16/bf16/fp32")
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--inference_accel_scheme", default="none", help="Inference accel: none|spectrum|smoothcache (drives the probe+seam pair together)")
+    p.add_argument("--inference_accel_scheme", default="none", help="Inference accel: none|spectrum|smoothcache|deepcache|teacache (drives the probe+seam pair together)")
     p.add_argument("--arch", default="", help="Override: anima or newbie")
+    # Native-Anima faithful-forward producer: these write anima_* keys into
+    # request.model_extra (consumed by _load_model / _resolve_native_anima_paths).
+    p.add_argument("--anima_faithful", choices=["auto", "on", "off"], default="auto",
+                   help="Native-Anima faithful forward: auto=enable when assets present else degrade to stub (default); on/off force it")
+    p.add_argument("--anima_dit_path", default="", help="Override native-Anima DiT .safetensors (else models/anima/diffusion_models)")
+    p.add_argument("--anima_vae_path", default="", help="Override qwen-image VAE .safetensors (else models/anima/vae)")
+    p.add_argument("--anima_qwen3_path", default="", help="Override Qwen3 text-encoder .safetensors (else models/anima/text_encoders)")
+    p.add_argument("--anima_t5_tokenizer_dir", default="", help="Override T5 tokenizer dir for the llm_adapter target ids (else models/anima/tokenizer_t5)")
+    # EasyControl v2 / colorize control-conditioned render (default-off; parity without --control_image).
+    p.add_argument("--control_image", default="", help="Control image (line-art/grayscale) for EasyControl v2 colorize render")
+    p.add_argument("--easycontrol_v2", choices=["auto", "on", "off"], default="auto",
+                   help="EasyControl v2 colorize: auto=on when a control image + easycontrol_v2.* adapter are present; on/off force it")
+    p.add_argument("--colorize_mode", choices=["asis", "lineart", "grayscale"], default="asis",
+                   help="Treat --control_image as-is, or derive line-art/grayscale control from it first")
     return p
 
 
@@ -298,39 +373,62 @@ def build_generation_request_from_args(args: argparse.Namespace | Mapping[str, A
     if not data.get("model_path") and not data.get("dry_run"):
         raise ValueError("model_path is required unless --dry_run or --request_json is used")
     seed = data.get("seed")
+    payload = {
+        "schema_id": "generation.image",
+        "model_path": data.get("model_path") or "",
+        "adapter_path": data.get("adapter_path") or "",
+        "output_dir": data.get("output_dir") or "",
+        "prompt": data.get("prompt") or "",
+        "negative_prompt": data.get("negative_prompt") or "",
+        "width": data.get("width", 1024),
+        "height": data.get("height", 1024),
+        "steps": data.get("steps", 20),
+        "guidance_scale": data.get("guidance_scale", 5.0),
+        "seed": -1 if seed is None else seed,
+        "sampler": data.get("sampler_name") or data.get("sampler") or "euler",
+        "smc_cfg": bool(data.get("smc_cfg", False)),
+        "smc_cfg_lambda": data.get("smc_cfg_lambda", 5.0),
+        "smc_cfg_alpha": data.get("smc_cfg_alpha", 0.2),
+        "tgate_probe": bool(data.get("tgate_probe", False)),
+        "tgate_start_step": data.get("tgate_start_step", 0),
+        "tgate_min_block": data.get("tgate_min_block", 0),
+        "tgate_skip": bool(data.get("tgate_skip", False)),
+        "spectrum_probe": bool(data.get("spectrum_probe", False)),
+        "spectrum_window_size": data.get("spectrum_window_size", 2.0),
+        "spectrum_flex_window": data.get("spectrum_flex_window", 0.25),
+        "spectrum_warmup_steps": data.get("spectrum_warmup_steps", 6),
+        "spectrum_stop_caching_step": data.get("spectrum_stop_caching_step", -1),
+        "dtype": data.get("dtype") or "bf16",
+        "device": data.get("device") or "cuda",
+        "batch_size": data.get("batch_size", 1),
+        "inference_accel_scheme": data.get("inference_accel_scheme", "none"),
+        "arch": (data.get("arch") or "auto") or "auto",
+        "output_name": data.get("output_name") or "",
+        "dry_run": bool(data.get("dry_run", False)),
+    }
+    # Native-Anima faithful-forward producer -> request.model_extra (extra="allow").
+    # "auto" is the loader default, so omit the key (its presence would pin a bool);
+    # only on/off write an explicit anima_faithful. Path overrides only when non-empty.
+    af = str(data.get("anima_faithful") or "auto").strip().lower()
+    if af == "on":
+        payload["anima_faithful"] = True
+    elif af == "off":
+        payload["anima_faithful"] = False
+    for key in ("anima_dit_path", "anima_vae_path", "anima_qwen3_path", "anima_t5_tokenizer_dir"):
+        val = str(data.get(key) or "").strip()
+        if val:
+            payload[key] = val
+    # EasyControl v2 colorize producer -> request.model_extra. Only emitted when a
+    # control image is supplied (no control image -> no key -> bitwise-parity t2i).
+    control_image = str(data.get("control_image") or "").strip()
+    if control_image:
+        payload["control_image_path"] = control_image
+        payload["colorize_mode"] = str(data.get("colorize_mode") or "asis").strip().lower()
+        ev2 = str(data.get("easycontrol_v2") or "auto").strip().lower()
+        if ev2 in ("on", "off"):  # "auto" is the scope default; omit to avoid pinning
+            payload["easycontrol_v2"] = ev2
     request = GenerationRequest.from_legacy_payload(
-        {
-            "schema_id": "generation.image",
-            "model_path": data.get("model_path") or "",
-            "adapter_path": data.get("adapter_path") or "",
-            "output_dir": data.get("output_dir") or "",
-            "prompt": data.get("prompt") or "",
-            "negative_prompt": data.get("negative_prompt") or "",
-            "width": data.get("width", 1024),
-            "height": data.get("height", 1024),
-            "steps": data.get("steps", 20),
-            "guidance_scale": data.get("guidance_scale", 5.0),
-            "seed": -1 if seed is None else seed,
-            "sampler": data.get("sampler_name") or data.get("sampler") or "euler",
-            "smc_cfg": bool(data.get("smc_cfg", False)),
-            "smc_cfg_lambda": data.get("smc_cfg_lambda", 5.0),
-            "smc_cfg_alpha": data.get("smc_cfg_alpha", 0.2),
-            "tgate_probe": bool(data.get("tgate_probe", False)),
-            "tgate_start_step": data.get("tgate_start_step", 0),
-            "tgate_min_block": data.get("tgate_min_block", 0),
-            "spectrum_probe": bool(data.get("spectrum_probe", False)),
-            "spectrum_window_size": data.get("spectrum_window_size", 2.0),
-            "spectrum_flex_window": data.get("spectrum_flex_window", 0.25),
-            "spectrum_warmup_steps": data.get("spectrum_warmup_steps", 6),
-            "spectrum_stop_caching_step": data.get("spectrum_stop_caching_step", -1),
-            "dtype": data.get("dtype") or "bf16",
-            "device": data.get("device") or "cuda",
-            "batch_size": data.get("batch_size", 1),
-            "inference_accel_scheme": data.get("inference_accel_scheme", "none"),
-            "arch": (data.get("arch") or "auto") or "auto",
-            "output_name": data.get("output_name") or "",
-            "dry_run": bool(data.get("dry_run", False)),
-        },
+        payload,
         source=RequestSource.CLI,
         compat_mode=True,
     )
@@ -432,7 +530,8 @@ def main(argv: Optional[list] = None) -> None:
         arch = _detect_arch(generation_request.model_path)
     logger.info("arch=%s dtype=%s device=%s", arch, dtype_name, generation_request.device)
 
-    model = _load_model(generation_request.model_path, arch, generation_request.device, dtype)
+    model = _load_model(generation_request.model_path, arch, generation_request.device, dtype,
+                        model_extra=getattr(generation_request, "model_extra", None))
     if generation_request.adapter_path:
         model = _apply_adapter(model, generation_request.adapter_path, arch, generation_request.device)
     model, tensorrt_report = _maybe_apply_newbie_tensorrt_transformer(model, generation_request, arch)
@@ -455,6 +554,11 @@ def main(argv: Optional[list] = None) -> None:
         _spectrum_probe = generation_request.spectrum_probe
         _smoothcache_probe = generation_request.smoothcache_probe
         _cache_seam_backend = generation_request.cache_seam_backend
+    # EasyControl v2 colorize render fields (request.model_extra; empty -> plain t2i).
+    _gen_extra = getattr(generation_request, "model_extra", None) or {}
+    _control_image = str(_gen_extra.get("control_image_path") or "").strip()
+    _colorize_mode = str(_gen_extra.get("colorize_mode") or "asis").strip().lower()
+    _easycontrol_v2 = str(_gen_extra.get("easycontrol_v2") or "auto").strip().lower()
     images = _generate(model, prompt=generation_request.prompt, negative_prompt=generation_request.negative_prompt,
                        width=generation_request.width, height=generation_request.height, steps=generation_request.steps,
                        guidance_scale=generation_request.guidance_scale, seed=seed,
@@ -467,6 +571,7 @@ def main(argv: Optional[list] = None) -> None:
                        tgate_probe=generation_request.tgate_probe,
                        tgate_start_step=generation_request.tgate_start_step,
                        tgate_min_block=generation_request.tgate_min_block,
+                       tgate_skip=getattr(generation_request, "tgate_skip", False),
                        spectrum_probe=_spectrum_probe,
                        spectrum_window_size=generation_request.spectrum_window_size,
                        spectrum_flex_window=generation_request.spectrum_flex_window,
@@ -476,7 +581,11 @@ def main(argv: Optional[list] = None) -> None:
                        smoothcache_error_threshold=generation_request.smoothcache_error_threshold,
                        smoothcache_warmup_steps=generation_request.smoothcache_warmup_steps,
                        cache_seam_backend=_cache_seam_backend,
-                       cache_seam_window_size=generation_request.cache_seam_window_size)
+                       cache_seam_window_size=generation_request.cache_seam_window_size,
+                       control_image_path=_control_image,
+                       colorize_mode=_colorize_mode,
+                       easycontrol_v2=_easycontrol_v2,
+                       adapter_path=generation_request.adapter_path or "")
 
     out_dir = Path(generation_request.output_dir or "./inference_output")
     out_dir.mkdir(parents=True, exist_ok=True)

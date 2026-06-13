@@ -15,8 +15,11 @@ Design invariants
   identical to today's behavior.  Even when enabled, a step that the active
   Spectrum/SmoothCache decision does not mark cacheable computes normally, so
   the only divergence is on intentionally cached steps.
-* **Block granularity.** Only Spectrum and SmoothCache are block-level and
-  share the ``run_*(block_fn, block_index, cache, *args)`` contract.  T-GATE is
+* **Block granularity.** Spectrum, SmoothCache, DeepCache and TeaCache are all
+  block-level and share the ``run_*(block_fn, block_index, cache, *args)``
+  contract.  Spectrum/SmoothCache pair with a per-step observe probe; DeepCache
+  and TeaCache are *self-contained* (they recover step boundaries from the
+  ``block_index`` wrap-around, so they need no probe switch).  T-GATE is
   cross-attention granularity (``run_with_tgate_skip`` operates inside a block)
   and is *not* driven here; it stays the already-wired observe probe + library
   primitive.  ``backend="tgate"`` is accepted but leaves the block seam in the
@@ -36,13 +39,21 @@ from typing import Any, Callable, Dict, Iterator, Optional
 try:  # package import
     from .spectrum_probe import SpectrumCache, run_with_spectrum_skip
     from .smoothcache import SmoothCacheStore, run_with_smoothcache
+    from .deepcache import DeepCacheStore, run_with_deepcache
+    from .teacache import TeaCacheStore, run_with_teacache
 except ImportError:  # pragma: no cover - direct-file smoke fallback
     from core.lulynx_trainer.spectrum_probe import SpectrumCache, run_with_spectrum_skip
     from core.lulynx_trainer.smoothcache import SmoothCacheStore, run_with_smoothcache
+    from core.lulynx_trainer.deepcache import DeepCacheStore, run_with_deepcache
+    from core.lulynx_trainer.teacache import TeaCacheStore, run_with_teacache
 
 
-BLOCK_LEVEL_BACKENDS = ("spectrum", "smoothcache")
-KNOWN_BACKENDS = ("none", "spectrum", "smoothcache", "tgate")
+# Block-level backends share the ``run_*(block_fn, block_index, cache, *args)``
+# contract and are driven inside ``_run_blocks``.  Spectrum/SmoothCache pair with
+# a per-step probe; DeepCache/TeaCache are *self-contained* (they track step
+# boundaries from the ``block_index`` wrap-around) so they need no probe switch.
+BLOCK_LEVEL_BACKENDS = ("spectrum", "smoothcache", "deepcache", "teacache")
+KNOWN_BACKENDS = ("none", "spectrum", "smoothcache", "deepcache", "teacache", "tgate")
 
 
 @dataclass(frozen=True)
@@ -50,6 +61,9 @@ class UnifiedCacheSeamPolicy:
     enabled: bool = False
     backend: str = "none"
     spectrum_window_size: int = 3
+    deepcache_interval: int = 3
+    deepcache_deep_fraction: float = 0.4
+    teacache_rel_l1_threshold: float = 0.05
 
     def normalized(self) -> "UnifiedCacheSeamPolicy":
         backend = str(self.backend or "none").strip().lower().replace("-", "").replace("_", "")
@@ -59,11 +73,21 @@ class UnifiedCacheSeamPolicy:
             enabled=bool(self.enabled) and backend in BLOCK_LEVEL_BACKENDS,
             backend=backend,
             spectrum_window_size=max(int(self.spectrum_window_size), 2),
+            deepcache_interval=max(int(self.deepcache_interval), 1),
+            deepcache_deep_fraction=min(max(float(self.deepcache_deep_fraction), 0.0), 1.0),
+            teacache_rel_l1_threshold=max(float(self.teacache_rel_l1_threshold), 0.0),
         )
 
     def to_dict(self) -> Dict[str, Any]:
         n = self.normalized()
-        return {"enabled": n.enabled, "backend": n.backend, "spectrum_window_size": n.spectrum_window_size}
+        return {
+            "enabled": n.enabled,
+            "backend": n.backend,
+            "spectrum_window_size": n.spectrum_window_size,
+            "deepcache_interval": n.deepcache_interval,
+            "deepcache_deep_fraction": n.deepcache_deep_fraction,
+            "teacache_rel_l1_threshold": n.teacache_rel_l1_threshold,
+        }
 
 
 class UnifiedCacheSeam:
@@ -79,6 +103,15 @@ class UnifiedCacheSeam:
                 self._cache = SpectrumCache(window_size=self.policy.spectrum_window_size)
             elif self.backend == "smoothcache":
                 self._cache = SmoothCacheStore()
+            elif self.backend == "deepcache":
+                self._cache = DeepCacheStore(
+                    interval=self.policy.deepcache_interval,
+                    deep_fraction=self.policy.deepcache_deep_fraction,
+                )
+            elif self.backend == "teacache":
+                self._cache = TeaCacheStore(
+                    rel_l1_threshold=self.policy.teacache_rel_l1_threshold,
+                )
 
     def run_block(self, block_fn: Callable[..., Any], block_index: int, *args, **kwargs) -> Any:
         """Drive the active backend for one DiT block, or pass through verbatim."""
@@ -88,6 +121,10 @@ class UnifiedCacheSeam:
             return run_with_spectrum_skip(block_fn, block_index, self._cache, *args, **kwargs)
         if self.backend == "smoothcache":
             return run_with_smoothcache(block_fn, block_index, self._cache, *args, **kwargs)
+        if self.backend == "deepcache":
+            return run_with_deepcache(block_fn, block_index, self._cache, *args, **kwargs)
+        if self.backend == "teacache":
+            return run_with_teacache(block_fn, block_index, self._cache, *args, **kwargs)
         return block_fn(*args, **kwargs)
 
     def clear(self) -> None:
@@ -124,9 +161,19 @@ def build_cache_seam(
     enabled: bool = False,
     backend: str = "none",
     spectrum_window_size: int = 3,
+    deepcache_interval: int = 3,
+    deepcache_deep_fraction: float = 0.4,
+    teacache_rel_l1_threshold: float = 0.05,
 ) -> UnifiedCacheSeam:
     return UnifiedCacheSeam(
-        UnifiedCacheSeamPolicy(enabled=enabled, backend=backend, spectrum_window_size=spectrum_window_size)
+        UnifiedCacheSeamPolicy(
+            enabled=enabled,
+            backend=backend,
+            spectrum_window_size=spectrum_window_size,
+            deepcache_interval=deepcache_interval,
+            deepcache_deep_fraction=deepcache_deep_fraction,
+            teacache_rel_l1_threshold=teacache_rel_l1_threshold,
+        )
     )
 
 
@@ -156,15 +203,22 @@ class InferenceAccelResolution:
 def resolve_inference_accel_scheme(scheme: str | None) -> InferenceAccelResolution:
     """Map a high-level accel scheme to its (probe, seam) switch pair.
 
-    Only ``spectrum`` / ``smoothcache`` are block-level real-skip schemes;
-    anything else resolves to off (bitwise parity).  Accepts hyphen/underscore
-    spellings (``smooth-cache`` / ``smooth_cache``).
+    ``spectrum`` / ``smoothcache`` are block-level real-skip schemes that pair a
+    per-step probe with the seam backend.  ``deepcache`` / ``teacache`` are also
+    block-level real-skip schemes but *self-contained* (no probe — they track
+    step boundaries from the block-index wrap-around), so they resolve to the
+    seam backend alone.  Anything else resolves to off (bitwise parity).  Accepts
+    hyphen/underscore spellings (``smooth-cache`` / ``deep_cache``).
     """
     token = str(scheme or "none").strip().lower().replace("-", "").replace("_", "")
     if token == "spectrum":
         return InferenceAccelResolution("spectrum", True, False, "spectrum")
     if token == "smoothcache":
         return InferenceAccelResolution("smoothcache", False, True, "smoothcache")
+    if token == "deepcache":
+        return InferenceAccelResolution("deepcache", False, False, "deepcache")
+    if token == "teacache":
+        return InferenceAccelResolution("teacache", False, False, "teacache")
     return InferenceAccelResolution("none", False, False, "none")
 
 

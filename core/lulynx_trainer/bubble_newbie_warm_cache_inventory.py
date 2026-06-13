@@ -278,13 +278,32 @@ def _newbie_canary_family(natural_load_canary: Mapping[str, Any]) -> Mapping[str
     return {}
 
 
-def _select_axis(rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+def _current_source_root_keys(source_axis_requirement: Mapping[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for raw in _list(source_axis_requirement.get("families")):
+        item = _mapping(raw)
+        if _family_key(item.get("family")) != "newbie":
+            continue
+        keys.update(_path_key(root) for root in _strings(item.get("current_source_roots")))
+    return {key for key in keys if key}
+
+
+def _select_axis(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    current_source_root_keys: set[str] | None = None,
+) -> Mapping[str, Any]:
     ready = [item for item in rows if bool(item.get("cache_ready"))]
     if not ready:
         return rows[0] if rows else {}
+    current_keys = current_source_root_keys or set()
     ready.sort(
         key=lambda item: (
-            "no_skip_clip" in str(item.get("root") or ""),
+            _path_key(item.get("source_data")) in current_keys,
+            not bool(item.get("completed_canary_command_count")),
+            not bool(item.get("do_not_rerun_without_new_axis")),
+            str(item.get("axis_kind") or "") == "full_ready",
+            "repair" in str(item.get("root") or "").lower(),
             _safe_float(item.get("sample_cache_coverage")),
             _safe_int(item.get("sample_count")),
         ),
@@ -325,7 +344,8 @@ def build_newbie_warm_cache_inventory(
         )
         axis["do_not_rerun_without_new_axis"] = bool(axis["completed_canary_command_count"])
 
-    selected = _select_axis(axes)
+    current_source_root_keys = _current_source_root_keys(_mapping(source_axis_requirement))
+    selected = _select_axis(axes, current_source_root_keys=current_source_root_keys)
     selected_key = str(selected.get("source_root_key") or "")
     canary_family = _newbie_canary_family(_mapping(natural_load_canary))
     blocker_summary = _mapping(_mapping(natural_load_canary).get("blocker_summary"))
@@ -371,6 +391,8 @@ def build_newbie_warm_cache_inventory(
         "selected_axis_kind": str(selected.get("axis_kind") or ""),
         "source_data_original": str(selected.get("source_data") or ""),
         "prepared_source_data": str(selected.get("source_root") or ""),
+        "selected_axis_repair_produced": "repair" in str(selected.get("root") or "").lower(),
+        "selected_axis_current_source_root_match": _path_key(selected.get("source_data")) in current_source_root_keys,
         "selected_axis_sample_offset": _safe_int(selected.get("sample_offset")),
         "selected_axis_sample_count": _safe_int(selected.get("sample_count")),
         "selected_axis_stems": _strings(_mapping(selected.get("manifest")).get("stems")),

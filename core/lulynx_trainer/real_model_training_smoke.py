@@ -231,6 +231,8 @@ def _apply_adapter_overrides(config: UnifiedTrainingConfig, *, family: str, adap
         "ia3": LyCORISAlgo.IA3,
         "full": LyCORISAlgo.FULL,
         "diag-oft": LyCORISAlgo.DIAG_OFT,
+        "glora": LyCORISAlgo.GLORA,
+        "glokr": LyCORISAlgo.GLOKR,
     }
 
     config.network_module = NetworkType.LORA
@@ -479,6 +481,7 @@ def _build_config(
     anima_block_residency_min_params: int,
     anima_block_prefetch: bool,
     anima_block_prefetch_depth: int,
+    anima_block_prefetch_mode: str,
     newbie_block_residency: str,
     newbie_block_residency_min_params: int,
     newbie_block_prefetch: bool,
@@ -542,6 +545,7 @@ def _build_config(
         anima_block_residency_min_params=max(int(anima_block_residency_min_params or 0), 0),
         anima_block_prefetch=bool(anima_block_prefetch),
         anima_block_prefetch_depth=max(int(anima_block_prefetch_depth or 0), 0),
+        anima_block_prefetch_mode=str(anima_block_prefetch_mode or "original"),
         newbie_block_residency=str(newbie_block_residency or "resident"),
         newbie_block_residency_min_params=max(int(newbie_block_residency_min_params or 0), 0),
         newbie_block_prefetch=bool(newbie_block_prefetch),
@@ -701,6 +705,7 @@ def _run_case(
     anima_block_residency_min_params: int,
     anima_block_prefetch: bool,
     anima_block_prefetch_depth: int,
+    anima_block_prefetch_mode: str,
     newbie_block_residency: str,
     newbie_block_residency_min_params: int,
     newbie_block_prefetch: bool,
@@ -782,6 +787,7 @@ def _run_case(
         anima_block_residency_min_params=anima_block_residency_min_params,
         anima_block_prefetch=anima_block_prefetch,
         anima_block_prefetch_depth=anima_block_prefetch_depth,
+        anima_block_prefetch_mode=anima_block_prefetch_mode,
         newbie_block_residency=newbie_block_residency,
         newbie_block_residency_min_params=newbie_block_residency_min_params,
         newbie_block_prefetch=newbie_block_prefetch,
@@ -1055,6 +1061,7 @@ def main() -> int:
     parser.add_argument("--anima-block-residency-min-params", type=int, default=0)
     parser.add_argument("--anima-block-prefetch", action="store_true")
     parser.add_argument("--anima-block-prefetch-depth", type=int, default=1)
+    parser.add_argument("--anima-block-prefetch-mode", default="original", choices=["original", "adaptive"])
     parser.add_argument("--newbie-block-residency", default="resident", choices=["resident", "streaming_offload", "block_cpu_pinned"])
     parser.add_argument("--newbie-block-residency-min-params", type=int, default=0)
     parser.add_argument("--newbie-block-prefetch", action="store_true")
@@ -1183,6 +1190,7 @@ def main() -> int:
                 anima_block_residency_min_params=max(int(args.anima_block_residency_min_params or 0), 0),
                 anima_block_prefetch=bool(args.anima_block_prefetch),
                 anima_block_prefetch_depth=max(int(args.anima_block_prefetch_depth or 0), 0),
+                anima_block_prefetch_mode=str(args.anima_block_prefetch_mode or "original"),
                 newbie_block_residency=str(args.newbie_block_residency or "resident"),
                 newbie_block_residency_min_params=max(int(args.newbie_block_residency_min_params or 0), 0),
                 newbie_block_prefetch=bool(args.newbie_block_prefetch),
@@ -1228,6 +1236,7 @@ def main() -> int:
         "anima_block_residency": str(args.anima_block_residency or "resident"),
         "anima_block_prefetch": bool(args.anima_block_prefetch),
         "anima_block_prefetch_depth": max(int(args.anima_block_prefetch_depth or 0), 0),
+        "anima_block_prefetch_mode": str(args.anima_block_prefetch_mode or "original"),
         "newbie_block_residency": str(args.newbie_block_residency or "resident"),
         "newbie_block_prefetch": bool(args.newbie_block_prefetch),
         "newbie_block_prefetch_depth": max(int(args.newbie_block_prefetch_depth or 0), 0),

@@ -72,9 +72,24 @@ def _read_tensor(raw: bytes, dtype: str, shape: list[int]) -> np.ndarray | None:
         return np.frombuffer(raw, dtype=np.float16).astype(np.float32).reshape(shape)
     if dtype == "F32":
         return np.frombuffer(raw, dtype=np.float32).reshape(shape)
-    if dtype in {"F8_E4M3", "F8_E5M2"}:
-        return np.frombuffer(raw, dtype=np.uint8).astype(np.float32).reshape(shape) / 255.0
+    # F8_E4M3 / F8_E5M2 等：numpy 无原生 fp8 语义，按整数伪解码只会产生噪声统计，
+    # 显式跳过并由调用方标注 unsupported_dtypes。
     return None
+
+
+_MODULE_SUFFIX_MARKERS = (
+    ".lora_down", ".lora_up", ".lora_A", ".lora_B",
+    ".hada_", ".lokr_", ".diff", ".w1", ".w2",
+)
+
+
+def _module_prefix(name: str) -> str:
+    """Strip the weight-role suffix so the prefix matches the ``<module>.alpha`` key."""
+    for marker in _MODULE_SUFFIX_MARKERS:
+        idx = name.find(marker)
+        if idx > 0:
+            return name[:idx]
+    return name.rsplit(".", 1)[0]
 
 
 def _open_safetensors_header(path: str):
@@ -95,6 +110,7 @@ def analyze_lora(file_path: str, *, max_samples: int = 1000) -> Dict[str, Any]:
 
     layers: List[Dict[str, Any]] = []
     block_data: Dict[str, Dict[str, Any]] = {}
+    unsupported_dtypes: Dict[str, int] = {}
     total_params = 0
 
     handle, header, offset_base = _open_safetensors_header(str(path))
@@ -119,11 +135,13 @@ def analyze_lora(file_path: str, *, max_samples: int = 1000) -> Dict[str, Any]:
             handle.seek(offset_base + start)
             tensor = _read_tensor(handle.read(end - start), info.get("dtype", ""), info.get("shape", []))
             if tensor is None:
+                dtype_name = str(info.get("dtype", "") or "unknown").upper()
+                unsupported_dtypes[dtype_name] = unsupported_dtypes.get(dtype_name, 0) + 1
                 continue
 
             total_params += int(tensor.size)
             rank = int(tensor.shape[0]) if tensor.ndim >= 2 and any(x in name.lower() for x in ["down", "lora_a", "w1"]) else (min(tensor.shape) if tensor.ndim >= 2 else 0)
-            alpha = alpha_values.get(name.rsplit(".", 1)[0], float(rank) if rank > 0 else 1.0)
+            alpha = alpha_values.get(_module_prefix(name), float(rank) if rank > 0 else 1.0)
             scale = alpha / rank if rank > 0 else 1.0
             has_anomaly = bool(np.isnan(tensor).any() or np.isinf(tensor).any())
             if has_anomaly:
@@ -136,6 +154,19 @@ def analyze_lora(file_path: str, *, max_samples: int = 1000) -> Dict[str, Any]:
                 mean_val = float(np.mean(tensor))
                 std_val = float(np.std(tensor))
                 sparsity = float(np.mean(np.abs(tensor) < 1e-7))
+
+            # 有效信息承载量:down 矩阵的 effective rank 占比(奇异值 > 1% max 的数量 / 总秩)
+            eff_rank_ratio = None
+            if (not has_anomaly and tensor.ndim >= 2 and tensor.size <= 4_000_000
+                    and any(x in name.lower() for x in ["down", "lora_a", "w1"])):
+                mat = tensor.reshape(tensor.shape[0], -1).astype(np.float32)
+                if min(mat.shape) >= 2:
+                    try:
+                        svals = np.linalg.svd(mat, compute_uv=False)
+                        if svals.size and float(svals[0]) > 0.0:
+                            eff_rank_ratio = float(np.sum(svals > svals[0] * 0.01) / svals.size)
+                    except np.linalg.LinAlgError:
+                        eff_rank_ratio = None
 
             flat = tensor.flatten()
             if flat.size > max_samples:
@@ -157,6 +188,7 @@ def analyze_lora(file_path: str, *, max_samples: int = 1000) -> Dict[str, Any]:
                 "alpha": _safe_round(alpha, 4),
                 "scale": _safe_round(scale, 4),
                 "sparsity": _safe_round(sparsity, 4),
+                "effective_rank_ratio": _safe_round(eff_rank_ratio, 4) if eff_rank_ratio is not None else None,
                 "has_anomaly": has_anomaly,
                 "sample_points": samples,
             }
@@ -164,11 +196,14 @@ def analyze_lora(file_path: str, *, max_samples: int = 1000) -> Dict[str, Any]:
 
             block_id = normalize_block_name(name)
             if block_id != "OTHER":
-                block = block_data.setdefault(block_id, {"count": 0, "sum_norm": 0.0, "sum_sparsity": 0.0, "sum_rms": 0.0, "dead_count": 0, "overfit_count": 0, "underfit_count": 0})
+                block = block_data.setdefault(block_id, {"count": 0, "sum_norm": 0.0, "sum_sparsity": 0.0, "sum_rms": 0.0, "sum_eff": 0.0, "eff_count": 0, "dead_count": 0, "overfit_count": 0, "underfit_count": 0})
                 block["count"] += 1
                 block["sum_norm"] += norm_val
                 block["sum_sparsity"] += sparsity
                 block["sum_rms"] += rms
+                if eff_rank_ratio is not None:
+                    block["sum_eff"] += eff_rank_ratio
+                    block["eff_count"] += 1
                 if rms < 1e-6:
                     block["dead_count"] += 1
                 elif rms > 0.15:
@@ -179,7 +214,7 @@ def analyze_lora(file_path: str, *, max_samples: int = 1000) -> Dict[str, Any]:
         handle.close()
 
     lora_type = "LoRA"
-    lower_names = [name.lower() for name in layers and [item["name"] for item in layers] or []]
+    lower_names = [item["name"].lower() for item in layers]
     if any("lokr" in name for name in lower_names):
         lora_type = "LoKr"
     elif any("hada" in name for name in lower_names):
@@ -194,6 +229,7 @@ def analyze_lora(file_path: str, *, max_samples: int = 1000) -> Dict[str, Any]:
         avg_norm = block["sum_norm"] / max(block["count"], 1)
         avg_sparsity = block["sum_sparsity"] / max(block["count"], 1)
         avg_rms = block["sum_rms"] / max(block["count"], 1)
+        info_ratio = (block["sum_eff"] / block["eff_count"] * 100.0) if block["eff_count"] > 0 else None
         status = "good"
         if block["dead_count"] > block["count"] * 0.5 or avg_rms > 0.2:
             status = "critical"
@@ -207,6 +243,7 @@ def analyze_lora(file_path: str, *, max_samples: int = 1000) -> Dict[str, Any]:
             "avg_norm": _safe_round(avg_norm, 4),
             "avg_sparsity": _safe_round(avg_sparsity * 100.0, 2),
             "avg_rms": _safe_round(avg_rms, 6),
+            "info_ratio": _safe_round(info_ratio, 2) if info_ratio is not None else None,
             "overfit_count": block["overfit_count"],
             "underfit_count": block["underfit_count"],
             "dead_count": block["dead_count"],
@@ -229,6 +266,7 @@ def analyze_lora(file_path: str, *, max_samples: int = 1000) -> Dict[str, Any]:
         "layers": layers,
         "position_analysis": position_analysis,
         "recommendations": recommendations,
+        "unsupported_dtypes": unsupported_dtypes,
     }
 
 
@@ -242,6 +280,7 @@ def block_analyze(file_path: str) -> Dict[str, Any]:
             "id": item["key"],
             "magnitude": avg_rms,
             "normalized_magnitude": (avg_rms / max_rms * 100.0) if max_rms > 0 else 0.0,
+            "info_ratio": item.get("info_ratio"),
             "layer_count": item["layer_count"],
             "status": item["status"],
         })

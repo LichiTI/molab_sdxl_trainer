@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -25,10 +26,68 @@ def _path_exists(value: Any) -> bool:
     return bool(text) and Path(text).exists()
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+
+
+def _ab_evidence_summary(path: Path) -> dict[str, Any]:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "path": str(path),
+            "load_error": type(exc).__name__,
+            "status": "unreadable_ab_evidence",
+            "release_claim_eligible": False,
+        }
+    comparison = _mapping(report.get("comparison"))
+    decision = _mapping(report.get("decision"))
+    release_claim = _mapping(report.get("release_claim"))
+    loss_stability = _mapping(report.get("loss_stability"))
+    before = _mapping(report.get("before"))
+    after = _mapping(report.get("after"))
+    before_metrics = _mapping(before.get("metrics"))
+    after_metrics = _mapping(after.get("metrics"))
+    data_wait_before = comparison.get("data_wait_share_before", before_metrics.get("data_wait_share"))
+    data_wait_after = comparison.get("data_wait_share_after", after_metrics.get("data_wait_share"))
+    return {
+        "path": str(path),
+        "case_id": str(report.get("case_id") or ""),
+        "family": str(report.get("family") or ""),
+        "status": str(report.get("status") or ""),
+        "decision_status": str(decision.get("status") or ""),
+        "decision_reasons": _string_list(decision.get("reasons")),
+        "release_claim_eligible": bool(release_claim.get("eligible")),
+        "release_claim_scope": str(release_claim.get("scope") or ""),
+        "data_wait_share_before": _safe_float(data_wait_before),
+        "data_wait_share_after": _safe_float(data_wait_after),
+        "data_wait_share_delta": _safe_float(comparison.get("data_wait_share_delta")),
+        "steady_samples_per_second_gain_pct": _safe_float(
+            comparison.get("steady_samples_per_second_gain_pct")
+        ),
+        "steady_samples_per_second_gain_ratio": _safe_float(
+            comparison.get("steady_samples_per_second_gain_ratio")
+        ),
+        "loss_regression_ratio": _safe_float(comparison.get("loss_regression_ratio")),
+        "max_loss_regression_ratio": _safe_float(
+            loss_stability.get("max_loss_regression_ratio"), 0.05
+        ),
+        "loss_stability_status": str(loss_stability.get("status") or ""),
+    }
+
+
 def _existing_completion(out_dir: Any) -> dict[str, Any]:
     text = str(out_dir or "").strip()
     if not text:
-        return {"completed": False, "evidence_paths": [], "missing_paths": ["out_dir_missing"]}
+        return {
+            "completed": False,
+            "evidence_paths": [],
+            "missing_paths": ["out_dir_missing"],
+            "ab_evidence_summaries": [],
+        }
     base = Path(text)
     required = [
         base / "real_material_canary_results.json",
@@ -46,6 +105,7 @@ def _existing_completion(out_dir: Any) -> dict[str, Any]:
         "completed": not missing,
         "evidence_paths": evidence_paths,
         "missing_paths": missing,
+        "ab_evidence_summaries": [_ab_evidence_summary(path) for path in ab_files],
     }
 
 

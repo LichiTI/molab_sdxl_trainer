@@ -640,8 +640,13 @@ class CaptionDataset(Dataset):
                 except (ValueError, IndexError):
                     pass
 
-        # Token Warmup: 根据当前 step 截断 tag 数量
-        if self.token_warmup_max > 0 and self._global_step > 0:
+        # Token Warmup: 在 token_warmup_steps 步内，把保留的 tag 数从 token_warmup_min
+        # 线性升到 token_warmup_max。只有真正配置了 warmup *日程*（steps > 0）才启用：
+        # steps==0 时没有任何渐变意义，且 max 在 trainer 侧被接到 keep_tokens，一旦误触发
+        # 就会把 caption 截断到 keep_tokens、静默丢弃 keep_tokens 之后的所有 tag，破坏下方
+        # "保留前 N 个再 shuffle" 的策略（该 bug 仅在真实训练 global_step>0 时显形，step=0
+        # 的 smoke 夹具照不出来）。
+        if self.token_warmup_max > 0 and self.token_warmup_steps > 0 and self._global_step > 0:
             ratio = min(self._global_step / max(self.token_warmup_steps, 1), 1.0)
             keep = int(self.token_warmup_min + (self.token_warmup_max - self.token_warmup_min) * ratio)
             if keep > 0:
@@ -864,8 +869,15 @@ class CaptionDataset(Dataset):
         image = image.crop((left, top, left + tw, top + th))
         loss_mask = self._load_loss_mask(sample.image_path, alpha_channel, (new_w, new_h), (left, top, left + tw, top + th))
 
-        if self.flip_augment and random.random() > 0.5:
+        # Decide the horizontal flip once so the target image, its loss mask and
+        # any external control image all flip together (an unflipped mask/control
+        # would mirror-misalign the supervision). do_flip stays False when
+        # flip_augment is off, keeping the non-augmented path byte-for-byte.
+        do_flip = self.flip_augment and random.random() > 0.5
+        if do_flip:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            if loss_mask is not None:
+                loss_mask = torch.flip(loss_mask, dims=[-1])
 
         if self._album_pipeline is not None:
             img_np = np.array(image)
@@ -975,6 +987,8 @@ class CaptionDataset(Dataset):
             # Resize/Crop the same way
             c_img = c_img.resize((new_w, new_h), Image.LANCZOS)
             c_img = c_img.crop((left, top, left + tw, top + th))
+            if do_flip:
+                c_img = c_img.transpose(Image.FLIP_LEFT_RIGHT)
             control_image = c_img
         
         # Convert control image to tensor (usually normalized to [0, 1])

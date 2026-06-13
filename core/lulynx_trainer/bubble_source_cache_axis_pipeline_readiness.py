@@ -16,6 +16,7 @@ EXPECTED_REPORTS = {
     "source_axis_requirement": "bubble_p60_source_axis_requirement_v0",
     "external_input_admission": "bubble_gpu_bubble_external_input_admission_v0",
     "source_cache_axis_admission_preflight": "bubble_source_cache_axis_admission_preflight_v0",
+    "source_cache_axis_repair_plan": "bubble_source_cache_axis_repair_plan_v0",
     "source_cache_axis_manual_canary_plan": "bubble_source_cache_axis_manual_canary_plan_v0",
     "source_cache_axis_identity_registry": "bubble_source_cache_axis_identity_registry_v0",
     "readiness_next_actions": "gpu_bubble_experiment_readiness_next_actions_v0",
@@ -55,6 +56,16 @@ def _artifact_path(artifact_paths: Mapping[str, Any], key: str) -> str:
     return str(value)
 
 
+def _artifact_modified_ns(artifact_paths: Mapping[str, Any], key: str) -> int:
+    path = _artifact_path(artifact_paths, key)
+    if not path:
+        return 0
+    try:
+        return Path(path).stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
 def _stage(
     key: str,
     payload: Mapping[str, Any],
@@ -87,6 +98,7 @@ def _stage(
         "exists": exists,
         "report_ok": report_ok,
         "roadmap_ok": roadmap_ok,
+        "modified_ns": _artifact_modified_ns(artifact_paths, key),
         "summary": dict(summary or {}),
     }
 
@@ -168,6 +180,18 @@ def _manual_plan_summary(manual_plan: Mapping[str, Any]) -> dict[str, Any]:
         "blocked_command_count": _safe_int(manual_plan.get("blocked_command_count")),
         "requires_gpu_if_executed": bool(manual_plan.get("requires_gpu_if_executed")),
         "blocker_count": len(_strings(manual_plan.get("blockers"))),
+    }
+
+
+def _repair_plan_summary(repair_plan: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "status": str(repair_plan.get("status") or ""),
+        "command_count": _safe_int(repair_plan.get("command_count")),
+        "blocked_command_count": _safe_int(repair_plan.get("blocked_command_count")),
+        "repair_axis_count": _safe_int(repair_plan.get("repair_axis_count")),
+        "requires_gpu_if_executed": bool(repair_plan.get("requires_gpu_if_executed")),
+        "family_runner_missing": _strings(repair_plan.get("family_runner_missing")),
+        "blocker_count": len(_strings(repair_plan.get("blockers"))),
     }
 
 
@@ -273,6 +297,63 @@ def _pipeline_status(
     return "manual_review_required"
 
 
+def _stage_freshness_summary(
+    stages: Sequence[Mapping[str, Any]],
+    *,
+    preflight_admitted: bool,
+    manual_plan_ready: bool,
+) -> dict[str, Any]:
+    stage_by_id = {str(stage.get("id") or ""): stage for stage in stages}
+    anchor_ids = [
+        "source_axis_requirement",
+        "external_input_admission",
+    ]
+    dependent_ids = [
+        "source_cache_axis_admission_preflight",
+        "source_cache_axis_manual_canary_plan",
+    ]
+    anchor_rows = [
+        stage_by_id[stage_id]
+        for stage_id in anchor_ids
+        if _safe_int(stage_by_id.get(stage_id, {}).get("modified_ns")) > 0
+    ]
+    anchor_ns = max((_safe_int(stage.get("modified_ns")) for stage in anchor_rows), default=0)
+    stale_stage_ids = [
+        stage_id
+        for stage_id in dependent_ids
+        if 0 < _safe_int(stage_by_id.get(stage_id, {}).get("modified_ns")) < anchor_ns
+    ]
+    stale_ready_stage_ids: list[str] = []
+    if preflight_admitted and "source_cache_axis_admission_preflight" in stale_stage_ids:
+        stale_ready_stage_ids.append("source_cache_axis_admission_preflight")
+    if manual_plan_ready and "source_cache_axis_manual_canary_plan" in stale_stage_ids:
+        stale_ready_stage_ids.append("source_cache_axis_manual_canary_plan")
+    unknown_stage_ids = [
+        stage_id
+        for stage_id in [*anchor_ids, *dependent_ids]
+        if stage_by_id.get(stage_id, {}).get("exists")
+        and _safe_int(stage_by_id.get(stage_id, {}).get("modified_ns")) <= 0
+    ]
+    return {
+        "artifact_role": "gpu_bubble_source_cache_axis_pipeline_stage_freshness_summary",
+        "freshness_checked": bool(anchor_ns),
+        "anchor_stage_ids": anchor_ids,
+        "dependent_stage_ids": dependent_ids,
+        "stale_stage_count": len(stale_stage_ids),
+        "stale_stage_ids": stale_stage_ids,
+        "stale_ready_stage_count": len(stale_ready_stage_ids),
+        "stale_ready_stage_ids": stale_ready_stage_ids,
+        "unknown_freshness_stage_count": len(unknown_stage_ids),
+        "unknown_freshness_stage_ids": unknown_stage_ids,
+        "ready_stage_freshness_ok": not stale_ready_stage_ids,
+        "freshness_ok": bool(anchor_ns) and not stale_stage_ids,
+        "fail_closed": not stale_ready_stage_ids,
+        "not_release_evidence": True,
+        "safe_to_auto_start": False,
+        "release_claim_allowed": False,
+    }
+
+
 def build_source_cache_axis_pipeline_readiness(
     *,
     source_scan: Mapping[str, Any],
@@ -281,6 +362,7 @@ def build_source_cache_axis_pipeline_readiness(
     external_input_admission: Mapping[str, Any],
     source_cache_axis_admission_preflight: Mapping[str, Any],
     source_cache_axis_manual_canary_plan: Mapping[str, Any],
+    source_cache_axis_repair_plan: Mapping[str, Any] | None = None,
     source_cache_axis_identity_registry: Mapping[str, Any] | None = None,
     readiness_next_actions: Mapping[str, Any] | None = None,
     artifact_paths: Mapping[str, Any] | None = None,
@@ -327,6 +409,16 @@ def build_source_cache_axis_pipeline_readiness(
             summary=_identity_registry_summary(_mapping(source_cache_axis_identity_registry)),
         ),
     ]
+    if source_cache_axis_repair_plan is not None:
+        stages.insert(
+            5,
+            _stage(
+                "source_cache_axis_repair_plan",
+                _mapping(source_cache_axis_repair_plan),
+                paths,
+                summary=_repair_plan_summary(_mapping(source_cache_axis_repair_plan)),
+            ),
+        )
     readiness = _mapping(readiness_next_actions)
     if readiness:
         stages.append(
@@ -349,6 +441,14 @@ def build_source_cache_axis_pipeline_readiness(
     )
     preflight_admitted = bool(preflight_summary["admitted"])
     manual_plan_ready = manual_summary["status"] == "protected_manual_canary_plan_ready"
+    stage_freshness = _stage_freshness_summary(
+        stages,
+        preflight_admitted=preflight_admitted,
+        manual_plan_ready=manual_plan_ready,
+    )
+    stale_ready_stage_ids = _strings(stage_freshness.get("stale_ready_stage_ids"))
+    freshness_blocks_ready = bool(stale_ready_stage_ids)
+    missing_or_mismatch = missing_or_mismatch or freshness_blocks_ready
     status = _pipeline_status(
         missing_or_mismatch=missing_or_mismatch,
         external_input_required=external_required,
@@ -362,7 +462,9 @@ def build_source_cache_axis_pipeline_readiness(
         blockers.append("external_source_or_cache_axis_required")
     if ext_summary["sd15_status"] == "checkpoint_required":
         blockers.append("sd15_checkpoint_required")
+    blockers.extend(f"{stage_id}_stale_ready_artifact" for stage_id in stale_ready_stage_ids)
     blockers.extend(_strings(source_cache_axis_admission_preflight.get("blockers")))
+    blockers.extend(_strings(_mapping(source_cache_axis_repair_plan).get("blockers")))
     blockers.extend(_strings(source_cache_axis_manual_canary_plan.get("blockers")))
     sorted_blockers = sorted(set(blockers))
     axis_readiness = _axis_readiness_summary(
@@ -387,11 +489,12 @@ def build_source_cache_axis_pipeline_readiness(
             }
         )
     if external_required:
+        repair_command_count = _safe_int(_mapping(source_cache_axis_repair_plan).get("command_count"))
         next_actions.append(
             {
-                "id": "provide_new_source_or_cache_axis",
+                "id": "review_source_cache_axis_repair_plan" if repair_command_count else "provide_new_source_or_cache_axis",
                 "status": "external_input_required",
-                "requires_gpu_if_executed": False,
+                "requires_gpu_if_executed": bool(repair_command_count),
                 "safe_to_auto_start": False,
             }
         )
@@ -430,6 +533,7 @@ def build_source_cache_axis_pipeline_readiness(
         "manual_canary_plan_ready": manual_plan_ready,
         "stage_count": len(stages),
         "stage_ok_count": sum(1 for item in stages if item["status"] == "ok"),
+        "stage_freshness": stage_freshness,
         "stage_roadmap_lineage": {
             "expected_roadmap": ROADMAP,
             "stage_count": len(stages),

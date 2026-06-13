@@ -182,3 +182,19 @@ def _normalize_qwen_image_latents(vae: Any, latents: torch.Tensor) -> torch.Tens
     mean = mean.view(view_shape)
     inv_std = (1.0 / std).view(view_shape)
     return (latents - mean) * inv_std
+
+
+def _denormalize_qwen_image_latents(vae: Any, latents: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`_normalize_qwen_image_latents` (``latents*std+mean``).
+
+    Used at decode time: the DiT operates in the normalised latent space, so a
+    sampled latent must be de-normalised before the qwen-image VAE decoder.
+    """
+    config = getattr(vae, "config", None)
+    z_dim = int(getattr(config, "z_dim", latents.shape[1]) or latents.shape[1])
+    mean = torch.tensor(getattr(config, "latents_mean"), device=latents.device, dtype=latents.dtype)
+    std = torch.tensor(getattr(config, "latents_std"), device=latents.device, dtype=latents.dtype)
+    view_shape = (1, z_dim) + (1,) * (latents.dim() - 2)
+    mean = mean.view(view_shape)
+    std = std.view(view_shape)
+    return latents * std + mean

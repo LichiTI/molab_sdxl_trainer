@@ -73,14 +73,19 @@ def main() -> int:
     checks.append(("parity_spectrum_no_context", torch.equal(baseline, out_spec), f"max={float((baseline-out_spec).abs().max()):.2e}"))
 
     # 3. dispatch routing --------------------------------------------------
+    from core.lulynx_trainer.deepcache import DeepCacheStore  # noqa: E402
+    from core.lulynx_trainer.teacache import TeaCacheStore  # noqa: E402
+
     routes_ok = (
         isinstance(build_cache_seam(enabled=True, backend="spectrum")._cache, SpectrumCache)
         and isinstance(build_cache_seam(enabled=True, backend="smoothcache")._cache, SmoothCacheStore)
+        and isinstance(build_cache_seam(enabled=True, backend="deepcache")._cache, DeepCacheStore)
+        and isinstance(build_cache_seam(enabled=True, backend="teacache")._cache, TeaCacheStore)
         and build_cache_seam(enabled=True, backend="tgate").enabled is False
         and build_cache_seam(enabled=True, backend="none").enabled is False
         and UnifiedCacheSeamPolicy(enabled=True, backend="spectrum").normalized().enabled is True
     )
-    checks.append(("dispatch_routes", routes_ok, "spectrum/smoothcache/tgate/none"))
+    checks.append(("dispatch_routes", routes_ok, "spectrum/smoothcache/deepcache/teacache/tgate/none"))
 
     # 4. reuse on a cacheable SmoothCache step ----------------------------
     seam = UnifiedCacheSeam(UnifiedCacheSeamPolicy(enabled=True, backend="smoothcache"))
@@ -102,7 +107,7 @@ def main() -> int:
         parity_no_context=checks[1][1] and checks[2][1],
         dispatch_routes_correct=checks[3][1],
         reuse_on_cacheable_step=checks[4][1],
-        backends_supported=["spectrum", "smoothcache"],
+        backends_supported=["spectrum", "smoothcache", "deepcache", "teacache"],
     )
     checks.append(("scorecard_ok", card["ok"], f"default_changed={card['default_behavior_changed']}"))
 

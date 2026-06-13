@@ -17,6 +17,17 @@ from enum import Enum
 from core.safe_pickle import safe_torch_load
 from .anima_train_norm_compat import resolve_anima_train_norm_state_for_layer
 from .lokr_load_resolver import resolve_lokr_state_for_layer
+from .generalized_adapters import (
+    GLoRALinearLayer,
+    GLoRAConv2dLayer,
+    collect_glora_layer_state,
+    load_glora_layer_state,
+)
+from .glokr_layer import (
+    GLoKrLinearLayer,
+    collect_glokr_layer_state,
+    load_glokr_layer_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +40,8 @@ class LyCORISType(Enum):
     IA3 = "ia3"
     FULL = "full"
     DIAG_OFT = "diag-oft"
+    GLORA = "glora"
+    GLOKR = "glokr"
 
 
 @dataclass
@@ -58,6 +71,20 @@ class LyCORISConfig:
     # Conv2d dimensions
     conv_dim: int = 0  # 0 = same as rank
     conv_alpha: float = 0.0  # 0 = same as alpha
+
+    # GLoRA-specific (Phase 1 standard + Phase 2 extras, all defaults off)
+    glora_rank_dropout: float = 0.0
+    glora_module_dropout: float = 0.0
+    glora_no_materialize_forward: bool = False  # ΔW=W·A+B fast path without materializing A,B
+    glora_use_tucker: bool = False              # tucker B path for Conv2d kernels >1
+    glora_train_bias: bool = True               # adapt bias when base module has bias
+
+    # GLoKr (Kronecker-parameterized Generalized adapter, research-grade)
+    glokr_factor: int = -1                  # -1 = auto-pick balanced factor
+    glokr_rank_dropout: float = 0.0
+    glokr_module_dropout: float = 0.0
+    glokr_no_materialize_forward: bool = False
+    glokr_train_bias: bool = True
 
     # Preset target modules
     presets: str = ""  # "full", "attn-only", "attn-mlp", or custom comma-separated module list
@@ -827,6 +854,66 @@ class LyCORISInjector:
                 dropout=self.config.dropout,
             ).to(module.weight.device, dtype=module.weight.dtype)
         
+        elif self.config.lycoris_type == LyCORISType.GLORA:
+            train_bias = bool(getattr(self.config, "glora_train_bias", True))
+            if isinstance(module, nn.Conv2d):
+                rank = int(self.config.conv_dim or self.config.rank)
+                alpha = float(self.config.conv_alpha or self.config.alpha)
+                org_bias = module.bias if (train_bias and module.bias is not None) else None
+                return GLoRAConv2dLayer(
+                    in_channels=module.in_channels,
+                    out_channels=module.out_channels,
+                    kernel_size=module.kernel_size,
+                    stride=module.stride,
+                    padding=module.padding,
+                    dilation=module.dilation,
+                    groups=module.groups,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=self.config.dropout,
+                    org_weight=module.weight,
+                    org_bias=org_bias,
+                    rank_dropout=float(getattr(self.config, "glora_rank_dropout", 0.0)),
+                    module_dropout=float(getattr(self.config, "glora_module_dropout", 0.0)),
+                    use_tucker=bool(getattr(self.config, "glora_use_tucker", False)),
+                ).to(module.weight.device, dtype=module.weight.dtype)
+            if not isinstance(module, nn.Linear):
+                return None
+            org_bias = module.bias if (train_bias and module.bias is not None) else None
+            return GLoRALinearLayer(
+                in_features=module.in_features,
+                out_features=module.out_features,
+                rank=self.config.rank,
+                alpha=self.config.alpha,
+                dropout=self.config.dropout,
+                org_weight=module.weight,
+                org_bias=org_bias,
+                rank_dropout=float(getattr(self.config, "glora_rank_dropout", 0.0)),
+                module_dropout=float(getattr(self.config, "glora_module_dropout", 0.0)),
+                no_materialize_forward=bool(getattr(self.config, "glora_no_materialize_forward", False)),
+            ).to(module.weight.device, dtype=module.weight.dtype)
+
+        elif self.config.lycoris_type == LyCORISType.GLOKR:
+            # GLoKr is a project-original research adapter; Linear only in the
+            # first cut so we don't ship un-validated Conv2d Kronecker code.
+            if not isinstance(module, nn.Linear):
+                return None
+            train_bias = bool(getattr(self.config, "glokr_train_bias", True))
+            org_bias = module.bias if (train_bias and module.bias is not None) else None
+            return GLoKrLinearLayer(
+                in_features=module.in_features,
+                out_features=module.out_features,
+                rank=self.config.rank,
+                alpha=self.config.alpha,
+                dropout=self.config.dropout,
+                org_weight=module.weight,
+                org_bias=org_bias,
+                factor=int(getattr(self.config, "glokr_factor", -1)),
+                rank_dropout=float(getattr(self.config, "glokr_rank_dropout", 0.0)),
+                module_dropout=float(getattr(self.config, "glokr_module_dropout", 0.0)),
+                no_materialize_forward=bool(getattr(self.config, "glokr_no_materialize_forward", False)),
+            ).to(module.weight.device, dtype=module.weight.dtype)
+
         elif self.config.lycoris_type == LyCORISType.LOKR:
             if isinstance(module, nn.Conv2d):
                 rank = int(self.config.conv_dim or self.config.rank)
@@ -1010,6 +1097,12 @@ class LyCORISInjector:
                 for attr in ("lokr_w1", "lokr_w1_a", "lokr_w1_b", "lokr_w2", "lokr_w2_a", "lokr_w2_b"):
                     if hasattr(layer, attr):
                         state_dict[f"{base_name}.{attr}"] = getattr(layer, attr).data
+            elif isinstance(layer, (GLoRALinearLayer, GLoRAConv2dLayer)):
+                state_dict.update(collect_glora_layer_state(layer, base_name))
+                continue  # alpha already included
+            elif isinstance(layer, GLoKrLinearLayer):
+                state_dict.update(collect_glokr_layer_state(layer, base_name))
+                continue
             elif isinstance(layer, LoConLayer):
                 state_dict[f"{base_name}.lora_down.weight"] = layer.lora_down.weight.data
                 state_dict[f"{base_name}.lora_up.weight"] = layer.lora_up.weight.data
@@ -1096,6 +1189,16 @@ class LyCORISInjector:
                     for attr in ("lokr_w1", "lokr_w1_a", "lokr_w1_b", "lokr_w2", "lokr_w2_a", "lokr_w2_b")
                     if hasattr(layer, attr)
                 }
+            elif isinstance(layer, (GLoRALinearLayer, GLoRAConv2dLayer)):
+                glora_loaded, glora_total = load_glora_layer_state(layer, state_dict, base_name)
+                loaded_keys += glora_loaded
+                total_expected += glora_total
+                continue
+            elif isinstance(layer, GLoKrLinearLayer):
+                glokr_loaded, glokr_total = load_glokr_layer_state(layer, state_dict, base_name)
+                loaded_keys += glokr_loaded
+                total_expected += glokr_total
+                continue
             elif isinstance(layer, _NormAdapter):
                 key_map = {
                     f"{base_name}.norm_scale": layer.scale,

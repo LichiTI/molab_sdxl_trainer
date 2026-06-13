@@ -20,6 +20,10 @@ REPORT = "bubble_external_input_handoff_packet_v0"
 ROADMAP = "gpu_bubble_elimination_roadmap.md"
 INTAKE_REPORT = "bubble_external_input_intake_registry_v0"
 REPLAY_REPORT = "bubble_external_input_replay_plan_v0"
+WARM_CACHE_DETECTED_STATUSES = {
+    "warm_cache_axis_ready",
+    "warm_cache_axis_completed_but_not_release_ready",
+}
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -50,13 +54,41 @@ def _repo_path(repo_root: Path, value: str) -> str:
     return str(repo_root / path)
 
 
-def _input_items(intake: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _warm_cache_axis_detected(inventory: Mapping[str, Any]) -> bool:
+    status = str(inventory.get("status") or "")
+    return (
+        bool(inventory.get("selected_axis_cache_ready"))
+        or _safe_int(inventory.get("ready_axis_count")) > 0
+        or _safe_int(inventory.get("completed_canary_axis_count")) > 0
+        or status in WARM_CACHE_DETECTED_STATUSES
+    )
+
+
+def _input_items(
+    intake: Mapping[str, Any],
+    pipeline: Mapping[str, Any],
+    newbie_warm_cache_inventory: Mapping[str, Any],
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     missing_ids = set(_strings(intake.get("missing_external_inputs")))
+    source_cache_ready = bool(pipeline.get("preflight_admitted")) and bool(
+        pipeline.get("manual_canary_plan_ready")
+    )
+    warm_cache_detected = _warm_cache_axis_detected(newbie_warm_cache_inventory)
     for raw in _list(intake.get("intake_items")):
         item = _mapping(raw)
         item_id = str(item.get("id") or "")
         status = str(item.get("status") or "")
+        detected = status == "available" or (item_id == "warm_cache_axis" and warm_cache_detected)
+        if item_id == "new_source_root" and _safe_int(intake.get("new_source_root_count")) > 0:
+            detected = True
+        if item_id in {"new_source_root", "warm_cache_axis"} and detected and status != "available":
+            status = "detected_refresh_required"
+        if item_id == "new_source_root" and detected:
+            status = "detected_refresh_required"
+        required = item_id in missing_ids or status in {"missing", "pending_external_input"}
+        if item_id == "new_source_root":
+            required = False if detected else item_id in missing_ids
         rows.append(
             {
                 "id": item_id,
@@ -65,7 +97,8 @@ def _input_items(intake: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "path": str(item.get("path") or ""),
                 "next_action": str(item.get("next_action") or ""),
                 "provided": status == "available",
-                "required": item_id in missing_ids or status in {"missing", "pending_external_input"},
+                "detected": detected,
+                "required": required,
             }
         )
     return rows
@@ -125,6 +158,65 @@ def _refresh_commands(repo_root: Path, python_exe: str) -> list[dict[str, Any]]:
             "requires_gpu_if_executed": False,
         },
         {
+            "id": "refresh_sd15_lora512_release_gap_readiness",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_sd15_lora512_release_gap_readiness.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/sd15_lora512_release_gap_readiness.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_source_axis_scout",
+            "command": [
+                py,
+                _repo_path(repo_root, "devtools/build_bubble_p60_source_axis_scout_from_intake.py"),
+            ],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/p60_source_axis_scout.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_source_axis_requirement",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_p60_source_axis_requirement.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/p60_source_axis_requirement.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_warm_cache_inventory",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_warm_cache_inventory.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_warm_cache_inventory.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_external_input_admission",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_external_input_admission.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/external_input_admission.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_source_cache_axis_admission_preflight",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_source_cache_axis_admission_preflight.py")],
+            "expected_outputs": [
+                _repo_path(repo_root, f"{runtime}/source_cache_axis_admission_preflight.json")
+            ],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_source_cache_axis_repair_plan",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_source_cache_axis_repair_plan.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/source_cache_axis_repair_plan.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_source_cache_axis_manual_canary_plan",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_source_cache_axis_manual_canary_plan.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/source_cache_axis_manual_canary_plan.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_post_manual_evidence_rebuild_plan",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_post_manual_evidence_rebuild_plan.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/post_manual_evidence_rebuild_plan.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
             "id": "refresh_source_axis_freshness_dedupe_audit",
             "command": [py, _repo_path(repo_root, "devtools/build_bubble_source_axis_freshness_dedupe_audit.py")],
             "expected_outputs": [_repo_path(repo_root, f"{runtime}/source_axis_freshness_dedupe_audit.json")],
@@ -146,6 +238,72 @@ def _refresh_commands(repo_root: Path, python_exe: str) -> list[dict[str, Any]]:
             "id": "refresh_external_input_handoff_packet",
             "command": [py, _repo_path(repo_root, "devtools/build_bubble_external_input_handoff_packet.py")],
             "expected_outputs": [_repo_path(repo_root, f"{runtime}/external_input_handoff_packet.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_blockskip_quality_followup_manifest",
+            "command": [py, _repo_path(repo_root, "devtools/run_bubble_newbie_blockskip_quality_followup.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_blockskip_quality_followup_manifest.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_blockskip_quality_stability_review",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_blockskip_quality_stability_review.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_blockskip_quality_stability_review.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_blockskip_loss_curve_ab_evidence",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_blockskip_loss_curve_ab_evidence.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_blockskip_loss_curve_ab_evidence.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_blockskip_quality_semantic_evidence",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_blockskip_quality_semantic_evidence.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_blockskip_quality_semantic_evidence.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_internal_phase_diagnosis",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_internal_phase_diagnosis.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_internal_phase_diagnosis.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_natural_load_gate_semantics_review",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_natural_load_gate_semantics_review.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_natural_load_gate_semantics_review.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_compute_bound_gate_exit_policy",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_compute_bound_gate_exit_policy.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_compute_bound_gate_exit_policy.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_blockskip_quality_drift_review",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_blockskip_quality_drift_review.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_blockskip_quality_drift_review.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_tail8_attention_compute_review",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_tail8_attention_compute_review.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_tail8_attention_compute_review.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_tail8_forward_anomaly_review",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_tail8_forward_anomaly_review.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_tail8_forward_anomaly_review.json")],
+            "requires_gpu_if_executed": False,
+        },
+        {
+            "id": "refresh_newbie_tail8_seed2027_rerun_preflight",
+            "command": [py, _repo_path(repo_root, "devtools/build_bubble_newbie_tail8_seed2027_rerun_preflight.py")],
+            "expected_outputs": [_repo_path(repo_root, f"{runtime}/newbie_tail8_seed2027_rerun_preflight.json")],
             "requires_gpu_if_executed": False,
         },
         {
@@ -264,6 +422,15 @@ def _handoff_steps(items: Sequence[Mapping[str, Any]], slots: Sequence[Mapping[s
                 "after_input": "rescan_and_preflight_before_manual_canary_plan",
             }
         )
+    if "anima_source_or_cache_axis" in missing_ids:
+        steps.append(
+            {
+                "id": "provide_anima_source_or_cache_axis",
+                "status": "external_input_required",
+                "target": "anima-specific source or cache axis for saturation boundary",
+                "after_input": "refresh_anima_saturation_boundary_and_release_gate_json",
+            }
+        )
     return steps
 
 
@@ -274,17 +441,21 @@ def _input_lifecycle_summary(items: Sequence[Mapping[str, Any]]) -> dict[str, An
         item_id = str(item.get("id") or "")
         if not item_id:
             continue
-        provided = bool(item.get("provided")) or str(item.get("status") or "") == "available"
+        detected = (
+            bool(item.get("detected"))
+            or bool(item.get("provided"))
+            or str(item.get("status") or "") == "available"
+        )
         required = bool(item.get("required"))
-        accepted = provided and not required
+        accepted = detected and not required and str(item.get("status") or "") == "available"
         rows.append(
             {
                 "input_id": item_id,
                 "status": str(item.get("status") or ""),
-                "detected": provided,
+                "detected": detected,
                 "accepted": accepted,
                 "pending": not accepted,
-                "requires_downstream_refresh": provided,
+                "requires_downstream_refresh": detected,
                 "release_claim_allowed_after_detection": False,
                 "safe_to_auto_start": False,
                 "not_release_evidence": True,
@@ -341,11 +512,19 @@ def _resolution_summary(
     replay: Mapping[str, Any],
     pipeline: Mapping[str, Any],
     sd15: Mapping[str, Any],
+    external_input_detected: bool,
 ) -> dict[str, Any]:
     missing = set(missing_ids)
     sd15_required = "sd15_checkpoint" in missing or "sd15_base_checkpoint_missing" in _strings(sd15.get("blockers"))
     source_axis_required = bool(
-        missing.intersection({"new_source_root", "warm_cache_axis", "caption_repair_axis"})
+        missing.intersection(
+            {
+                "new_source_root",
+                "warm_cache_axis",
+                "caption_repair_axis",
+                "anima_source_or_cache_axis",
+            }
+        )
     )
     replay_ready = _safe_int(replay.get("ready_command_count")) > 0
     preflight_admitted = bool(pipeline.get("preflight_admitted"))
@@ -364,6 +543,9 @@ def _resolution_summary(
             replay_resolution.get("new_source_root_count", replay.get("new_source_root_count")),
         )
     )
+    source_cache_ready = bool(pipeline.get("preflight_admitted")) and bool(
+        pipeline.get("manual_canary_plan_ready")
+    )
     return {
         "summary_version": 1,
         "roadmap": ROADMAP,
@@ -374,11 +556,12 @@ def _resolution_summary(
         "sd15_checkpoint_path": str(intake_resolution.get("sd15_checkpoint_path") or ""),
         "new_source_root_count": new_source_root_count,
         "new_source_root_required": "new_source_root" in missing,
-        "source_or_cache_axis_required": source_axis_required,
+        "source_or_cache_axis_required": source_axis_required or not source_cache_ready,
         "warm_cache_or_caption_repair_required": bool(
             missing.intersection({"warm_cache_axis", "caption_repair_axis"})
         ),
-        "external_input_detected": bool(replay.get("external_input_detected")),
+        "anima_source_or_cache_axis_required": "anima_source_or_cache_axis" in missing,
+        "external_input_detected": external_input_detected,
         "json_replay_ready": replay_ready,
         "preflight_admitted": preflight_admitted,
         "manual_canary_plan_ready": manual_plan_ready,
@@ -408,6 +591,7 @@ def build_external_input_handoff_packet(
     external_input_replay_plan: Mapping[str, Any] | None = None,
     source_cache_axis_pipeline_readiness: Mapping[str, Any] | None = None,
     sd15_readiness: Mapping[str, Any] | None = None,
+    newbie_warm_cache_inventory: Mapping[str, Any] | None = None,
     python_exe: str = "backend/env/python-flashattention/python.exe",
 ) -> dict[str, Any]:
     """Build a fail-closed external-input handoff packet."""
@@ -417,14 +601,19 @@ def build_external_input_handoff_packet(
     replay = _mapping(external_input_replay_plan)
     pipeline = _mapping(source_cache_axis_pipeline_readiness)
     sd15 = _mapping(sd15_readiness)
-    items = _input_items(intake)
+    warm_cache = _mapping(newbie_warm_cache_inventory)
+    items = _input_items(intake, pipeline, warm_cache)
     slots = _registration_slots(intake)
     missing = [item for item in items if bool(item.get("required"))]
     missing_ids = [str(item.get("id") or "") for item in missing if item.get("id")]
-    external_detected = bool(intake.get("external_input_detected")) or bool(replay.get("external_input_detected"))
-    status = "external_input_detected_review_required" if external_detected else "waiting_for_external_input"
     steps = _handoff_steps(items, slots)
     input_lifecycle = _input_lifecycle_summary(items)
+    external_detected = (
+        bool(intake.get("external_input_detected"))
+        or bool(replay.get("external_input_detected"))
+        or _safe_int(input_lifecycle.get("detected_input_count")) > 0
+    )
+    status = "external_input_detected_review_required" if external_detected else "waiting_for_external_input"
     refresh_commands = _refresh_commands(repo, python_exe)
     refresh_sequence_contract = _refresh_sequence_contract(refresh_commands)
     unsafe_command_count = sum(
@@ -477,6 +666,7 @@ def build_external_input_handoff_packet(
             replay=replay,
             pipeline=pipeline,
             sd15=sd15,
+            external_input_detected=external_detected,
         ),
         "replay_command_summary": _replay_command_summary(replay),
         "pipeline_summary": {

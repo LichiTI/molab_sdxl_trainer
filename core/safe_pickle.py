@@ -24,6 +24,7 @@ SAFE_MODULES: Dict[str, Set[str]] = {
     'torch.nn.parameter': {'Parameter'},
     'torch.nn.modules': {'Module'},
     'collections': {'OrderedDict', 'defaultdict'},
+    '_codecs': {'encode'},
     'numpy': {'ndarray', 'dtype', 'float32', 'float64', 'int64', 'int32'},
     'numpy.core.multiarray': {'scalar', '_reconstruct'},
     'builtins': _TRUSTED_BUILTINS,

@@ -199,6 +199,7 @@ def _toy_owner() -> SimpleNamespace:
         _loss_to_per_sample=lambda loss, _batch: loss.view(loss.shape[0], -1).mean(dim=1),
         _weighted_mean_loss=lambda loss, _batch: loss.mean(),
         _compute_repa_loss=lambda _batch, _prompt_embeds: None,
+        _compute_sra2_haste_loss=lambda _batch, _prompt_embeds: None,
     )
 
 

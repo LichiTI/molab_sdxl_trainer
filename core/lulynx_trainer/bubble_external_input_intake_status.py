@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .bubble_post_input_refresh_contract import POST_INPUT_REFRESH_SEQUENCE
-from .bubble_sd15_lora512_release_gap_readiness import SD15_CHECKPOINT_CANDIDATES
+from .bubble_sd15_lora512_release_gap_readiness import sd15_checkpoint_candidates
 
 
 EXTERNAL_INPUT_INTAKE_STATUS_REPORT = "bubble_external_input_intake_registry_v0"
@@ -60,6 +60,36 @@ def _source_current_roots(source_axis_requirement: Mapping[str, Any]) -> list[st
     return sorted(roots)
 
 
+def _known_identity_roots(source_cache_axis_identity_registry: Mapping[str, Any]) -> list[str]:
+    roots: set[str] = set()
+    for raw in _list(source_cache_axis_identity_registry.get("rows")):
+        item = _mapping(raw)
+        source_kinds = set(_strings(item.get("source_kinds")))
+        source_kind = str(item.get("source_kind") or "")
+        known_root = bool(
+            item.get("current_source_root")
+            or item.get("duplicate_or_stale_axis")
+            or item.get("attempted_or_completed")
+            or item.get("completed_existing_evidence")
+            or source_kind == "current_source_root"
+            or "current_source_root" in source_kinds
+            or "warm_cache_inventory_axis" in source_kinds
+        )
+        if bool(item.get("new_source_root")) and not known_root:
+            continue
+        if source_kind == "new_source_root" and not known_root:
+            continue
+        root = str(item.get("source_root") or item.get("normalized_source_root") or "").strip()
+        if root:
+            roots.add(root)
+            continue
+        identity_key = str(item.get("identity_key") or "")
+        parts = identity_key.split("|")
+        if len(parts) >= 3 and parts[0] in {"root", "axis"} and parts[2]:
+            roots.add(parts[2])
+    return sorted(roots)
+
+
 def _source_dirs(source_root: Path) -> list[Path]:
     if not source_root.is_dir():
         return []
@@ -70,16 +100,14 @@ def _source_dirs(source_root: Path) -> list[Path]:
 
 
 def _sd15_status(model_root: Path) -> dict[str, Any]:
-    sd15_dir = model_root / "sd15"
-    candidates = [sd15_dir / name for name in SD15_CHECKPOINT_CANDIDATES]
-    if sd15_dir.is_dir():
-        candidates.extend(path for path in sorted(sd15_dir.glob("*.safetensors")) if path not in candidates)
+    candidates = sd15_checkpoint_candidates(model_root)
     existing = [path for path in candidates if path.is_file()]
     checkpoint = existing[0] if existing else None
+    model_dir = checkpoint.parent if checkpoint else model_root / "sd15"
     return {
         "status": "checkpoint_available" if checkpoint else "checkpoint_missing",
-        "model_dir": str(sd15_dir),
-        "model_dir_exists": sd15_dir.is_dir(),
+        "model_dir": str(model_dir),
+        "model_dir_exists": model_dir.is_dir(),
         "checkpoint_exists": checkpoint is not None,
         "checkpoint_path": str(checkpoint) if checkpoint else "",
         "checkpoint_count": len(existing),
@@ -89,9 +117,14 @@ def _sd15_status(model_root: Path) -> dict[str, Any]:
     }
 
 
-def _source_status(source_root: Path, source_axis_requirement: Mapping[str, Any]) -> dict[str, Any]:
+def _source_status(
+    source_root: Path,
+    source_axis_requirement: Mapping[str, Any],
+    source_cache_axis_identity_registry: Mapping[str, Any],
+) -> dict[str, Any]:
     current_roots = _source_current_roots(source_axis_requirement)
-    current_keys = {_norm_path(root) for root in current_roots}
+    known_roots = sorted({*current_roots, *_known_identity_roots(source_cache_axis_identity_registry)})
+    current_keys = {_norm_path(root) for root in known_roots}
     dirs = _source_dirs(source_root)
     rows: list[dict[str, Any]] = []
     for item in dirs:
@@ -108,16 +141,36 @@ def _source_status(source_root: Path, source_axis_requirement: Mapping[str, Any]
             }
         )
     new_roots = [item for item in rows if not bool(item["matches_current_source_axis"])]
+    explicit_new_root_required = any(
+        str(_mapping(item).get("requirement") or "") == "new_source_axis_required"
+        or str(_mapping(item).get("source_axis_state") or "") == "exhausted_current_source_axis"
+        for item in _list(source_axis_requirement.get("families"))
+    )
+    new_source_root_required = not bool(new_roots) and bool(explicit_new_root_required)
     return {
-        "status": "new_source_root_available" if new_roots else "new_source_root_missing",
+        "status": (
+            "new_source_root_available"
+            if new_roots
+            else "new_source_root_missing"
+            if new_source_root_required
+            else "source_or_cache_axis_review_required"
+        ),
         "source_root": str(source_root),
         "source_root_exists": source_root.is_dir(),
         "current_source_roots": current_roots,
+        "known_source_roots": known_roots,
         "source_root_count": len(rows),
         "new_source_root_count": len(new_roots),
+        "new_source_root_required": new_source_root_required,
         "roots": rows,
-        "requires_external_input": not bool(new_roots),
-        "next_action": "scan_new_source_root" if new_roots else "provide_new_source_or_cache_axis",
+        "requires_external_input": new_source_root_required,
+        "next_action": (
+            "scan_new_source_root"
+            if new_roots
+            else "provide_new_source_or_cache_axis"
+            if new_source_root_required
+            else "prepare_warm_cache_or_caption_repair_axis"
+        ),
     }
 
 
@@ -150,7 +203,13 @@ def _intake_items(sd15: Mapping[str, Any], source_axis: Mapping[str, Any]) -> li
         },
         {
             "id": "new_source_root",
-            "status": "available" if _safe_int(source_axis.get("new_source_root_count")) else "missing",
+            "status": (
+                "available"
+                if _safe_int(source_axis.get("new_source_root_count"))
+                else "missing"
+                if bool(source_axis.get("new_source_root_required"))
+                else "not_required_current_or_cache_axis_review"
+            ),
             "required_for": "natural_load_canary_source_axis",
             "path": "",
             "next_action": str(source_axis.get("next_action") or ""),
@@ -168,6 +227,13 @@ def _intake_items(sd15: Mapping[str, Any], source_axis: Mapping[str, Any]) -> li
             "required_for": "caption_sample_coverage_gate",
             "path": "",
             "next_action": "repair_or_register_high_caption_coverage_axis",
+        },
+        {
+            "id": "anima_source_or_cache_axis",
+            "status": "pending_external_input",
+            "required_for": "anima_saturation_boundary",
+            "path": "",
+            "next_action": "provide_anima_source_or_cache_axis",
         },
     ]
 
@@ -195,10 +261,11 @@ def _input_resolution_summary(
         "sd15_checkpoint_path": str(sd15.get("checkpoint_path") or ""),
         "sd15_checkpoint_required": not sd15_checkpoint_exists,
         "new_source_root_count": new_source_root_count,
-        "new_source_root_required": new_source_root_count <= 0,
+        "new_source_root_required": bool(source_axis.get("new_source_root_required")),
         "warm_cache_or_caption_repair_required": any(
             item in set(missing_inputs) for item in ("warm_cache_axis", "caption_repair_axis")
         ),
+        "anima_source_or_cache_axis_required": "anima_source_or_cache_axis" in set(missing_inputs),
         "next_json_refresh_sequence": list(POST_INPUT_REFRESH_SEQUENCE),
         "next_manual_gpu_gate": "sd15_manual_ab_after_checkpoint_review",
         "safe_to_auto_start": False,
@@ -285,6 +352,7 @@ def build_external_input_intake_status(
     repo_root: Path,
     source_axis_requirement: Mapping[str, Any] | None = None,
     pipeline_readiness: Mapping[str, Any] | None = None,
+    source_cache_axis_identity_registry: Mapping[str, Any] | None = None,
     model_root: Path | None = None,
     source_root: Path | None = None,
 ) -> dict[str, Any]:
@@ -295,8 +363,9 @@ def build_external_input_intake_status(
     sources = source_root or repo / "sucai"
     requirement = _mapping(source_axis_requirement)
     pipeline = _mapping(pipeline_readiness)
+    identity_registry = _mapping(source_cache_axis_identity_registry)
     sd15 = _sd15_status(models)
-    source_axis = _source_status(sources, requirement)
+    source_axis = _source_status(sources, requirement, identity_registry)
     registration_slots = _registration_slots(requirement)
     intake_items = _intake_items(sd15, source_axis)
     input_resolution_summary = _input_resolution_summary(
@@ -304,6 +373,7 @@ def build_external_input_intake_status(
         source_axis=source_axis,
         intake_items=intake_items,
     )
+    missing_external_inputs = list(input_resolution_summary["missing_external_inputs"])
     any_available = bool(sd15["checkpoint_exists"]) or bool(source_axis["new_source_root_count"])
     all_missing = bool(sd15["requires_external_input"]) and bool(source_axis["requires_external_input"])
     if any_available:
@@ -361,6 +431,18 @@ def build_external_input_intake_status(
                 "release_claim_allowed_after_success": False,
             }
         )
+    if "anima_source_or_cache_axis" in missing_external_inputs:
+        next_actions.append(
+            {
+                "id": "provide_anima_source_or_cache_axis",
+                "roadmap": ROADMAP,
+                "status": "external_input_required",
+                "requires_gpu_if_executed": False,
+                "not_release_evidence": True,
+                "safe_to_auto_start": False,
+                "release_claim_allowed_after_success": False,
+            }
+        )
     return {
         "schema_version": 1,
         "report": EXTERNAL_INPUT_INTAKE_STATUS_REPORT,
@@ -372,12 +454,13 @@ def build_external_input_intake_status(
         "does_not_run_cuda": True,
         "release_claim_allowed": False,
         "external_input_detected": any_available,
-        "external_input_required": all_missing,
+        "external_input_required": bool(missing_external_inputs),
         "sd15": sd15,
         "source_axis": source_axis,
         "pipeline_readiness": _pipeline_summary(pipeline),
         "intake_items": intake_items,
-        "missing_external_inputs": input_resolution_summary["missing_external_inputs"],
+        "missing_external_input_count": len(missing_external_inputs),
+        "missing_external_inputs": missing_external_inputs,
         "input_resolution_summary": input_resolution_summary,
         "candidate_registration_slots": registration_slots,
         "dedupe_baseline": _dedupe_baseline(requirement),

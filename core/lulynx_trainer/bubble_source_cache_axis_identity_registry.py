@@ -26,6 +26,7 @@ def build_source_cache_axis_identity_registry(
     source_cache_axis_admission_preflight: Mapping[str, Any] | None = None,
     source_cache_axis_manual_canary_plan: Mapping[str, Any] | None = None,
     external_input_replay_plan: Mapping[str, Any] | None = None,
+    newbie_warm_cache_inventory: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the standalone axis identity registry without scanning or GPU work."""
 
@@ -36,6 +37,7 @@ def build_source_cache_axis_identity_registry(
         source_cache_axis_admission_preflight=source_cache_axis_admission_preflight,
         source_cache_axis_manual_canary_plan=source_cache_axis_manual_canary_plan,
         external_input_replay_plan=external_input_replay_plan,
+        newbie_warm_cache_inventory=newbie_warm_cache_inventory,
     )
     registry = dict(_mapping(audit.get("source_cache_axis_identity_registry")))
     registry.update(

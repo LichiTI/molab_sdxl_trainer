@@ -149,6 +149,12 @@ def apply_low_vram_guardrails(
     sparse_allowed = bool(_get(config, "vram_smart_sensing_sparse_swap_enabled", True))
     delta_cache_allowed = bool(_get(config, "vram_smart_sensing_delta_cache_enabled", False))
     enhanced_protection_mode = bool(_get(config, "enhanced_protection_mode", False))
+    # fp8 base already halves the frozen DiT weight footprint; auto-offloading
+    # that *same* set of weights to CPU is redundant and actively harmful — the
+    # fp8 master stays on CPU while LoRALinear._base_forward reads it, so each
+    # step materialises a bf16 GPU copy that cancels the saving (and was the
+    # crash root before the device-safe fallback). Prefer resident + checkpoint.
+    fp8_base_on = bool(_get(config, "fp8_base", False)) or bool(_get(config, "fp8_base_compute", False))
 
     raw_residency = str(_get(config, residency_key, current_mode) or current_mode).strip().lower().replace("-", "_")
     residency_autotunable = raw_residency in _AUTO_RESIDENCY_VALUES
@@ -162,6 +168,19 @@ def apply_low_vram_guardrails(
                     "reason": "streaming_guard_disabled",
                     "requested": recommendation,
                 }
+            )
+        elif recommendation in {"streaming_offload", "block_cpu_pinned"} and fp8_base_on:
+            result["skipped"].append(
+                {
+                    "key": residency_key,
+                    "reason": "fp8_base_resident_preferred",
+                    "requested": recommendation,
+                }
+            )
+            result["notes"].append(
+                "fp8_base is enabled: frozen DiT weights are already compressed, so the "
+                "auto CPU-offload residency switch is suppressed (it would duplicate/conflict "
+                "with fp8). Activation checkpointing still applies; set residency explicitly to override."
             )
         elif residency_autotunable:
             setattr(config, residency_key, recommendation)

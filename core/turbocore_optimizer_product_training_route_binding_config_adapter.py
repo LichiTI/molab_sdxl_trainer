@@ -46,6 +46,7 @@ def build_optimizer_product_training_route_binding_config_adapter(
         write_artifact=True,
     )
     signature_fields = set(inspect.signature(TrainingLoop.__init__).parameters)
+    preflight_summary = _as_dict(preflight.get("summary"))
     candidate = _as_dict(preflight.get("post_approval_training_route_binding_candidate"))
     switches = _as_dict(candidate.get("existing_training_loop_switches"))
     patch_ready = bool(
@@ -77,6 +78,12 @@ def build_optimizer_product_training_route_binding_config_adapter(
             "training_loop_constructor_mode_field_present_count": 1
             if ROUTE_BINDING_MODE_FIELD in signature_fields
             else 0,
+            "owner_release_direction_recorded_count": int(
+                preflight_summary.get("owner_release_direction_recorded_count", 0) or 0
+            ),
+            "owner_release_direction_approval_recorded_count": int(
+                preflight_summary.get("owner_release_direction_approval_recorded_count", 0) or 0
+            ),
             "product_training_route_binding_config_patch_ready_count": 1 if patch_ready else 0,
             "training_loop_kwargs_patch_field_count": len(patch),
             "request_fields_emitted_count": 0,

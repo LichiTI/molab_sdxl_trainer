@@ -67,7 +67,7 @@ class AdafactorTrainingExecutor:
             for param in group["params"]:
                 if id(param) not in self._param_ids or param.grad is None:
                     continue
-                cases.append(self._step_param(native, param, group_cfg))
+                cases.append(self._step_param(native, param, group_cfg, group))
         ok = bool(cases) and all(bool(case.get("ok", False)) for case in cases)
         blockers = _dedupe([reason for case in cases for reason in case.get("blocked_reasons", [])])
         if not cases:
@@ -99,7 +99,13 @@ class AdafactorTrainingExecutor:
             self._native = native_with_entrypoints(ENTRYPOINT)
         return self._native
 
-    def _step_param(self, native: Any, param: torch.nn.Parameter, group_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    def _step_param(
+        self,
+        native: Any,
+        param: torch.nn.Parameter,
+        group_cfg: Mapping[str, Any],
+        group: Mapping[str, Any],
+    ) -> dict[str, Any]:
         if group_cfg.get("beta1") is not None:
             return _case_failed("adafactor_native_step_first_moment_unsupported", "adafactor_live_state_first_moment_unsupported")
         if param.dtype != torch.float32 or (param.grad is not None and param.grad.dtype != torch.float32):
@@ -111,7 +117,8 @@ class AdafactorTrainingExecutor:
         else:
             return _case_failed("adafactor_native_step_requires_1d_or_2d", "adafactor_native_step_shape_unsupported")
         state = self.optimizer.state[param]
-        if "step" not in state:
+        step_before = _step_int(state.get("step", group.get("step")))
+        if step_before is None:
             return _case_failed("adafactor_live_state_missing:step", "adafactor_live_state_missing")
         factored = "exp_avg_sq_row" in state and "exp_avg_sq_col" in state
         if not factored and "exp_avg_sq" not in state:
@@ -121,7 +128,7 @@ class AdafactorTrainingExecutor:
         exp_avg_sq = torch.zeros_like(param.detach()).contiguous() if factored else state["exp_avg_sq"].contiguous()
         launch_config = {
             **dict(group_cfg),
-            "beta2": _beta2_for_step(state, group_cfg),
+            "beta2": _beta2_for_step(step_before, group_cfg),
             "factored": factored,
             "rows": rows,
             "cols": cols,
@@ -148,7 +155,8 @@ class AdafactorTrainingExecutor:
             return _case_failed(f"{type(exc).__name__}: {exc}", "adafactor_native_step_call_failed")
         if not bool(launch.get("ok", False)):
             return _case_failed(str(launch.get("reason") or "native_step_failed"), "adafactor_native_step_failed", launch)
-        state["step"] = int(state.get("step", 0) or 0) + 1
+        step_after = step_before + 1
+        _store_step(state, group, step_after)
         if factored:
             state["exp_avg_sq_row"] = row_tensor.reshape(rows)
             state["exp_avg_sq_col"] = col_tensor.reshape(cols)
@@ -160,7 +168,7 @@ class AdafactorTrainingExecutor:
             "param_numel": int(param.numel()),
             "param_dtype": str(param.dtype).replace("torch.", ""),
             "factored": factored,
-            "step_after": int(state.get("step", 0) or 0),
+            "step_after": step_after,
             "kernel_executed": bool(launch.get("kernel_executed", False)),
             "training_parameters_mutated": bool(launch.get("parameters_mutated", False)),
             "launch": launch,
@@ -213,11 +221,33 @@ def _group_config(group: Mapping[str, Any], config: AdafactorTrainingExecutorCon
     return payload
 
 
-def _beta2_for_step(state: Mapping[str, Any], group_cfg: Mapping[str, Any]) -> float:
+def _beta2_for_step(step_before: int, group_cfg: Mapping[str, Any]) -> float:
     if group_cfg.get("beta2") is not None:
         return float(group_cfg["beta2"])
-    step = int(state.get("step", 0) or 0) + 1
+    step = step_before + 1
     return float(1.0 - math.pow(max(step, 1), float(group_cfg.get("decay_rate", -0.8))))
+
+
+def _step_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        return int(value.detach().cpu().item())
+    return int(value)
+
+
+def _store_step(state: dict[str, Any], group: Mapping[str, Any], step_after: int) -> None:
+    current = state.get("step")
+    if isinstance(current, torch.Tensor):
+        current.fill_(int(step_after))
+    elif current is not None:
+        state["step"] = int(step_after)
+    elif isinstance(group, dict) and "step" in group:
+        group["step"] = int(step_after)
+    else:
+        state["step"] = int(step_after)
 
 
 def _optional_float(value: Any) -> float | None:

@@ -6,21 +6,12 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .bubble_post_input_refresh_contract import POST_INPUT_REFRESH_SEQUENCE
+
 
 POST_MANUAL_EVIDENCE_REBUILD_PLAN_REPORT = "bubble_post_manual_evidence_rebuild_plan_v0"
 ROADMAP = "gpu_bubble_elimination_roadmap.md"
-REQUIRED_REBUILD_REFRESH_SEQUENCE = [
-    "refresh_external_input_admission",
-    "refresh_external_input_intake_registry",
-    "refresh_external_input_replay_plan",
-    "refresh_source_axis_freshness_dedupe_audit",
-    "refresh_source_cache_axis_identity_registry",
-    "refresh_source_cache_axis_pipeline_readiness",
-    "refresh_external_input_handoff_packet",
-    "refresh_gpu_bubble_readiness_next_actions",
-    "refresh_gpu_bubble_terminal_self_check",
-    "run_gpu_bubble_release_readiness_guard",
-]
+REQUIRED_REBUILD_REFRESH_SEQUENCE = list(POST_INPUT_REFRESH_SEQUENCE)
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
@@ -205,15 +196,53 @@ def _sd15_expected_outputs(sd15_readiness: Mapping[str, Any]) -> list[str]:
     return [str(value) for value in expected.values() if value]
 
 
+def _existing_path_count(paths: Sequence[str]) -> int:
+    return sum(1 for raw in paths if Path(str(raw)).is_file())
+
+
+def _sd15_manual_ab_evidence_ready(sd15_readiness: Mapping[str, Any]) -> bool:
+    return bool(sd15_readiness.get("evidence_ready")) or str(sd15_readiness.get("status") or "") in {
+        "manual_gpu_evidence_ready",
+        "evidence_available_pending_release_claim_refresh",
+    }
+
+
+def _sd15_manual_ab_evidence_required(sd15_readiness: Mapping[str, Any]) -> bool:
+    if _sd15_manual_ab_evidence_ready(sd15_readiness):
+        return False
+    status = str(sd15_readiness.get("status") or "")
+    return status in {"ready_for_manual_gpu_run", "manual_gpu_evidence_required"}
+
+
+def _sd15_manual_ab_evidence_summary(sd15_readiness: Mapping[str, Any]) -> dict[str, Any]:
+    outputs = _sd15_expected_outputs(sd15_readiness)
+    existing = _existing_path_count(outputs)
+    required = _sd15_manual_ab_evidence_required(sd15_readiness)
+    return {
+        "summary_version": 1,
+        "roadmap": ROADMAP,
+        "artifact_role": "sd15_lora512_manual_ab_evidence_summary",
+        "status": str(sd15_readiness.get("status") or ""),
+        "execution_ready": bool(sd15_readiness.get("execution_ready")),
+        "evidence_ready": _sd15_manual_ab_evidence_ready(sd15_readiness),
+        "manual_ab_evidence_required": required,
+        "expected_output_count": len(outputs),
+        "existing_expected_output_count": existing,
+        "missing_expected_output_count": max(len(outputs) - existing, 0),
+        "release_case_id": str(sd15_readiness.get("release_case_id") or ""),
+        "case_id": str(sd15_readiness.get("case_id") or ""),
+        "safe_to_auto_start": False,
+        "release_claim_allowed": False,
+        "not_release_evidence": True,
+    }
+
+
 def _manual_evidence_ready(
     *,
     manual_plan: Mapping[str, Any],
     sd15_readiness: Mapping[str, Any],
 ) -> bool:
-    return bool(manual_plan.get("preflight_admitted")) or str(sd15_readiness.get("status") or "") in {
-        "manual_gpu_evidence_ready",
-        "evidence_available_pending_release_claim_refresh",
-    }
+    return bool(manual_plan.get("preflight_admitted")) or _sd15_manual_ab_evidence_ready(sd15_readiness)
 
 
 def _base_rebuild_status(evidence_ready: bool) -> tuple[str, list[str]]:
@@ -241,14 +270,17 @@ def _manual_evidence_blocking_summary(
     *,
     manual_ready: bool,
     sd15_manual_blocked: bool,
+    sd15_manual_ab_required: bool,
     evidence_ready: bool,
     blockers: Sequence[str],
     gap_summary: Mapping[str, Any],
 ) -> dict[str, Any]:
     natural_blocked = str(gap_summary.get("natural_load_status") or "") == "blocked_pending_canary"
     release_blocked = str(gap_summary.get("release_readiness") or "") == "blocked_pending_evidence"
+    uncovered_cases = set(_strings(gap_summary.get("uncovered_case_ids")))
+    sd15_release_gap = sd15_manual_blocked or sd15_manual_ab_required or "sd15_lora_512" in uncovered_cases
     source_plan_blocked = "source_cache_axis_manual_canary_plan_not_ready" in blockers
-    manual_evidence_required = "manual_gpu_evidence_required" in blockers
+    manual_evidence_required = "manual_gpu_evidence_required" in blockers or source_plan_blocked or sd15_manual_ab_required
     return {
         "summary_version": 1,
         "roadmap": ROADMAP,
@@ -257,14 +289,16 @@ def _manual_evidence_blocking_summary(
         "source_cache_axis_manual_canary_plan_ready": manual_ready,
         "source_cache_axis_manual_canary_plan_required": source_plan_blocked,
         "sd15_checkpoint_required": sd15_manual_blocked,
+        "sd15_lora512_manual_ab_evidence_required": sd15_manual_ab_required,
         "natural_load_canary_pending": natural_blocked,
         "release_claims_rebuild_required": release_blocked or evidence_ready,
         "release_gate_blockers": [
-            *(["sd15_lora_512"] if sd15_manual_blocked else []),
+            *(["sd15_lora_512"] if sd15_release_gap else []),
             *(["natural_load_canary_pending"] if natural_blocked else []),
         ],
         "next_required_inputs": [
             *(["sd15_checkpoint"] if sd15_manual_blocked else []),
+            *(["sd15_lora512_manual_ab_evidence"] if sd15_manual_ab_required else []),
             *(["source_cache_axis_manual_canary_evidence"] if source_plan_blocked else []),
             *(["manual_gpu_evidence"] if manual_evidence_required else []),
         ],
@@ -333,45 +367,6 @@ def _rebuild_commands(repo_root: Path, python_exe: str, *, status: str, prerequi
             ],
         ),
         _command(
-            command_id="refresh_source_axis_requirement",
-            description="Refresh source/cache-axis requirement after post-run evidence rebuild.",
-            command=[py, _repo_path(repo_root, "devtools/build_bubble_p60_source_axis_requirement.py")],
-            stage_id="refresh_source_cache_admission_chain",
-            stage_order=40,
-            status=status,
-            prerequisites=prerequisites,
-            depends_on=["rebuild_followup_run_readiness"],
-            expected_outputs=[
-                _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/p60_source_axis_requirement.json")
-            ],
-        ),
-        _command(
-            command_id="refresh_newbie_warm_cache_inventory",
-            description="Refresh Newbie warm-cache inventory against rebuilt natural-load gate.",
-            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_warm_cache_inventory.py")],
-            stage_id="refresh_source_cache_admission_chain",
-            stage_order=40,
-            status=status,
-            prerequisites=prerequisites,
-            depends_on=["rebuild_current_combined_evidence_pack"],
-            expected_outputs=[
-                _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/newbie_warm_cache_inventory.json")
-            ],
-        ),
-        _command(
-            command_id="refresh_external_input_admission",
-            description="Refresh external input admission after rebuilt release evidence.",
-            command=[py, _repo_path(repo_root, "devtools/build_bubble_external_input_admission.py")],
-            stage_id="refresh_source_cache_admission_chain",
-            stage_order=40,
-            status=status,
-            prerequisites=prerequisites,
-            depends_on=["refresh_source_axis_requirement", "refresh_newbie_warm_cache_inventory"],
-            expected_outputs=[
-                _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/external_input_admission.json")
-            ],
-        ),
-        _command(
             command_id="refresh_external_input_intake_registry",
             description="Refresh external input intake registry after rebuilt evidence.",
             command=[py, _repo_path(repo_root, "devtools/build_bubble_external_input_intake_status.py")],
@@ -379,7 +374,7 @@ def _rebuild_commands(repo_root: Path, python_exe: str, *, status: str, prerequi
             stage_order=60,
             status=status,
             prerequisites=prerequisites,
-            depends_on=["refresh_external_input_admission"],
+            depends_on=["rebuild_current_combined_evidence_pack"],
             expected_outputs=[
                 _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/external_input_intake_registry.json")
             ],
@@ -398,6 +393,141 @@ def _rebuild_commands(repo_root: Path, python_exe: str, *, status: str, prerequi
             ],
         ),
         _command(
+            command_id="refresh_sd15_lora512_release_gap_readiness",
+            description="Refresh SD15 LoRA 512 readiness before admission consumes rebuilt evidence.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_sd15_lora512_release_gap_readiness.py")],
+            stage_id="refresh_source_cache_admission_chain",
+            stage_order=65,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_external_input_replay_plan"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/sd15_lora512_release_gap_readiness.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_source_axis_scout",
+            description="Refresh source-axis scout from registered intake roots after completed manual GPU evidence is indexed.",
+            command=[
+                py,
+                _repo_path(repo_root, "devtools/build_bubble_p60_source_axis_scout_from_intake.py"),
+            ],
+            stage_id="refresh_source_cache_admission_chain",
+            stage_order=65,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_sd15_lora512_release_gap_readiness", "rebuild_followup_run_readiness"],
+            expected_outputs=[
+                _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/p60_source_axis_scout.json")
+            ],
+        ),
+        _command(
+            command_id="refresh_source_axis_requirement",
+            description="Refresh source/cache-axis requirement after post-run evidence rebuild.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_p60_source_axis_requirement.py")],
+            stage_id="refresh_source_cache_admission_chain",
+            stage_order=65,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_source_axis_scout"],
+            expected_outputs=[
+                _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/p60_source_axis_requirement.json")
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_warm_cache_inventory",
+            description="Refresh Newbie warm-cache inventory after source-axis requirement refresh.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_warm_cache_inventory.py")],
+            stage_id="refresh_source_cache_admission_chain",
+            stage_order=65,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_source_axis_requirement"],
+            expected_outputs=[
+                _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/newbie_warm_cache_inventory.json")
+            ],
+        ),
+        _command(
+            command_id="refresh_external_input_admission",
+            description="Refresh external input admission after rebuilt release evidence.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_external_input_admission.py")],
+            stage_id="refresh_source_cache_admission_chain",
+            stage_order=65,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_warm_cache_inventory"],
+            expected_outputs=[
+                _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/external_input_admission.json")
+            ],
+        ),
+        _command(
+            command_id="refresh_source_cache_axis_admission_preflight",
+            description="Refresh source/cache-axis preflight before rebuilding manual canary plan.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_source_cache_axis_admission_preflight.py")],
+            stage_id="refresh_source_cache_admission_chain",
+            stage_order=65,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_external_input_admission"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/source_cache_axis_admission_preflight.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_source_cache_axis_repair_plan",
+            description="Refresh manual-only warm-cache/caption repair plan before manual canary planning.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_source_cache_axis_repair_plan.py")],
+            stage_id="refresh_source_cache_admission_chain",
+            stage_order=65,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_source_cache_axis_admission_preflight"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/source_cache_axis_repair_plan.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_source_cache_axis_manual_canary_plan",
+            description="Refresh protected manual canary plan after rebuilt preflight evidence.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_source_cache_axis_manual_canary_plan.py")],
+            stage_id="refresh_source_cache_admission_chain",
+            stage_order=65,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_source_cache_axis_repair_plan"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/source_cache_axis_manual_canary_plan.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_post_manual_evidence_rebuild_plan",
+            description="Refresh this post-manual rebuild plan after SD15/source-cache planning updates.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_post_manual_evidence_rebuild_plan.py")],
+            stage_id="refresh_source_cache_admission_chain",
+            stage_order=65,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_source_cache_axis_manual_canary_plan"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/post_manual_evidence_rebuild_plan.json",
+                )
+            ],
+        ),
+        _command(
             command_id="refresh_source_axis_freshness_dedupe_audit",
             description="Refresh source-axis freshness/dedupe audit after rebuilt evidence.",
             command=[py, _repo_path(repo_root, "devtools/build_bubble_source_axis_freshness_dedupe_audit.py")],
@@ -405,7 +535,7 @@ def _rebuild_commands(repo_root: Path, python_exe: str, *, status: str, prerequi
             stage_order=60,
             status=status,
             prerequisites=prerequisites,
-            depends_on=["refresh_external_input_replay_plan"],
+            depends_on=["refresh_post_manual_evidence_rebuild_plan"],
             expected_outputs=[
                 _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/source_axis_freshness_dedupe_audit.json")
             ],
@@ -450,14 +580,190 @@ def _rebuild_commands(repo_root: Path, python_exe: str, *, status: str, prerequi
             ],
         ),
         _command(
-            command_id="refresh_gpu_bubble_readiness_next_actions",
-            description="Refresh top-level GPU bubble readiness after all post-run artifacts.",
-            command=[py, _repo_path(repo_root, "devtools/build_gpu_bubble_experiment_readiness_next_actions.py")],
+            command_id="refresh_newbie_blockskip_quality_followup_manifest",
+            description="Refresh Newbie BlockSkip follow-up manifest in manifest-only mode.",
+            command=[py, _repo_path(repo_root, "devtools/run_bubble_newbie_blockskip_quality_followup.py")],
             stage_id="refresh_top_level_readiness",
             stage_order=80,
             status=status,
             prerequisites=prerequisites,
             depends_on=["refresh_external_input_handoff_packet"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_blockskip_quality_followup_manifest.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_blockskip_quality_stability_review",
+            description="Refresh Newbie BlockSkip quality stability review before top-level readiness.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_blockskip_quality_stability_review.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_blockskip_quality_followup_manifest"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_blockskip_quality_stability_review.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_blockskip_loss_curve_ab_evidence",
+            description="Refresh Newbie BlockSkip loss-curve A/B evidence before semantic review.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_blockskip_loss_curve_ab_evidence.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_blockskip_quality_stability_review"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_blockskip_loss_curve_ab_evidence.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_blockskip_quality_semantic_evidence",
+            description="Refresh Newbie BlockSkip semantic evidence before top-level readiness consumes it.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_blockskip_quality_semantic_evidence.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_blockskip_loss_curve_ab_evidence"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_blockskip_quality_semantic_evidence.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_internal_phase_diagnosis",
+            description="Refresh Newbie internal phase diagnosis before natural-load gate semantics review.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_internal_phase_diagnosis.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_blockskip_quality_semantic_evidence"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_internal_phase_diagnosis.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_natural_load_gate_semantics_review",
+            description="Refresh Newbie natural-load gate semantics review after BlockSkip quality review.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_natural_load_gate_semantics_review.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_internal_phase_diagnosis"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_natural_load_gate_semantics_review.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_compute_bound_gate_exit_policy",
+            description="Refresh Newbie compute-bound gate exit policy after semantics review.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_compute_bound_gate_exit_policy.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_natural_load_gate_semantics_review"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_compute_bound_gate_exit_policy.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_blockskip_quality_drift_review",
+            description="Refresh Newbie BlockSkip quality drift review after policy and semantic evidence.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_blockskip_quality_drift_review.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_compute_bound_gate_exit_policy"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_blockskip_quality_drift_review.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_tail8_attention_compute_review",
+            description="Refresh Newbie tail8 target-depth attention compute review before top-level readiness.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_tail8_attention_compute_review.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_blockskip_quality_drift_review"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_tail8_attention_compute_review.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_tail8_forward_anomaly_review",
+            description="Refresh Newbie tail8 forward anomaly review before rerun preflight.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_tail8_forward_anomaly_review.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_tail8_attention_compute_review"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_tail8_forward_anomaly_review.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_newbie_tail8_seed2027_rerun_preflight",
+            description="Refresh Newbie tail8 seed2027 rerun preflight before top-level readiness.",
+            command=[py, _repo_path(repo_root, "devtools/build_bubble_newbie_tail8_seed2027_rerun_preflight.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_tail8_forward_anomaly_review"],
+            expected_outputs=[
+                _repo_path(
+                    repo_root,
+                    "devtools/benchmark_evidence/bubble_runtime/newbie_tail8_seed2027_rerun_preflight.json",
+                )
+            ],
+        ),
+        _command(
+            command_id="refresh_gpu_bubble_readiness_next_actions",
+            description="Refresh top-level GPU bubble readiness after all post-run and BlockSkip artifacts.",
+            command=[py, _repo_path(repo_root, "devtools/build_gpu_bubble_experiment_readiness_next_actions.py")],
+            stage_id="refresh_top_level_readiness",
+            stage_order=80,
+            status=status,
+            prerequisites=prerequisites,
+            depends_on=["refresh_newbie_tail8_seed2027_rerun_preflight"],
             expected_outputs=[
                 _repo_path(repo_root, "devtools/benchmark_evidence/bubble_runtime/gpu_bubble_experiment_readiness_next_actions.json")
             ],
@@ -521,12 +827,15 @@ def build_post_manual_evidence_rebuild_plan(
     canary = _mapping(natural_load_canary)
     manual_ready = str(manual_plan.get("status") or "") == "protected_manual_canary_plan_ready"
     sd15_manual_blocked = "sd15_base_checkpoint_missing" in _strings(sd15.get("blockers"))
+    sd15_manual_ab_required = _sd15_manual_ab_evidence_required(sd15)
     evidence_ready = _manual_evidence_ready(manual_plan=manual_plan, sd15_readiness=sd15)
     command_status, blockers = _base_rebuild_status(evidence_ready)
     if not manual_ready:
         blockers.append("source_cache_axis_manual_canary_plan_not_ready")
     if sd15_manual_blocked:
         blockers.append("sd15_checkpoint_required")
+    if sd15_manual_ab_required:
+        blockers.append("sd15_lora512_manual_ab_evidence_required")
     if evidence_ready:
         status = "post_manual_rebuild_ready"
     elif sd15_manual_blocked or not manual_ready:
@@ -553,11 +862,13 @@ def build_post_manual_evidence_rebuild_plan(
         "manual_canary_expected_outputs": _manual_plan_outputs(manual_plan),
         "sd15_status": str(sd15.get("status") or ""),
         "sd15_expected_outputs": _sd15_expected_outputs(sd15),
+        "sd15_manual_ab_evidence_summary": _sd15_manual_ab_evidence_summary(sd15),
         "input_sources": [dict(_mapping(item)) for item in _list(input_sources)],
         "current_gap_summary": gap_summary,
         "manual_evidence_blocking_summary": _manual_evidence_blocking_summary(
             manual_ready=manual_ready,
             sd15_manual_blocked=sd15_manual_blocked,
+            sd15_manual_ab_required=sd15_manual_ab_required,
             evidence_ready=evidence_ready,
             blockers=blockers,
             gap_summary=gap_summary,

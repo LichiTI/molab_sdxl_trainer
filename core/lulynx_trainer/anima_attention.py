@@ -546,9 +546,19 @@ def _patch_attention_forward(module: torch.nn.Module) -> None:
     """
     _orig_forward = module.forward
 
-    def _dispatched_forward(self, x, context=None):
+    def _dispatched_forward(self, x, context=None, rope_emb=None, **_unused):
+        # #147 faithful 3D RoPE: the accelerated dispatch below has no RoPE path
+        # (it projects q/k/v and calls dit_attention directly). The native faithful
+        # forward passes a non-None rope_emb on self-attention only; route those
+        # calls back to the original rope-aware native forward captured above.
+        # This is purely additive — non-faithful / cross-attention calls never pass
+        # rope_emb, so they fall straight through to the unchanged accelerated path
+        # and stay bitwise-identical to today (zero regression).
+        if rope_emb is not None:
+            return _orig_forward(x, context=context, rope_emb=rope_emb)
         is_cross_attention = context is not None
         module_name = str(getattr(self, "_attention_module_name", ""))
+        eligible = False
         try:
             from .tgate import observe_attention_call
 
@@ -567,45 +577,63 @@ def _patch_attention_forward(module: torch.nn.Module) -> None:
 
         source = x if context is None else context
 
-        fused_qkv = getattr(self, "_fused_qkv", None)
-        fused_kv = getattr(self, "_fused_kv", None)
+        def _compute_attention() -> torch.Tensor:
+            fused_qkv = getattr(self, "_fused_qkv", None)
+            fused_kv = getattr(self, "_fused_kv", None)
 
-        if fused_qkv is not None and context is None:
-            q_raw, k_raw, v_raw = fused_qkv(x)
-            q = self.q_norm(self._split_heads(q_raw))
-            k = self.k_norm(self._split_heads(k_raw))
-            v = self._split_heads(v_raw)
-        elif fused_kv is not None and context is not None:
-            q = self.q_norm(self._split_heads(self.q_proj(x)))
-            k_raw, v_raw = fused_kv(source)
-            k = self.k_norm(self._split_heads(k_raw))
-            v = self._split_heads(v_raw)
-        else:
-            q = self.q_norm(self._split_heads(self.q_proj(x)))
-            k = self.k_norm(self._split_heads(self.k_proj(source)))
-            v = self._split_heads(self.v_proj(source))
+            if fused_qkv is not None and context is None:
+                q_raw, k_raw, v_raw = fused_qkv(x)
+                q = self.q_norm(self._split_heads(q_raw))
+                k = self.k_norm(self._split_heads(k_raw))
+                v = self._split_heads(v_raw)
+            elif fused_kv is not None and context is not None:
+                q = self.q_norm(self._split_heads(self.q_proj(x)))
+                k_raw, v_raw = fused_kv(source)
+                k = self.k_norm(self._split_heads(k_raw))
+                v = self._split_heads(v_raw)
+            else:
+                q = self.q_norm(self._split_heads(self.q_proj(x)))
+                k = self.k_norm(self._split_heads(self.k_proj(source)))
+                v = self._split_heads(self.v_proj(source))
 
-        backend = getattr(self, "_attention_backend", "sdpa")
-        split_chunks = int(getattr(self, "_attention_split_chunks", 0) or 0)
-        early_del = bool(getattr(self, "_attention_early_deletion", False))
-        attn = dit_attention(
-            q,
-            k,
-            v,
-            backend=backend,
-            split_chunks=split_chunks,
-            amd_sdpa_slice_trigger_gb=float(getattr(self, "_amd_sdpa_slice_trigger_gb", 0.0) or 0.0),
-            amd_sdpa_slice_target_gb=float(getattr(self, "_amd_sdpa_slice_target_gb", 0.0) or 0.0),
-            early_delete=early_del,
-            sliding_window_size=int(getattr(self, "_attention_profile_window_size", 0) or 0),
-            sliding_backend=str(getattr(self, "_attention_profile_backend", "auto") or "auto"),
-            sliding_torch_fallback_max_tokens=int(getattr(self, "_attention_profile_torch_max_tokens", 2048) or 2048),
-            launcher_attention_backend=str(getattr(self, "_attention_profile_launcher_backend", backend) or backend),
-            flex_runtime_active=bool(getattr(self, "_attention_profile_flex_runtime_active", False)),
-        )
-        if early_del:
-            del q, k, v
-        return self.output_proj(self._merge_heads(attn))
+            backend = getattr(self, "_attention_backend", "sdpa")
+            split_chunks = int(getattr(self, "_attention_split_chunks", 0) or 0)
+            early_del = bool(getattr(self, "_attention_early_deletion", False))
+            attn = dit_attention(
+                q,
+                k,
+                v,
+                backend=backend,
+                split_chunks=split_chunks,
+                amd_sdpa_slice_trigger_gb=float(getattr(self, "_amd_sdpa_slice_trigger_gb", 0.0) or 0.0),
+                amd_sdpa_slice_target_gb=float(getattr(self, "_amd_sdpa_slice_target_gb", 0.0) or 0.0),
+                early_delete=early_del,
+                sliding_window_size=int(getattr(self, "_attention_profile_window_size", 0) or 0),
+                sliding_backend=str(getattr(self, "_attention_profile_backend", "auto") or "auto"),
+                sliding_torch_fallback_max_tokens=int(getattr(self, "_attention_profile_torch_max_tokens", 2048) or 2048),
+                launcher_attention_backend=str(getattr(self, "_attention_profile_launcher_backend", backend) or backend),
+                flex_runtime_active=bool(getattr(self, "_attention_profile_flex_runtime_active", False)),
+            )
+            if early_del:
+                del q, k, v
+            return self.output_proj(self._merge_heads(attn))
+
+        # T-GATE real skip (opt-in, generation-scoped). Default off -> the closure
+        # runs verbatim, so the forward is bitwise-identical to today. Only an
+        # eligible cross-attention call with a warm cache reuses the prior output
+        # and skips q/k/v/attention entirely (the actual compute saving).
+        if is_cross_attention:
+            try:
+                from .tgate import get_active_tgate_execution, run_cross_attention_cached
+
+                _tgate_exec = get_active_tgate_execution()
+            except Exception:
+                _tgate_exec = None
+            if _tgate_exec is not None:
+                return run_cross_attention_cached(
+                    _compute_attention, module_name, _tgate_exec, eligible
+                )
+        return _compute_attention()
 
     import types
     module.forward = types.MethodType(_dispatched_forward, module)

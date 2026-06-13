@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from core.turbocore_native_update_promotion_scorecard import build_native_update_promotion_scorecard  # noqa: E402
 from turbocore_native_update_release_review_package_smoke import (  # noqa: E402
     EXPECTED_OPTIMIZER_FAMILY_COUNTS,
+    LEGACY_SIMPLE_FORMULA_SUMMARY_DRIFT_COUNTS,
     _artifact_map,
     _assert_optimizer_family_counts,
     _assert_summary_counts_preserved,
@@ -351,6 +352,73 @@ def _owner_release_review_record_ready() -> dict[str, object]:
     }
 
 
+def _owner_release_direction_record_ready() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "package": "turbocore_native_update_owner_release_direction_record_v0",
+        "gate": "native_update_owner_release_direction_record",
+        "ok": True,
+        "owner_direction_packet_ready": True,
+        "signed_direction_present": True,
+        "signed_direction_valid": True,
+        "owner_release_direction_recorded": True,
+        "owner_release_approval_recorded": True,
+        "decision": "native_update_owner_release_direction_recorded_default_off",
+        "signed_owner_release_direction_digest_match": True,
+        "blocked_reasons": [],
+        "product_exposure_allowed": False,
+        "request_fields_emitted": False,
+        "schema_exposure_allowed": False,
+        "ui_exposure_allowed": False,
+        "backend_router_registered": False,
+        "runtime_dispatch_allowed": False,
+        "native_dispatch_allowed": False,
+        "training_path_enabled": False,
+        "training_launch_executed": False,
+        "post_owner_release_request_fields": {},
+        "summary": {
+            "owner_release_direction_ready_for_signature_count": 1,
+            "owner_release_direction_recorded_count": 1,
+            "owner_release_direction_approval_recorded_count": 1,
+            "owner_release_approval_recorded_count": 1,
+            "runtime_dispatch_ready_count": 0,
+            "native_dispatch_allowed_count": 0,
+            "training_path_enabled_count": 0,
+        },
+    }
+
+
+def _stable_first_release_scope_ready() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "artifact": "turbocore_optimizer_stable_first_release_scope_v0",
+        "gate": "optimizer_stable_first_release_default_off_scope",
+        "ok": True,
+        "stable_first_release_scope": "stable_baseline_with_turbocore_optimizer_default_off",
+        "stable_first_release_blocked_by_turbocore_optimizer": False,
+        "turbocore_optimizer_default_off_release_scope_ready": True,
+        "release_claim_allowed": True,
+        "native_training_claim_allowed": False,
+        "product_exposure_allowed": False,
+        "runtime_dispatch_allowed": False,
+        "native_dispatch_allowed": False,
+        "training_path_enabled": False,
+        "blocked_reasons": [],
+        "summary": {
+            "stable_first_release_turbocore_optimizer_blocker_count": 0,
+            "turbocore_optimizer_default_off_release_scope_ready_count": 1,
+            "owner_release_approval_recorded_count": 0,
+            "owner_release_direction_recorded_count": 0,
+            "owner_release_direction_approval_recorded_count": 0,
+            "product_exposure_decision_recorded_count": 0,
+            "product_training_route_binding_ready_count": 0,
+            "run_local_adapter_staged_count": 0,
+            "runtime_config_patch_applied_count": 0,
+            "training_path_enabled_count": 0,
+        },
+    }
+
+
 def _multitensor_release_hold_summary() -> dict[str, object]:
     return {
         "gate": "native_update_optimizer_multitensor_release_hold",
@@ -387,8 +455,11 @@ def _assert_dispatch_closed(report: dict[str, object]) -> None:
     assert report["training_parameter_mutation_allowed"] is False, report
 
 
-def _optimizer_family_counts() -> dict[str, int]:
-    return dict(EXPECTED_OPTIMIZER_FAMILY_COUNTS)
+def _optimizer_family_counts() -> dict[str, object]:
+    counts: dict[str, object] = dict(EXPECTED_OPTIMIZER_FAMILY_COUNTS)
+    counts.update({key: 0 for key in LEGACY_SIMPLE_FORMULA_SUMMARY_DRIFT_COUNTS})
+    counts["plugin_selected_simple_formula_request_schema_ui_non_exposure_ready"] = True
+    return counts
 
 
 def _digest_payload(value: dict[str, object]) -> str:
@@ -424,12 +495,14 @@ def test_scorecard_is_coherent_but_not_promotion_ready() -> None:
     assert "representative_performance_gate_missing" in blockers, report
     assert "native_update_product_exposure_decision_missing" in blockers, report
     assert "native_update_release_review_package_missing" in blockers, report
+    assert "native_update_owner_release_direction_record_missing" in blockers, report
     assert "native_runtime_recovery_training_dispatch_disabled" in blockers, report
     assert "owner_gradient_sync_default_off" in primary_blockers, report
     assert "direct_gradient_write_default_off" not in primary_blockers, report
     assert "stream_lifetime_ownership_default_off" in primary_blockers, report
     assert "native_dispatch_training_runtime_executor_default_off" in primary_blockers, report
     assert "native_update_release_review_package_missing" in primary_blockers, report
+    assert "native_update_owner_release_direction_record_missing" in primary_blockers, report
     assert "native_dispatch_runtime_not_implemented" in derived_blockers, report
     assert "native_dispatch_training_path_disabled" in derived_blockers, report
     assert "native_dispatch_diagnostic_executor_call_disabled" in derived_blockers, report
@@ -965,6 +1038,155 @@ def test_scorecard_requires_recorded_product_exposure_decision() -> None:
     assert "native_update_product_exposure_decision_not_recorded" in primary_blockers, report
 
 
+def test_scorecard_requires_recorded_owner_release_direction() -> None:
+    param = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+    optimizer = torch.optim.AdamW([param], lr=1e-3)
+    report = build_native_update_promotion_scorecard(
+        optimizer=optimizer,
+        params=[param],
+        shadow_report=_shadow_report(),
+        performance_report=_performance_report(),
+        runtime_context={
+            "native_update_product_exposure_decision": _product_exposure_decision_ready(),
+            "native_update_release_review_package": _release_review_package_ready(),
+            "native_update_owner_release_review_record": _owner_release_review_record_ready(),
+            "turbocore_optimizer_stable_first_release_scope": _stable_first_release_scope_ready(),
+        },
+        mode="native_experimental",
+        dispatch_enabled=True,
+        required_shadow_passes=1,
+        allow_missing_native_kernel=True,
+        strict=True,
+    )
+    blockers = set(report["promotion_blockers"])
+    primary_blockers = set(report["primary_promotion_blockers"])
+    direction = report["owner_release_direction_record"]
+    assert report["promotion_ready"] is False, report
+    assert direction["present"] is False, report
+    assert "native_update_owner_release_direction_record_missing" in blockers, report
+    assert "native_update_owner_release_direction_record_missing" in primary_blockers, report
+
+    invalid = _owner_release_direction_record_ready()
+    invalid["signed_direction_valid"] = False
+    invalid["signed_owner_release_direction_digest_match"] = False
+    invalid["blocked_reasons"] = ["signed_owner_release_direction_template_digest_mismatch"]
+    invalid_report = build_native_update_promotion_scorecard(
+        optimizer=optimizer,
+        params=[param],
+        shadow_report=_shadow_report(),
+        performance_report=_performance_report(),
+        runtime_context={
+            "native_update_product_exposure_decision": _product_exposure_decision_ready(),
+            "native_update_release_review_package": _release_review_package_ready(),
+            "native_update_owner_release_review_record": _owner_release_review_record_ready(),
+            "native_update_owner_release_direction_record": invalid,
+            "turbocore_optimizer_stable_first_release_scope": _stable_first_release_scope_ready(),
+        },
+        mode="native_experimental",
+        dispatch_enabled=True,
+        required_shadow_passes=1,
+        allow_missing_native_kernel=True,
+        strict=True,
+    )
+    invalid_blockers = set(invalid_report["promotion_blockers"])
+    invalid_direction = invalid_report["owner_release_direction_record"]
+    assert invalid_report["promotion_ready"] is False, invalid_report
+    assert invalid_direction["present"] is True, invalid_report
+    assert invalid_direction["signed_direction_valid"] is False, invalid_report
+    assert invalid_direction["signed_owner_release_direction_digest_match"] is False, invalid_report
+    assert "native_update_owner_release_direction_record_signed_direction_valid_failed" in invalid_blockers, (
+        invalid_report
+    )
+    assert (
+        "native_update_owner_release_direction_record_signed_owner_release_direction_digest_match_failed"
+        in invalid_blockers
+    ), invalid_report
+    assert (
+        "signed_owner_release_direction_template_digest_mismatch"
+        in invalid_report["owner_release_direction_record"]["blocked_reasons"]
+    ), invalid_report
+
+
+def test_scorecard_carries_stable_first_release_scope_default_off() -> None:
+    param = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+    optimizer = torch.optim.AdamW([param], lr=1e-3)
+    stable_scope = _stable_first_release_scope_ready()
+    report = build_native_update_promotion_scorecard(
+        optimizer=optimizer,
+        params=[param],
+        shadow_report=_shadow_report(),
+        performance_report=_performance_report(),
+        runtime_context={
+            "native_update_product_exposure_decision": _product_exposure_decision_ready(),
+            "native_update_release_review_package": _release_review_package_ready(),
+            "turbocore_optimizer_stable_first_release_scope": stable_scope,
+        },
+        mode="native_experimental",
+        dispatch_enabled=True,
+        required_shadow_passes=1,
+        allow_missing_native_kernel=True,
+        strict=True,
+    )
+    compact = report["stable_first_release_scope"]
+    assert compact["present"] is True, report
+    assert compact["turbocore_optimizer_default_off_release_scope_ready"] is True, report
+    assert compact["summary"]["stable_first_release_turbocore_optimizer_blocker_count"] == 0, report
+    assert compact["summary"]["turbocore_optimizer_default_off_release_scope_ready_count"] == 1, report
+    assert compact["summary"]["owner_release_direction_recorded_count"] == 0, report
+    assert compact["summary"]["owner_release_direction_approval_recorded_count"] == 0, report
+    assert "turbocore_optimizer_default_off_release_scope_not_ready" not in report["promotion_blockers"], report
+    _assert_dispatch_closed(report)
+
+    signed_direction_scope = json.loads(json.dumps(stable_scope))
+    signed_direction_scope["summary"]["owner_release_direction_recorded_count"] = 1
+    signed_direction_scope["summary"]["owner_release_direction_approval_recorded_count"] = 1
+    signed_direction_report = build_native_update_promotion_scorecard(
+        optimizer=optimizer,
+        params=[param],
+        shadow_report=_shadow_report(),
+        performance_report=_performance_report(),
+        runtime_context={
+            "native_update_product_exposure_decision": _product_exposure_decision_ready(),
+            "native_update_release_review_package": _release_review_package_ready(),
+            "turbocore_optimizer_stable_first_release_scope": signed_direction_scope,
+        },
+        mode="native_experimental",
+        dispatch_enabled=True,
+        required_shadow_passes=1,
+        allow_missing_native_kernel=True,
+        strict=True,
+    )
+    signed_compact = signed_direction_report["stable_first_release_scope"]
+    assert signed_compact["summary"]["owner_release_direction_recorded_count"] == 1, signed_direction_report
+    assert signed_compact["summary"]["owner_release_direction_approval_recorded_count"] == 1, (
+        signed_direction_report
+    )
+    _assert_dispatch_closed(signed_direction_report)
+
+    unsafe_scope = json.loads(json.dumps(stable_scope))
+    unsafe_scope["native_training_claim_allowed"] = True
+    unsafe_scope["summary"]["training_path_enabled_count"] = 1
+    unsafe = build_native_update_promotion_scorecard(
+        optimizer=optimizer,
+        params=[param],
+        shadow_report=_shadow_report(),
+        performance_report=_performance_report(),
+        runtime_context={
+            "native_update_product_exposure_decision": _product_exposure_decision_ready(),
+            "native_update_release_review_package": _release_review_package_ready(),
+            "turbocore_optimizer_stable_first_release_scope": unsafe_scope,
+        },
+        mode="native_experimental",
+        dispatch_enabled=True,
+        required_shadow_passes=1,
+        allow_missing_native_kernel=True,
+        strict=True,
+    )
+    assert "stable_first_release_scope_unsafe:native_training_claim_allowed" in unsafe["promotion_blockers"], unsafe
+    assert "stable_first_release_scope_unsafe:training_path_enabled_count" in unsafe["promotion_blockers"], unsafe
+    _assert_dispatch_closed(unsafe)
+
+
 def test_scorecard_promotes_cuda_training_dispatch_runtime() -> None:
     if not torch.cuda.is_available():
         return
@@ -1005,6 +1227,7 @@ def test_scorecard_promotes_cuda_training_dispatch_runtime() -> None:
             "native_update_product_exposure_decision": _product_exposure_decision_ready(),
             "native_update_release_review_package": _release_review_package_ready(),
             "native_update_owner_release_review_record": _owner_release_review_record_ready(),
+            "native_update_owner_release_direction_record": _owner_release_direction_record_ready(),
         },
         mode="native_experimental",
         dispatch_enabled=True,
@@ -1021,6 +1244,9 @@ def test_scorecard_promotes_cuda_training_dispatch_runtime() -> None:
     assert report["release_review_package"]["owner_release_review_record"]["present"] is True, report
     assert report["release_review_package"]["owner_release_review_record"]["signed_review_valid"] is True, report
     assert report["release_review_package"]["owner_release_review_record"]["release_review_recorded"] is True, report
+    assert report["owner_release_direction_record"]["present"] is True, report
+    assert report["owner_release_direction_record"]["signed_direction_valid"] is True, report
+    assert report["owner_release_direction_record"]["owner_release_direction_recorded"] is True, report
     assert report["release_review_package"]["expected_gate_count"] == 12, report
     assert report["release_review_package"]["supplemental_gate_count"] == 2, report
     assert report["release_review_package"]["present_supplemental_gate_count"] == 2, report
@@ -1078,7 +1304,7 @@ def test_scorecard_surfaces_unsupported_context() -> None:
     assert "gradient_release_not_supported" in reasons, report
 
 
-def main() -> int:
+def _run_all_tests() -> None:
     test_scorecard_is_coherent_but_not_promotion_ready()
     test_scorecard_accepts_representative_performance_gate_without_dispatch()
     test_scorecard_can_replay_diagnostic_executor_without_training_dispatch()
@@ -1095,9 +1321,66 @@ def main() -> int:
     test_scorecard_preserves_real_optimizer_family_compact_counts()
     test_scorecard_rejects_real_optimizer_family_compact_count_tamper()
     test_scorecard_requires_recorded_product_exposure_decision()
+    test_scorecard_requires_recorded_owner_release_direction()
+    test_scorecard_carries_stable_first_release_scope_default_off()
     test_scorecard_promotes_cuda_training_dispatch_runtime()
     test_scorecard_surfaces_unsupported_context()
-    print("turbocore_native_update_promotion_scorecard_smoke: ok")
+
+
+def run_smoke() -> dict[str, object]:
+    _run_all_tests()
+    param = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+    optimizer = torch.optim.AdamW([param], lr=1e-3)
+    report = build_native_update_promotion_scorecard(
+        optimizer=optimizer,
+        params=[param],
+        shadow_report=_shadow_report(),
+        performance_report=_performance_report(),
+        runtime_context={
+            "native_update_product_exposure_decision": _product_exposure_decision_ready(),
+            "native_update_release_review_package": _release_review_package_ready(),
+            "turbocore_optimizer_stable_first_release_scope": _stable_first_release_scope_ready(),
+        },
+        mode="native_experimental",
+        dispatch_enabled=True,
+        required_shadow_passes=1,
+        allow_missing_native_kernel=True,
+        strict=True,
+    )
+    stable_summary = report["stable_first_release_scope"]["summary"]
+    direction_summary = report["owner_release_direction_record"]["summary"]
+    return {
+        "schema_version": 1,
+        "probe": "turbocore_native_update_promotion_scorecard_smoke",
+        "ok": True,
+        "promotion_ready": report["promotion_ready"],
+        "training_path_enabled": report["training_path_enabled"],
+        "native_dispatch_allowed": report["native_dispatch_allowed"],
+        "summary": {
+            "stable_first_release_turbocore_optimizer_blocker_count": stable_summary[
+                "stable_first_release_turbocore_optimizer_blocker_count"
+            ],
+            "turbocore_optimizer_default_off_release_scope_ready_count": stable_summary[
+                "turbocore_optimizer_default_off_release_scope_ready_count"
+            ],
+            "training_path_enabled_count": 1 if report["training_path_enabled"] else 0,
+            "native_dispatch_allowed_count": 1 if report["native_dispatch_allowed"] else 0,
+            "owner_release_direction_ready_for_signature_count": int(
+                direction_summary.get("owner_release_direction_ready_for_signature_count", 0) or 0
+            ),
+            "owner_release_direction_recorded_count": int(
+                direction_summary.get("owner_release_direction_recorded_count", 0) or 0
+            ),
+            "owner_release_direction_approval_recorded_count": int(
+                direction_summary.get("owner_release_direction_approval_recorded_count", 0) or 0
+            ),
+        },
+        "recommended_next_step": "keep promotion blocked until owner/product approvals and training path binding are recorded",
+    }
+
+
+def main() -> int:
+    print(json.dumps(run_smoke(), ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 

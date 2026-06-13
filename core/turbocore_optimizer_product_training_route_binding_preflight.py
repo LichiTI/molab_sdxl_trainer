@@ -16,6 +16,8 @@ ROADMAP = "devtools/docs/turbocore_optimizer_backend_design.md"
 INPUT_ARTIFACTS = {
     "native_readiness_gap": ARTIFACT_DIR / "turbocore_optimizer_native_readiness_gap_scorecard.json",
     "owner_release_review_record": ARTIFACT_DIR / "native_update_owner_release_review_record.json",
+    "owner_release_direction_record": ARTIFACT_DIR / "native_update_owner_release_direction_record.json",
+    "owner_release_direction_packet": ARTIFACT_DIR / "native_update_owner_release_direction_packet.json",
     "product_exposure_decision": ARTIFACT_DIR / "native_update_product_exposure_decision.json",
     "release_review_package": ARTIFACT_DIR / "native_update_release_review_package.json",
 }
@@ -68,6 +70,8 @@ def build_optimizer_product_training_route_binding_preflight(
     *,
     native_readiness_gap: Mapping[str, Any] | None = None,
     owner_release_review_record: Mapping[str, Any] | None = None,
+    owner_release_direction_record: Mapping[str, Any] | None = None,
+    owner_release_direction_packet: Mapping[str, Any] | None = None,
     product_exposure_decision: Mapping[str, Any] | None = None,
     release_review_package: Mapping[str, Any] | None = None,
     artifact_dir: str | Path | None = None,
@@ -76,12 +80,19 @@ def build_optimizer_product_training_route_binding_preflight(
     directory = Path(artifact_dir) if artifact_dir is not None else ARTIFACT_DIR
     gap = _source(native_readiness_gap, directory, "native_readiness_gap")
     owner = _source(owner_release_review_record, directory, "owner_release_review_record")
+    direction = _owner_release_direction_source(
+        owner_release_direction_record,
+        owner_release_direction_packet,
+        directory,
+    )
     exposure = _source(product_exposure_decision, directory, "product_exposure_decision")
     release = _source(release_review_package, directory, "release_review_package")
 
     gap_summary = _as_dict(gap.get("summary"))
     family_count = int(gap_summary.get("route_family_count", 0) or 0)
     launch_ready = int(gap_summary.get("runtime_launch_coverage_ready_family_count", 0) or 0)
+    launch_ready_optimizer = int(gap_summary.get("runtime_launch_coverage_ready_optimizer_count", 0) or 0)
+    launch_mode_counts = _as_dict(gap_summary.get("runtime_launch_coverage_mode_counts"))
     owner_hold = int(gap_summary.get("owner_release_hold_ready_family_count", 0) or 0)
     non_exposure = int(gap_summary.get("request_schema_ui_non_exposure_ready_family_count", 0) or 0)
     readiness_ready = bool(
@@ -94,23 +105,37 @@ def build_optimizer_product_training_route_binding_preflight(
         and int(gap_summary.get("family_specific_runtime_launch_missing_count", 0) or 0) == 0
     )
     owner_recorded = bool(owner.get("approval_recorded") is True and owner.get("release_review_recorded") is True)
+    owner_direction_recorded = bool(
+        direction.get("owner_release_direction_recorded") is True
+        and direction.get("owner_release_approval_recorded") is True
+    )
+    owner_direction_approval_recorded = bool(direction.get("owner_release_approval_recorded") is True)
     release_recorded = bool(
         release.get("release_review_recorded") is True or owner.get("release_review_recorded") is True
     )
     product_exposure_recorded = bool(exposure.get("product_exposure_decision_recorded") is True)
     unsafe_claims = _unsafe_claims(gap, "native_readiness_gap")
     unsafe_claims += _unsafe_claims(owner, "owner_release_review_record")
+    unsafe_claims += _unsafe_claims(direction, "owner_release_direction_packet")
     unsafe_claims += _unsafe_claims(exposure, "product_exposure_decision")
     unsafe_claims += _unsafe_claims(release, "release_review_package")
     defaults_closed = not unsafe_claims
     blockers = _dedupe(
         ([] if readiness_ready else ["native_readiness_gap_not_ready"])
         + ([] if owner_recorded else ["owner_release_approval_missing"])
+        + ([] if owner_direction_recorded else ["owner_release_direction_not_recorded"])
         + ([] if release_recorded else ["release_review_record_missing"])
         + ([] if product_exposure_recorded else ["product_exposure_decision_not_recorded"])
         + unsafe_claims
     )
-    preflight_ready = bool(readiness_ready and owner_recorded and release_recorded and product_exposure_recorded and defaults_closed)
+    preflight_ready = bool(
+        readiness_ready
+        and owner_recorded
+        and owner_direction_recorded
+        and release_recorded
+        and product_exposure_recorded
+        and defaults_closed
+    )
     candidate = _route_binding_candidate(gap_summary) if preflight_ready else {}
     payload = {
         "schema_version": 1,
@@ -136,12 +161,16 @@ def build_optimizer_product_training_route_binding_preflight(
             "route_family_count": family_count,
             "plugin_optimizer_count": int(gap_summary.get("plugin_optimizer_count", 0) or 0),
             "runtime_launch_coverage_ready_family_count": launch_ready,
+            "runtime_launch_coverage_ready_optimizer_count": launch_ready_optimizer,
+            "runtime_launch_coverage_mode_counts": launch_mode_counts,
             "family_specific_runtime_launch_adapter_ready_optimizer_count": int(
                 gap_summary.get("family_specific_runtime_launch_adapter_ready_optimizer_count", 0) or 0
             ),
             "owner_release_hold_ready_family_count": owner_hold,
             "request_schema_ui_non_exposure_ready_family_count": non_exposure,
             "owner_release_approval_recorded_count": 1 if owner_recorded else 0,
+            "owner_release_direction_recorded_count": 1 if owner_direction_recorded else 0,
+            "owner_release_direction_approval_recorded_count": 1 if owner_direction_approval_recorded else 0,
             "release_review_recorded_count": 1 if release_recorded else 0,
             "product_exposure_decision_recorded_count": 1 if product_exposure_recorded else 0,
             "product_training_route_binding_ready_count": family_count if preflight_ready else 0,
@@ -204,6 +233,12 @@ def _route_binding_candidate(gap_summary: Mapping[str, Any]) -> dict[str, Any]:
             "runtime_launch_coverage_ready_family_count": int(
                 gap_summary.get("runtime_launch_coverage_ready_family_count", 0) or 0
             ),
+            "runtime_launch_coverage_ready_optimizer_count": int(
+                gap_summary.get("runtime_launch_coverage_ready_optimizer_count", 0) or 0
+            ),
+            "runtime_launch_coverage_mode_counts": _as_dict(
+                gap_summary.get("runtime_launch_coverage_mode_counts")
+            ),
         },
     }
 
@@ -212,6 +247,21 @@ def _source(value: Mapping[str, Any] | None, directory: Path, name: str) -> dict
     if value is not None:
         return _as_dict(value)
     return _read_json(directory / INPUT_ARTIFACTS[name].name)
+
+
+def _owner_release_direction_source(
+    record: Mapping[str, Any] | None,
+    packet: Mapping[str, Any] | None,
+    directory: Path,
+) -> dict[str, Any]:
+    if record is not None:
+        return _as_dict(record)
+    if packet is not None:
+        return _as_dict(packet)
+    record = _source(None, directory, "owner_release_direction_record")
+    if record:
+        return record
+    return _source(None, directory, "owner_release_direction_packet")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -257,6 +307,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-readiness-gap", default="")
     parser.add_argument("--owner-release-review-record", default="")
+    parser.add_argument("--owner-release-direction-record", default="")
+    parser.add_argument("--owner-release-direction-packet", default="")
     parser.add_argument("--product-exposure-decision", default="")
     parser.add_argument("--release-review-package", default="")
     parser.add_argument("--artifact-dir", default="")
@@ -269,6 +321,8 @@ def main(argv: list[str] | None = None) -> int:
     payload = build_optimizer_product_training_route_binding_preflight(
         native_readiness_gap=_read_json_if_supplied(args.native_readiness_gap),
         owner_release_review_record=_read_json_if_supplied(args.owner_release_review_record),
+        owner_release_direction_record=_read_json_if_supplied(args.owner_release_direction_record),
+        owner_release_direction_packet=_read_json_if_supplied(args.owner_release_direction_packet),
         product_exposure_decision=_read_json_if_supplied(args.product_exposure_decision),
         release_review_package=_read_json_if_supplied(args.release_review_package),
         artifact_dir=args.artifact_dir or None,

@@ -343,6 +343,8 @@ def _collect_adapter_param_ids(lora_injector: Any) -> set[int]:
                 if id(param) not in base_ids:
                     ids.add(id(param))
     return ids
+
+
 def _param_itemsize(param: torch.nn.Parameter) -> int:
     try:
         return param.dtype.itemsize  # type: ignore[return-value]
@@ -364,34 +366,47 @@ def compress_frozen_weights_fp8(
     excludes = _split_patterns(exclude_patterns)
     dtype = torch.float8_e4m3fn
 
-    for name, param in module.named_parameters():
+    # Native fp8 direct-cast is only forward-safe for ``nn.Linear`` weights:
+    # RMSNorm/LayerNorm scales and biases are consumed by elementwise ops
+    # (``x * rsqrt(var)``) that cannot promote fp8, and nn.Embedding lookups on
+    # fp8 are unsupported. So we walk modules and cast *only* the 2-D weight of
+    # each frozen Linear (the matmul path), leaving norms/embeddings/biases in
+    # their original dtype. The Linear forward is made fp8-safe separately
+    # (LoRALinear._base_forward for wrapped layers; a dequant shim for the rest).
+    for name, child in module.named_modules():
+        if not isinstance(child, nn.Linear):
+            continue
+        weight = getattr(child, "weight", None)
+        if weight is None or weight.dim() != 2:
+            continue
         result.parameter_count += 1
-        qualified_name = f"{component_name}.{name}"
+        qualified_name = f"{component_name}.{name}" if name else component_name
         if includes and not _matches_any(qualified_name, includes):
             result.skipped_pattern_count += 1
             continue
         if excludes and _matches_any(qualified_name, excludes):
             result.skipped_pattern_count += 1
             continue
-        if id(param) in lora_ids or getattr(param, "_lora_leaf", False):
-            result.skipped_adapter_count += 1
-            continue
-        if param.requires_grad:
-            result.skipped_trainable_count += 1
+        eligible, reason = _linear_module_is_eligible(child, lora_ids)
+        if not eligible:
+            if reason == "adapter":
+                result.skipped_adapter_count += 1
+            else:
+                result.skipped_trainable_count += 1
             continue
 
-        orig_bytes = _param_itemsize(param)
+        orig_bytes = _param_itemsize(weight)
         try:
-            param.data = param.data.to(dtype)
+            weight.data = weight.data.to(dtype)
         except RuntimeError as exc:
             result.warnings.append(f"{qualified_name}: {exc}")
             continue
-        new_bytes = dtype.itemsize if hasattr(dtype, "itemsize") else param.element_size()
-        result.bytes_saved += param.numel() * max(orig_bytes - new_bytes, 0)
+        new_bytes = dtype.itemsize if hasattr(dtype, "itemsize") else weight.element_size()
+        result.bytes_saved += weight.numel() * max(orig_bytes - new_bytes, 0)
         result.compressed_count += 1
 
     logger.info(
-        "Weight compression %s: %d/%d frozen params compressed, estimated savings %.1f MB",
+        "Weight compression %s: %d/%d frozen Linear weights compressed, estimated savings %.1f MB",
         component_name,
         result.compressed_count,
         result.parameter_count,

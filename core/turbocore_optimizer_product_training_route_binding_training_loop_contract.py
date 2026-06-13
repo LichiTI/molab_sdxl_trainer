@@ -97,6 +97,11 @@ def _synthetic_signed_preflight(directory: Path) -> dict[str, Any]:
     return build_optimizer_product_training_route_binding_preflight(
         native_readiness_gap=_read_json(directory / "turbocore_optimizer_native_readiness_gap_scorecard.json"),
         owner_release_review_record={"ok": True, "approval_recorded": True, "release_review_recorded": True},
+        owner_release_direction_packet={
+            "ok": True,
+            "owner_release_direction_recorded": True,
+            "owner_release_approval_recorded": True,
+        },
         product_exposure_decision={
             "ok": True,
             "evidence_ready": True,

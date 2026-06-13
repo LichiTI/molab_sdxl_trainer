@@ -74,6 +74,138 @@ def compact_release_review_package(report: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def compact_stable_first_release_scope(report: Mapping[str, Any]) -> dict[str, Any]:
+    summary = _as_dict(report.get("summary"))
+    return {
+        "present": bool(report),
+        "gate": str(report.get("gate", "") or ""),
+        "ok": bool(report.get("ok", False)),
+        "stable_first_release_scope": str(report.get("stable_first_release_scope") or ""),
+        "stable_first_release_blocked_by_turbocore_optimizer": bool(
+            report.get("stable_first_release_blocked_by_turbocore_optimizer", False)
+        ),
+        "turbocore_optimizer_default_off_release_scope_ready": bool(
+            report.get("turbocore_optimizer_default_off_release_scope_ready", False)
+        ),
+        "release_claim_allowed": bool(report.get("release_claim_allowed", False)),
+        "native_training_claim_allowed": bool(report.get("native_training_claim_allowed", False)),
+        "product_exposure_allowed": bool(report.get("product_exposure_allowed", False)),
+        "runtime_dispatch_allowed": bool(report.get("runtime_dispatch_allowed", False)),
+        "native_dispatch_allowed": bool(report.get("native_dispatch_allowed", False)),
+        "training_path_enabled": bool(report.get("training_path_enabled", False)),
+        "summary": {
+            "stable_first_release_turbocore_optimizer_blocker_count": int(
+                summary.get("stable_first_release_turbocore_optimizer_blocker_count", 0) or 0
+            ),
+            "turbocore_optimizer_default_off_release_scope_ready_count": int(
+                summary.get("turbocore_optimizer_default_off_release_scope_ready_count", 0) or 0
+            ),
+            "owner_release_approval_recorded_count": int(
+                summary.get("owner_release_approval_recorded_count", 0) or 0
+            ),
+            "owner_release_direction_recorded_count": int(
+                summary.get("owner_release_direction_recorded_count", 0) or 0
+            ),
+            "owner_release_direction_approval_recorded_count": int(
+                summary.get("owner_release_direction_approval_recorded_count", 0) or 0
+            ),
+            "product_exposure_decision_recorded_count": int(
+                summary.get("product_exposure_decision_recorded_count", 0) or 0
+            ),
+            "product_training_route_binding_ready_count": int(
+                summary.get("product_training_route_binding_ready_count", 0) or 0
+            ),
+            "run_local_adapter_staged_count": int(summary.get("run_local_adapter_staged_count", 0) or 0),
+            "runtime_config_patch_applied_count": int(
+                summary.get("runtime_config_patch_applied_count", 0) or 0
+            ),
+            "training_path_enabled_count": int(summary.get("training_path_enabled_count", 0) or 0),
+        },
+        "blocked_reasons": _strings(report.get("blocked_reasons")),
+    }
+
+
+def compact_owner_release_direction_record(report: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "present": bool(report),
+        "gate": str(report.get("gate", "") or ""),
+        "ok": bool(report.get("ok", False)),
+        "owner_direction_packet_ready": report.get("owner_direction_packet_ready") is True,
+        "signed_direction_present": report.get("signed_direction_present") is True,
+        "signed_direction_valid": report.get("signed_direction_valid") is True,
+        "owner_release_direction_recorded": report.get("owner_release_direction_recorded") is True,
+        "owner_release_approval_recorded": report.get("owner_release_approval_recorded") is True,
+        "signed_owner_release_direction_digest_match": (
+            report.get("signed_owner_release_direction_digest_match") is True
+        ),
+        "decision": str(report.get("decision") or ""),
+        "blocked_reasons": _strings(report.get("blocked_reasons")),
+        "summary": _as_dict(report.get("summary")),
+        "unsafe_claims": _owner_direction_record_unsafe_claims(report),
+    }
+
+
+def owner_release_direction_record_blockers(report: Mapping[str, Any]) -> list[str]:
+    if not report:
+        return ["native_update_owner_release_direction_record_missing"]
+    blocked = _strings(report.get("blocked_reasons"))
+    if report.get("ok") is not True:
+        blocked.append("native_update_owner_release_direction_record_not_ok")
+    for field in (
+        "owner_direction_packet_ready",
+        "signed_direction_present",
+        "signed_direction_valid",
+        "owner_release_direction_recorded",
+        "owner_release_approval_recorded",
+        "signed_owner_release_direction_digest_match",
+    ):
+        if report.get(field) is not True:
+            blocked.append(f"native_update_owner_release_direction_record_{field}_failed")
+    if str(report.get("decision") or "") != "native_update_owner_release_direction_recorded_default_off":
+        blocked.append("native_update_owner_release_direction_record_decision_not_recorded_default_off")
+    for claim in _owner_direction_record_unsafe_claims(report):
+        blocked.append(f"native_update_owner_release_direction_record_unsafe:{claim}")
+    return _dedupe(blocked)
+
+
+def stable_first_release_scope_blockers(report: Mapping[str, Any]) -> list[str]:
+    if not report:
+        return []
+    compact = compact_stable_first_release_scope(report)
+    summary = _as_dict(compact.get("summary"))
+    blocked = _strings(report.get("blocked_reasons"))
+    if compact.get("ok") is not True:
+        blocked.append("turbocore_optimizer_stable_first_release_scope_not_ok")
+    if compact.get("turbocore_optimizer_default_off_release_scope_ready") is not True:
+        blocked.append("turbocore_optimizer_default_off_release_scope_not_ready")
+    if compact.get("stable_first_release_blocked_by_turbocore_optimizer") is True:
+        blocked.append("stable_first_release_blocked_by_turbocore_optimizer")
+    if int(summary.get("stable_first_release_turbocore_optimizer_blocker_count", 0) or 0) != 0:
+        blocked.append("stable_first_release_turbocore_optimizer_blockers_present")
+    if int(summary.get("turbocore_optimizer_default_off_release_scope_ready_count", 0) or 0) != 1:
+        blocked.append("turbocore_optimizer_default_off_release_scope_ready_count_missing")
+    for field in (
+        "native_training_claim_allowed",
+        "product_exposure_allowed",
+        "runtime_dispatch_allowed",
+        "native_dispatch_allowed",
+        "training_path_enabled",
+    ):
+        if compact.get(field) is True:
+            blocked.append(f"stable_first_release_scope_unsafe:{field}")
+    for field in (
+        "owner_release_approval_recorded_count",
+        "product_exposure_decision_recorded_count",
+        "product_training_route_binding_ready_count",
+        "run_local_adapter_staged_count",
+        "runtime_config_patch_applied_count",
+        "training_path_enabled_count",
+    ):
+        if int(summary.get(field, 0) or 0) != 0:
+            blocked.append(f"stable_first_release_scope_unsafe:{field}")
+    return _dedupe(blocked)
+
+
 def product_exposure_blockers(report: Mapping[str, Any]) -> list[str]:
     if not report:
         return ["native_update_product_exposure_decision_missing"]
@@ -191,7 +323,10 @@ def _owner_release_review_record_blockers(record: Mapping[str, Any]) -> list[str
         blocked.append("native_update_release_review_owner_record_package_decision_not_recorded_default_off")
     for claim in _owner_record_unsafe_claims(record):
         blocked.append(f"native_update_release_review_owner_record_unsafe:{claim}")
-    blocked.extend(f"native_update_release_review_owner_record:{reason}" for reason in _strings(record.get("blocked_reasons")))
+    blocked.extend(
+        f"native_update_release_review_owner_record:{reason}"
+        for reason in _strings(record.get("blocked_reasons"))
+    )
     return blocked
 
 
@@ -286,7 +421,9 @@ def _optimizer_family_coverage_blockers(report: Mapping[str, Any]) -> list[str]:
         blocked.append("native_update_release_review_optimizer_family_coverage_priority_gates_missing")
     for gate in priority_next_gates:
         if not _optimizer_owner_release_gate(gate):
-            blocked.append("native_update_release_review_optimizer_family_coverage_priority_gate_not_owner_release_hold")
+            blocked.append(
+                "native_update_release_review_optimizer_family_coverage_priority_gate_not_owner_release_hold"
+            )
     handoff_counts = _optimizer_family_handoff_counts(report)
     optimizer_counts = _int_dict(summary.get("optimizer_family_counts"))
     if not handoff_counts or handoff_counts != optimizer_counts:
@@ -362,6 +499,26 @@ def _owner_record_unsafe_claims(record: Mapping[str, Any]) -> list[str]:
     return unsafe
 
 
+def _owner_direction_record_unsafe_claims(record: Mapping[str, Any]) -> list[str]:
+    unsafe = []
+    for key in (
+        "product_exposure_allowed",
+        "request_fields_emitted",
+        "schema_exposure_allowed",
+        "ui_exposure_allowed",
+        "backend_router_registered",
+        "runtime_dispatch_allowed",
+        "native_dispatch_allowed",
+        "training_path_enabled",
+        "training_launch_executed",
+    ):
+        if record.get(key) is True:
+            unsafe.append(key)
+    if _as_dict(record.get("post_owner_release_request_fields")):
+        unsafe.append("post_owner_release_request_fields")
+    return unsafe
+
+
 def _digest_payload(value: Mapping[str, Any]) -> str:
     if not value:
         return ""
@@ -385,8 +542,12 @@ def _dedupe(values: list[str]) -> list[str]:
 
 
 __all__ = [
+    "compact_owner_release_direction_record",
     "compact_product_exposure_decision",
     "compact_release_review_package",
+    "compact_stable_first_release_scope",
+    "owner_release_direction_record_blockers",
     "product_exposure_blockers",
     "release_review_blockers",
+    "stable_first_release_scope_blockers",
 ]

@@ -70,8 +70,10 @@ def _families_requiring_runs(followup_plan: Mapping[str, Any]) -> set[str]:
         reasons = set(_string_list(mapped.get("reasons")))
         if family and (
             "action_boundary" in categories
+            or "cache_readiness" in categories
             or "release_claim_gate" in categories
             or "dataloader_rebuild_epoch_boundary_action_missing" in reasons
+            or any("family_cache" in reason or "cache_inventory" in reason for reason in reasons)
             or "release_claim_not_eligible" in reasons
         ):
             families.add("newbie" if family == "dit" else family)
@@ -273,6 +275,48 @@ def _profile_summary(
     }
 
 
+def _execution_surface_summary(commands: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    completed_ids: list[str] = []
+    rerun_blocked_ids: list[str] = []
+    active_release_ids: list[str] = []
+    diagnostic_ids: list[str] = []
+    blocked_ids: list[str] = []
+    for command in commands:
+        command_id = str(command.get("id") or "")
+        completed = bool(_mapping(command.get("existing_evidence")).get("completed"))
+        diagnostic = bool(command.get("diagnostic_only"))
+        release_relevant = bool(command.get("release_relevant"))
+        if completed:
+            completed_ids.append(command_id)
+        if bool(command.get("do_not_rerun_without_new_axis")):
+            rerun_blocked_ids.append(command_id)
+        if completed:
+            continue
+        if diagnostic:
+            diagnostic_ids.append(command_id)
+        elif release_relevant:
+            active_release_ids.append(command_id)
+        else:
+            blocked_ids.append(command_id)
+    if active_release_ids:
+        status = "release_relevant_manual_ready"
+    elif diagnostic_ids or completed_ids or blocked_ids:
+        status = "blocked_or_diagnostic_only"
+    else:
+        status = "no_followup_runs_needed"
+    return {
+        "execution_surface_status": status,
+        "active_release_relevant_command_count": len(active_release_ids),
+        "active_release_relevant_command_ids": active_release_ids,
+        "diagnostic_manual_ready_command_count": len(diagnostic_ids),
+        "diagnostic_manual_ready_command_ids": diagnostic_ids,
+        "completed_existing_command_ids": completed_ids,
+        "rerun_blocked_without_new_axis_command_ids": rerun_blocked_ids,
+        "blocked_nonrelease_command_count": len(blocked_ids),
+        "blocked_nonrelease_command_ids": blocked_ids,
+    }
+
+
 def _path_text(path: Path) -> str:
     return str(path)
 
@@ -441,25 +485,66 @@ def _sdxl_plans(repo_root: Path, source_data: Path, out_root: Path, python_execu
     ]
 
 
-def _newbie_plans(repo_root: Path, source_data: Path, out_root: Path, python_executable: Path) -> list[dict[str, Any]]:
+def _newbie_axis_label(source_data: Path, warm_cache_inventory: Mapping[str, Any] | None = None) -> str:
+    inventory = _mapping(warm_cache_inventory)
+    offset = inventory.get("selected_axis_sample_offset")
+    try:
+        offset_value = int(offset)
+    except (TypeError, ValueError, OverflowError):
+        offset_value = None
+    if offset_value is not None and offset_value >= 0:
+        return f"offset{offset_value}_warm_cache"
+    name = source_data.parent.name.lower() if source_data.name.lower() == "source_data" else source_data.name.lower()
+    if "offset32" in name:
+        return "offset32_no_skip_clip"
+    return "warm_cache"
+
+
+def _selected_newbie_source_from_inventory(warm_cache_inventory: Mapping[str, Any] | None) -> Path | None:
+    inventory = _mapping(warm_cache_inventory)
+    if not bool(inventory.get("selected_axis_cache_ready")):
+        return None
+    source = str(inventory.get("selected_axis_root") or inventory.get("prepared_source_data") or "").strip()
+    if not source:
+        return None
+    return Path(source)
+
+
+def _newbie_plans(
+    repo_root: Path,
+    source_data: Path,
+    out_root: Path,
+    python_executable: Path,
+    *,
+    warm_cache_inventory: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    axis_label = _newbie_axis_label(source_data, warm_cache_inventory)
+    source_axis = {
+        "source": "newbie_warm_cache_inventory" if _mapping(warm_cache_inventory) else "planner_default",
+        "selected_axis_kind": str(_mapping(warm_cache_inventory).get("selected_axis_kind") or ""),
+        "selected_axis_sample_offset": _mapping(warm_cache_inventory).get("selected_axis_sample_offset"),
+        "selected_axis_repair_produced": bool(_mapping(warm_cache_inventory).get("selected_axis_repair_produced")),
+        "source_data_original": str(_mapping(warm_cache_inventory).get("source_data_original") or ""),
+    }
     return [
         {
-            "id": "newbie_offset32_no_skip_clip_long_window",
+            "id": f"newbie_{axis_label}_long_window",
             "family": "newbie",
             "priority": 10,
             "release_relevant": True,
             "diagnostic_only": False,
             "sample_offset": 0,
             "source_data": _path_text(source_data),
-            "out_dir": _path_text(out_root / "real_material_canary_newbie_offset32_no_skip_clip_long_window_p60_followup"),
-            "rationale": "Re-run Newbie on the pooled no-skip-clip warm-cache source with a longer steady window.",
+            "source_axis": source_axis,
+            "out_dir": _path_text(out_root / f"real_material_canary_newbie_{axis_label}_long_window_p60_followup"),
+            "rationale": "Re-run Newbie on the selected warm-cache source with a longer steady window.",
             "command": _real_material_command(
                 repo_root,
                 python_executable=python_executable,
                 family="newbie",
                 source_data=source_data,
                 sample_offset=0,
-                out_dir=out_root / "real_material_canary_newbie_offset32_no_skip_clip_long_window_p60_followup",
+                out_dir=out_root / f"real_material_canary_newbie_{axis_label}_long_window_p60_followup",
                 flags=[
                     "--newbie-resolution",
                     "64",
@@ -477,14 +562,15 @@ def _newbie_plans(repo_root: Path, source_data: Path, out_root: Path, python_exe
             ),
         },
         {
-            "id": "newbie_offset32_no_skip_clip_batch1_diagnostic",
+            "id": f"newbie_{axis_label}_batch1_diagnostic",
             "family": "newbie",
             "priority": 20,
             "release_relevant": False,
             "diagnostic_only": True,
             "sample_offset": 0,
             "source_data": _path_text(source_data),
-            "out_dir": _path_text(out_root / "real_material_canary_newbie_offset32_no_skip_clip_batch1_diag_p60_followup"),
+            "source_axis": source_axis,
+            "out_dir": _path_text(out_root / f"real_material_canary_newbie_{axis_label}_batch1_diag_p60_followup"),
             "rationale": "Diagnostic underfilled-workload probe to see whether Newbie data wait is masked by compute.",
             "command": _real_material_command(
                 repo_root,
@@ -492,7 +578,7 @@ def _newbie_plans(repo_root: Path, source_data: Path, out_root: Path, python_exe
                 family="newbie",
                 source_data=source_data,
                 sample_offset=0,
-                out_dir=out_root / "real_material_canary_newbie_offset32_no_skip_clip_batch1_diag_p60_followup",
+                out_dir=out_root / f"real_material_canary_newbie_{axis_label}_batch1_diag_p60_followup",
                 flags=[
                     "--diagnostic-only",
                     "--newbie-resolution",
@@ -515,6 +601,109 @@ def _newbie_plans(repo_root: Path, source_data: Path, out_root: Path, python_exe
     ]
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value if value is not None else default)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
+def _natural_load_gpu_rerun_rows(followup_plan: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    gpu_plan = _mapping(followup_plan.get("gpu_rerun_plan"))
+    rows = gpu_plan.get("families")
+    if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
+        return [_mapping(item) for item in rows if _mapping(item)]
+    return []
+
+
+def _natural_load_axis_flags(family: str, axes: Mapping[str, Any]) -> list[str]:
+    resolution = _safe_int(axes.get("resolution"), 1024 if family == "sdxl" else 64)
+    samples = max(_safe_int(axes.get("samples"), 8), 8)
+    candidate_steps = _safe_int(axes.get("steps"), 16)
+    steps = max(candidate_steps * 2, 32)
+    warmup = max(min(steps // 4, 8), 4)
+    tune_interval = max(min(steps // 4, 8), 4)
+    prefix = "newbie" if family == "newbie" else family
+    flags = [
+        f"--{prefix}-resolution",
+        str(resolution),
+        f"--{prefix}-samples",
+        str(samples),
+        f"--{prefix}-steps",
+        str(steps),
+        f"--{prefix}-warmup",
+        str(warmup),
+        f"--{prefix}-tune-interval",
+        str(tune_interval),
+        "--min-throughput-gain",
+        "0.03",
+    ]
+    batch = _safe_int(axes.get("train_batch_size"), 0)
+    if batch > 0:
+        flags.extend([f"--{prefix}-batch", str(batch)])
+    return flags
+
+
+def _natural_load_gpu_rerun_plans(
+    repo_root: Path,
+    followup_plan: Mapping[str, Any],
+    *,
+    source_data: Path,
+    newbie_source_data: Path,
+    out_root: Path,
+    python_executable: Path,
+) -> list[dict[str, Any]]:
+    plans: list[dict[str, Any]] = []
+    for row in _natural_load_gpu_rerun_rows(followup_plan):
+        family = _family_key(row.get("family"))
+        if family not in {"sdxl", "newbie"}:
+            continue
+        if str(row.get("status") or "") not in {"manual_gpu_rerun_required", "manual_gpu_evidence_required"}:
+            continue
+        axes = _mapping(row.get("candidate_axes"))
+        resolution = _safe_int(axes.get("resolution"), 1024 if family == "sdxl" else 64)
+        steps = max(_safe_int(axes.get("steps"), 16) * 2, 32)
+        source = newbie_source_data if family == "newbie" else source_data
+        out_dir = out_root / f"real_material_canary_{family}_natural_load_epoch_boundary_res{resolution}_steps{steps}_p60_followup"
+        plans.append(
+            {
+                "id": f"{family}_natural_load_epoch_boundary_res{resolution}_steps{steps}",
+                "family": family,
+                "priority": 1,
+                "release_relevant": True,
+                "diagnostic_only": False,
+                "sample_offset": 0,
+                "source_data": _path_text(source),
+                "out_dir": _path_text(out_dir),
+                "rationale": (
+                    "Natural-load canary requested an epoch-boundary DataLoader rebuild follow-up; "
+                    "this command uses a longer window and a fresh out_dir so completed low-baseline axes are not rerun."
+                ),
+                "natural_load_gpu_rerun_plan": {
+                    "intent": str(row.get("intent") or ""),
+                    "recommended_command_profile": str(row.get("recommended_command_profile") or ""),
+                    "source_candidate_case_id": str(row.get("source_candidate_case_id") or ""),
+                    "source_candidate_kind": str(row.get("source_candidate_kind") or ""),
+                    "blocked_reason_ids": _string_list(row.get("blocked_reason_ids"))[:16],
+                    "candidate_axes": dict(axes),
+                    "rebuild_required_after_success": _string_list(row.get("rebuild_required_after_success")),
+                    "safe_to_auto_start": False,
+                    "release_claim_allowed_after_success": False,
+                },
+                "command": _real_material_command(
+                    repo_root,
+                    python_executable=python_executable,
+                    family=family,
+                    source_data=source,
+                    sample_offset=0,
+                    out_dir=out_dir,
+                    flags=_natural_load_axis_flags(family, axes),
+                ),
+            }
+        )
+    return plans
+
+
 def build_bubble_runtime_followup_run_plan(
     followup_plan: Mapping[str, Any],
     *,
@@ -523,6 +712,7 @@ def build_bubble_runtime_followup_run_plan(
     newbie_source_data: Path | None = None,
     out_root: Path | None = None,
     source_axis_scout: Mapping[str, Any] | None = None,
+    warm_cache_inventory: Mapping[str, Any] | None = None,
     python_executable: Path | None = None,
 ) -> dict[str, Any]:
     """Build concrete follow-up commands from a machine-readable follow-up plan."""
@@ -531,8 +721,10 @@ def build_bubble_runtime_followup_run_plan(
     out_base = out_root or repo / "devtools" / "benchmark_evidence" / "bubble_runtime"
     python = python_executable or _default_python_executable(repo)
     default_source = source_data or repo / "sucai" / "6_lulu"
+    inventory_newbie_source = _selected_newbie_source_from_inventory(warm_cache_inventory)
     default_newbie_source = (
         newbie_source_data
+        or inventory_newbie_source
         or repo
         / "devtools"
         / "benchmark_evidence"
@@ -545,10 +737,27 @@ def build_bubble_runtime_followup_run_plan(
     families.update(_scout_guidance_families(_mapping(source_axis_scout)))
     family_policies = _ensure_default_policies(_family_policy(followup_plan), families)
     commands: list[dict[str, Any]] = []
+    natural_load_gpu_rerun_plans = _natural_load_gpu_rerun_plans(
+        repo,
+        followup_plan,
+        source_data=default_source,
+        newbie_source_data=default_newbie_source,
+        out_root=out_base,
+        python_executable=python,
+    )
+    commands.extend(natural_load_gpu_rerun_plans)
     if "sdxl" in families:
         commands.extend(_sdxl_plans(repo, default_source, out_base, python))
     if "newbie" in families:
-        commands.extend(_newbie_plans(repo, default_newbie_source, out_base, python))
+        commands.extend(
+            _newbie_plans(
+                repo,
+                default_newbie_source,
+                out_base,
+                python,
+                warm_cache_inventory=warm_cache_inventory if inventory_newbie_source is not None else None,
+            )
+        )
     scout_plans = build_source_axis_scout_plans(
         repo,
         _mapping(source_axis_scout),
@@ -580,6 +789,7 @@ def build_bubble_runtime_followup_run_plan(
         item["do_not_rerun_without_new_axis"] = bool(existing["completed"])
     scaffolds = _aggressive_scaffolds(families, family_policies)
     completed_existing_command_count = sum(1 for item in commands if item["existing_evidence"]["completed"])
+    execution_surface = _execution_surface_summary(commands)
     unsafe_command_ids = [
         str(item.get("id") or "")
         for item in commands
@@ -618,6 +828,7 @@ def build_bubble_runtime_followup_run_plan(
         "rerun_blocked_without_new_axis_count": sum(
             1 for item in commands if item.get("do_not_rerun_without_new_axis")
         ),
+        **execution_surface,
         "requires_gpu": bool(commands),
         "safe_to_auto_start": False,
         "release_claim_allowed_after_success_command_count": sum(
@@ -631,6 +842,7 @@ def build_bubble_runtime_followup_run_plan(
         "unsafe_scaffold_count": len(unsafe_scaffold_ids),
         "unsafe_scaffold_ids": unsafe_scaffold_ids,
         "contract_ok": not unsafe_command_ids and not unsafe_scaffold_ids,
+        "natural_load_gpu_rerun_command_count": len(natural_load_gpu_rerun_plans),
         "source_axis_scout_command_count": len(scout_plans),
         "source_axis_scout_guidance_count": len(scout_guidance),
         "source_axis_scout_report": str(_mapping(source_axis_scout).get("report") or ""),

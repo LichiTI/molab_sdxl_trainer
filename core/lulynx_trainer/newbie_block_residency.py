@@ -8,10 +8,12 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from .dit_residency_planner import (
-    build_dit_residency_plan,
+from .dit_block_prefetch_controller import (
     clear_dit_block_prefetch_controller,
     install_dit_block_prefetch_controller,
+)
+from .dit_residency_planner import (
+    build_dit_residency_plan,
     normalize_dit_block_residency,
 )
 from .native_unet.weight_residency import LulynxManagedLinear

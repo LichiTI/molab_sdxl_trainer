@@ -27,7 +27,7 @@ ARTIFACT_DIR = REPO_ROOT / "temp" / "turbocore_optimizer"
 RELEASE_PACKAGE_ARTIFACT = ARTIFACT_DIR / "native_update_release_review_package.json"
 OWNER_HANDOFF_ARTIFACT = ARTIFACT_DIR / "native_update_owner_release_handoff_summary.json"
 ARTIFACT = ARTIFACT_DIR / "native_update_owner_release_review_packet.json"
-ROADMAP = "devtools/docs/turbocore_optimizer_backend_design.md"
+ROADMAP = "devtools/docs/turbocore_optimizer_backend_design_v2.md"
 
 
 def build_native_update_owner_release_review_packet(

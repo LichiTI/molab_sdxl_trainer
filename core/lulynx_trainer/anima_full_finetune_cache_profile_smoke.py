@@ -35,13 +35,10 @@ from backend.core.lulynx_trainer.run_manifest import manifest_path_for
 from backend.lulynx_launcher.services.training_registry import LulynxTrainingRegistry
 from backend.lulynx_launcher.services.training_route_service import TrainingRouteService
 
-
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
-
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +268,7 @@ class ProfileRunner:
         native_block_count: int,
         prefetch: bool,
         prefetch_depth: int,
+        prefetch_mode: str,
         pcie_transfer_format: str,
         sparse_swap: bool,
         optimizer_type: str,
@@ -303,6 +301,7 @@ class ProfileRunner:
             "anima_block_residency": residency,
             "anima_block_prefetch": bool(prefetch),
             "anima_block_prefetch_depth": max(int(prefetch_depth or 1), 0),
+            "anima_block_prefetch_mode": str(prefetch_mode or "original"),
             "pcie_transfer_format": str(pcie_transfer_format or "off"),
             "sparse_swap_enabled": bool(sparse_swap),
             "sparse_swap_warm_fraction": 0.35,
@@ -364,6 +363,7 @@ class ProfileRunner:
         native_block_count: int,
         prefetch: bool,
         prefetch_depth: int,
+        prefetch_mode: str,
         pcie_transfer_format: str,
         sparse_swap: bool,
         optimizer_type: str,
@@ -388,6 +388,7 @@ class ProfileRunner:
             native_block_count=native_block_count,
             prefetch=prefetch,
             prefetch_depth=prefetch_depth,
+            prefetch_mode=prefetch_mode,
             pcie_transfer_format=pcie_transfer_format,
             sparse_swap=sparse_swap,
             optimizer_type=optimizer_type,
@@ -481,6 +482,7 @@ def main() -> int:
     parser.add_argument("--native-block-count", type=int, default=1, help="number of native Anima DiT blocks to load")
     parser.add_argument("--prefetch", action="store_true", help="enable Anima streaming prefetch")
     parser.add_argument("--prefetch-depth", type=int, default=1, help="Anima streaming prefetch depth")
+    parser.add_argument("--prefetch-mode", default="original", choices=("original", "adaptive"), help="Anima streaming prefetch policy")
     parser.add_argument("--pcie-transfer-format", default="off", help="experimental PCIe transfer format")
     parser.add_argument("--sparse-swap", action="store_true", help="enable sparse swap planning")
     parser.add_argument("--optimizer-type", default="AdamW", help="optimizer type, e.g. AdamW or AnimaFactoredAdamW")
@@ -539,6 +541,7 @@ def main() -> int:
             native_block_count=int(args.native_block_count or 1),
             prefetch=bool(args.prefetch),
             prefetch_depth=int(args.prefetch_depth or 1),
+            prefetch_mode=str(args.prefetch_mode or "original"),
             pcie_transfer_format=str(args.pcie_transfer_format or "off"),
             sparse_swap=bool(args.sparse_swap),
             optimizer_type=str(args.optimizer_type or "AdamW"),
@@ -572,6 +575,7 @@ def main() -> int:
         "native_block_count": int(args.native_block_count or 1),
         "prefetch": bool(args.prefetch),
         "prefetch_depth": int(args.prefetch_depth or 1),
+        "prefetch_mode": str(args.prefetch_mode or "original"),
         "pcie_transfer_format": str(args.pcie_transfer_format or "off"),
         "sparse_swap": bool(args.sparse_swap),
         "optimizer_type": str(args.optimizer_type or "AdamW"),
@@ -591,7 +595,6 @@ def main() -> int:
     _write_json(profile_root / "cache_profile_summary.json", summary)
     print(f"[profile] summary={profile_root / 'cache_profile_summary.json'}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

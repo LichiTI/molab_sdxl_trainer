@@ -266,7 +266,15 @@ def run_smoke() -> dict[str, Any]:
         "probe": "native_training_performance_p6_audit_smoke",
         "ok": True,
         "milestone_completed": audit["milestone_completed"],
+        "p6_ready_gate_count": int(audit["summary"]["ready_gate_count"]),
+        "p6_required_gate_count": int(audit["summary"]["required_gate_count"]),
+        "p6_remaining_blocker_count": int(audit["summary"]["remaining_blocker_count"]),
+        "p6_milestone_completed_count": int(bool(audit["milestone_completed"])),
+        "p6_section_count": len(audit["sections"]),
+        "p6_required_promotion_count": len(audit["required_promotions"]),
+        "p6_remaining_blockers": list(audit["remaining_blockers"]),
         "recommended_next_step": audit["summary"]["recommended_next_step"],
+        "p6_recommended_next_step": audit["summary"]["recommended_next_step"],
     }
 
 

@@ -27,6 +27,9 @@ class SimpleOptimizerTrainingExecutorConfig:
     lr: float = 1e-3
     betas: tuple[float, float] = (0.9, 0.99)
     momentum: float = 0.9
+    centered: bool = False
+    derivative: float = 10.0
+    integral: float = 5.0
     nu: float = 1.0
     kappa: float = 1000.0
     xi: float = 10.0
@@ -37,6 +40,12 @@ class SimpleOptimizerTrainingExecutorConfig:
     trust_coefficient: float = 1e-3
     dampening: float = 0.0
     weight_decay: float = 0.0
+    weight_decouple: bool = True
+    fixed_decay: bool = False
+    delta: float = 0.1
+    wd_ratio: float = 0.1
+    nesterov: bool = False
+    p_bound: float = 0.0
     block_size: int = 128
     require_native_cuda: bool = True
 
@@ -59,11 +68,18 @@ class SimpleOptimizerTrainingExecutor:
         self.layout = _layout(self.params)
         self.param_flat = _flatten_params(self.params)
         self.grad_flat = torch.zeros_like(self.param_flat)
-        self.state_flat = torch.zeros_like(self.param_flat)
+        self.state_layout = _state_layout(self.config, int(self.param_flat.numel()), self.layout)
+        self.state_flat = torch.zeros(
+            int(self.state_layout[-1]["offset"] + self.state_layout[-1]["numel"]),
+            device=self.param_flat.device,
+            dtype=self.param_flat.dtype,
+        )
         self._views = _views(self.param_flat, self.layout)
         self._runtime_id: int | None = None
         self._native: Any | None = None
         self._step_index = 0
+        self._fromage_p_bound_initialized = False
+        self._refresh_optimizer_state_metadata(initialize=True)
 
     def __call__(self, request: Mapping[str, Any]) -> dict[str, Any]:
         request_payload = dict(request or {})
@@ -73,6 +89,7 @@ class SimpleOptimizerTrainingExecutor:
             return _blocked("cuda_required_for_simple_optimizer_training_executor")
         started = time.perf_counter()
         self._sync_params_and_grads()
+        self._refresh_optimizer_state_metadata(initialize=False)
         sync_ms = _elapsed_ms(started)
         native = self._load_native()
         if native is None:
@@ -135,6 +152,20 @@ class SimpleOptimizerTrainingExecutor:
         grads = [param.grad for param in self.params]
         self.grad_flat.copy_(_flatten_tensors([grad if grad is not None else torch.zeros_like(param) for param, grad in zip(self.params, grads)]))
 
+    def _refresh_optimizer_state_metadata(self, *, initialize: bool) -> None:
+        if self.config.optimizer_kind == "fromage":
+            _refresh_fromage_state_metadata(
+                config=self.config,
+                state_flat=self.state_flat,
+                state_layout=self.state_layout,
+                layout=self.layout,
+                param_flat=self.param_flat,
+                grad_flat=self.grad_flat,
+                initialize_p_bound=initialize and not self._fromage_p_bound_initialized,
+            )
+            if initialize:
+                self._fromage_p_bound_initialized = True
+
     def _load_native(self) -> Any | None:
         if self._native is None:
             self._native = native_with_entrypoints(*ENTRYPOINTS)
@@ -159,9 +190,13 @@ class SimpleOptimizerTrainingExecutor:
 
     def _launch_config(self) -> dict[str, Any]:
         return {
+            "optimizer_kind": self.config.optimizer_kind,
             "lr": float(self.config.lr),
             "betas": [float(self.config.betas[0]), float(self.config.betas[1])],
             "momentum": float(self.config.momentum),
+            "centered": bool(self.config.centered),
+            "derivative": float(self.config.derivative),
+            "integral": float(self.config.integral),
             "nu": float(self.config.nu),
             "kappa": float(self.config.kappa),
             "xi": float(self.config.xi),
@@ -172,11 +207,24 @@ class SimpleOptimizerTrainingExecutor:
             "trust_coefficient": float(self.config.trust_coefficient),
             "dampening": float(self.config.dampening),
             "weight_decay": float(self.config.weight_decay),
+            "weight_decouple": bool(self.config.weight_decouple),
+            "fixed_decay": bool(self.config.fixed_decay),
+            "delta": float(self.config.delta),
+            "wd_ratio": float(self.config.wd_ratio),
+            "nesterov": bool(self.config.nesterov),
+            "p_bound": float(self.config.p_bound),
+            "per_tensor_norm": self.config.optimizer_kind == "fromage",
+            "tensor_count": len(self.layout),
+            "param_group_offsets": _param_group_offsets(self.layout),
             "param_norm": _tensor_norm(self.param_flat),
             "grad_norm": _tensor_norm(self.grad_flat),
             "grad_abs_max": _tensor_absmax(self.grad_flat),
             "step_index": int(self._step_index + 1),
             "block_size": int(self.config.block_size),
+            "parameter_numel": int(self.param_flat.numel()),
+            "state_numel": int(self.state_flat.numel()),
+            "state_roles": [str(item["role"]) for item in self.state_layout],
+            "state_layout": [dict(item) for item in self.state_layout],
             "max_numel": int(self.param_flat.numel()),
             "training_dispatch": True,
             "training_path_enabled": True,
@@ -226,6 +274,9 @@ def _normalize_config(value: SimpleOptimizerTrainingExecutorConfig | Mapping[str
         lr=float(payload.get("lr", 1e-3)),
         betas=(float(betas[0]), float(betas[1])),
         momentum=float(payload.get("momentum", 0.9)),
+        centered=bool(payload.get("centered", False)),
+        derivative=float(payload.get("derivative", 10.0)),
+        integral=float(payload.get("integral", 5.0)),
         nu=float(payload.get("nu", 1.0)),
         kappa=float(payload.get("kappa", 1000.0)),
         xi=float(payload.get("xi", 10.0)),
@@ -236,6 +287,12 @@ def _normalize_config(value: SimpleOptimizerTrainingExecutorConfig | Mapping[str
         trust_coefficient=float(payload.get("trust_coefficient", 1e-3)),
         dampening=float(payload.get("dampening", 0.0)),
         weight_decay=float(payload.get("weight_decay", 0.0)),
+        weight_decouple=bool(payload.get("weight_decouple", True)),
+        fixed_decay=bool(payload.get("fixed_decay", False)),
+        delta=float(payload.get("delta", 0.1)),
+        wd_ratio=float(payload.get("wd_ratio", 0.1)),
+        nesterov=bool(payload.get("nesterov", False)),
+        p_bound=float(payload.get("p_bound", 0.0) or 0.0),
         block_size=int(payload.get("block_size", 128)),
         require_native_cuda=bool(payload.get("require_native_cuda", True)),
     )
@@ -253,6 +310,116 @@ def _layout(params: list[torch.Tensor]) -> list[tuple[tuple[int, ...], int, int]
 
 def _views(flat: torch.Tensor, layout: list[tuple[tuple[int, ...], int, int]]) -> list[torch.Tensor]:
     return [flat[offset : offset + count].view(shape) for shape, offset, count in layout]
+
+
+def _state_layout(
+    config: SimpleOptimizerTrainingExecutorConfig,
+    parameter_numel: int,
+    layout: list[tuple[tuple[int, ...], int, int]],
+) -> list[dict[str, int | str]]:
+    if config.optimizer_kind == "fromage":
+        tensor_count = len(layout)
+        sizes = [
+            ("param_group_offsets", tensor_count + 1),
+            ("per_tensor_param_norm", tensor_count),
+            ("per_tensor_grad_norm", tensor_count),
+            ("p_bound", tensor_count),
+            ("per_tensor_post_norm", tensor_count),
+        ]
+        offset = 0
+        rows: list[dict[str, int | str]] = []
+        for role, numel in sizes:
+            rows.append({"role": role, "offset": offset, "numel": numel})
+            offset += numel
+        return rows
+    roles = _state_roles(config)
+    return [
+        {"role": role, "offset": index * parameter_numel, "numel": parameter_numel}
+        for index, role in enumerate(roles)
+    ]
+
+
+def _state_roles(config: SimpleOptimizerTrainingExecutorConfig) -> list[str]:
+    if config.optimizer_kind == "rmsprop":
+        roles = ["square_avg"]
+        if config.centered:
+            roles.append("grad_avg")
+        if float(config.momentum) != 0.0:
+            roles.append("momentum_buffer")
+        return roles
+    if config.optimizer_kind == "pid" and float(config.momentum) > 0.0:
+        return ["integral_buffer", "previous_grad", "momentum_buffer"]
+    if config.optimizer_kind == "sgdp":
+        return ["momentum"]
+    return ["state_flat"]
+
+
+def _param_group_offsets(layout: list[tuple[tuple[int, ...], int, int]]) -> list[int]:
+    if not layout:
+        return [0]
+    offsets = [int(offset) for _, offset, _ in layout]
+    last_offset = int(layout[-1][1])
+    last_numel = int(layout[-1][2])
+    offsets.append(last_offset + last_numel)
+    return offsets
+
+
+def _state_entry(state_layout: list[dict[str, int | str]], role: str) -> dict[str, int | str]:
+    for item in state_layout:
+        if item["role"] == role:
+            return item
+    raise KeyError(role)
+
+
+def _refresh_fromage_state_metadata(
+    *,
+    config: SimpleOptimizerTrainingExecutorConfig,
+    state_flat: torch.Tensor,
+    state_layout: list[dict[str, int | str]],
+    layout: list[tuple[tuple[int, ...], int, int]],
+    param_flat: torch.Tensor,
+    grad_flat: torch.Tensor,
+    initialize_p_bound: bool,
+) -> None:
+    tensor_count = len(layout)
+    offsets = _param_group_offsets(layout)
+    with torch.no_grad():
+        _copy_state_values(state_flat, state_layout, "param_group_offsets", offsets)
+        _copy_state_values(
+            state_flat,
+            state_layout,
+            "per_tensor_param_norm",
+            [_tensor_norm(param_flat[offset : offset + count]) for _, offset, count in layout],
+        )
+        _copy_state_values(
+            state_flat,
+            state_layout,
+            "per_tensor_grad_norm",
+            [_tensor_norm(grad_flat[offset : offset + count]) for _, offset, count in layout],
+        )
+        _copy_state_values(state_flat, state_layout, "per_tensor_post_norm", [0.0] * tensor_count)
+        if initialize_p_bound:
+            p_bound_values = [0.0] * tensor_count
+            if float(config.p_bound) > 0.0:
+                p_bound_values = [
+                    _tensor_norm(param_flat[offset : offset + count]) * float(config.p_bound)
+                    for _, offset, count in layout
+                ]
+            _copy_state_values(state_flat, state_layout, "p_bound", p_bound_values)
+
+
+def _copy_state_values(
+    state_flat: torch.Tensor,
+    state_layout: list[dict[str, int | str]],
+    role: str,
+    values: list[float | int],
+) -> None:
+    entry = _state_entry(state_layout, role)
+    offset = int(entry["offset"])
+    numel = int(entry["numel"])
+    state_flat[offset : offset + numel].copy_(
+        torch.tensor(values[:numel], device=state_flat.device, dtype=state_flat.dtype)
+    )
 
 
 def _flatten_params(params: list[torch.Tensor]) -> torch.Tensor:

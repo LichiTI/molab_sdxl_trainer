@@ -85,48 +85,48 @@ class LoRASurgeon:
         try:
             with safe_open(tuned_model_path, framework="pt", device="cpu") as f_tuned, \
                  safe_open(base_model_path, framework="pt", device="cpu") as f_base:
-                
+
                 keys_tuned = set(f_tuned.keys())
                 keys_base = set(f_base.keys())
-            common_keys = keys_tuned.intersection(keys_base)
-            
-            # 筛选 Linear 和 Conv 层
-            target_keys = [k for k in common_keys if "weight" in k and ("attn" in k or "ff" in k or "proj" in k or "conv" in k)]
-            
-            for key in tqdm(target_keys, desc="Extracting Layers"):
-                # 1. 逐层加载到 GPU (或指定设备)
-                w_tuned = f_tuned.get_tensor(key).to(device)
-                w_base = f_base.get_tensor(key).to(device)
-                
-                # 2. 计算差分
-                w_diff = w_tuned - w_base
-                
-                # 释放原始权重
-                del w_tuned, w_base
-                
-                # 3. SVD 分解提取 LoRA
-                # key 转换: model.diffusion_model.output_blocks... -> lora_unet_output_blocks...
-                lora_key_base = key.replace(".weight", "").replace(".", "_")
-                # 简单命名规则适配 (需根据具体架构调整，这里做通用处理)
-                if "text_model" in key:
-                    lora_prefix = "lora_te_" + lora_key_base
-                else:
-                    lora_prefix = "lora_unet_" + lora_key_base
-                
-                try:
-                    lora_down, lora_up = self._get_svd_lora(w_diff, rank)
-                    
-                    lora_state_dict[f"{lora_prefix}.lora_down.weight"] = lora_down.cpu()
-                    lora_state_dict[f"{lora_prefix}.lora_up.weight"] = lora_up.cpu()
-                    lora_state_dict[f"{lora_prefix}.alpha"] = torch.tensor(float(rank)) # 通常 alpha=rank
-                    
-                except Exception as e:
-                    logger.warning(f"Skipping layer {key} due to error: {e}")
-                
-                # 清理显存
-                del w_diff
-                torch.cuda.empty_cache()
-                
+                common_keys = keys_tuned.intersection(keys_base)
+
+                # 筛选 Linear 和 Conv 层
+                target_keys = [k for k in common_keys if "weight" in k and ("attn" in k or "ff" in k or "proj" in k or "conv" in k)]
+
+                for key in tqdm(target_keys, desc="Extracting Layers"):
+                    # 1. 逐层加载到 GPU (或指定设备)
+                    w_tuned = f_tuned.get_tensor(key).to(device)
+                    w_base = f_base.get_tensor(key).to(device)
+
+                    # 2. 计算差分
+                    w_diff = w_tuned - w_base
+
+                    # 释放原始权重
+                    del w_tuned, w_base
+
+                    # 3. SVD 分解提取 LoRA
+                    # key 转换: model.diffusion_model.output_blocks... -> lora_unet_output_blocks...
+                    lora_key_base = key.replace(".weight", "").replace(".", "_")
+                    # 简单命名规则适配 (需根据具体架构调整，这里做通用处理)
+                    if "text_model" in key:
+                        lora_prefix = "lora_te_" + lora_key_base
+                    else:
+                        lora_prefix = "lora_unet_" + lora_key_base
+
+                    try:
+                        lora_down, lora_up = self._get_svd_lora(w_diff, rank)
+
+                        lora_state_dict[f"{lora_prefix}.lora_down.weight"] = lora_down.cpu()
+                        lora_state_dict[f"{lora_prefix}.lora_up.weight"] = lora_up.cpu()
+                        lora_state_dict[f"{lora_prefix}.alpha"] = torch.tensor(float(rank)) # 通常 alpha=rank
+
+                    except Exception as e:
+                        logger.warning(f"Skipping layer {key} due to error: {e}")
+
+                    # 清理显存
+                    del w_diff
+                    torch.cuda.empty_cache()
+
         except Exception as e:
             logger.error(f"Failed to extract LoRA: {e}")
             raise
@@ -165,58 +165,63 @@ class LoRASurgeon:
                 modules.add(k.split(".lora_up")[0])
                 
         new_state_dict = {}
-        
+
+        def resolve_mix(module: str) -> tuple[float, float]:
+            """Resolve per-layer mix weights; supports float (ratio-B) and
+            {"alpha_a": x, "alpha_b": y} entries (used by merge_loras_lbw)."""
+            if layer_weights:
+                for k, v in layer_weights.items():
+                    if k in module:  # 模糊匹配: "input_blocks.1" in "lora_unet_input_blocks_1_..."
+                        if isinstance(v, dict):
+                            return float(v.get("alpha_a", alpha_a)), float(v.get("alpha_b", alpha_b))
+                        return 1.0 - float(v), float(v)  # UI weight usually means Ratio B
+            return alpha_a, alpha_b
+
         for module in tqdm(modules, desc="Merging LoRA Layers"):
             # 获取权重
             up_a = state_a.get(f"{module}.lora_up.weight")
             down_a = state_a.get(f"{module}.lora_down.weight")
-            
+
             up_b = state_b.get(f"{module}.lora_up.weight")
             down_b = state_b.get(f"{module}.lora_down.weight")
-            
+
+            curr_alpha_a, curr_alpha_b = resolve_mix(module)
+
             if up_a is None or down_a is None:
-                # 只有 B 有
-                if up_b is not None:
-                    new_state_dict[f"{module}.lora_up.weight"] = up_b
+                # 只有 B 有：按混合权重缩放 up，保留原 alpha，保持与双边模块一致的强度语义
+                if up_b is not None and down_b is not None:
+                    new_state_dict[f"{module}.lora_up.weight"] = (up_b.float() * curr_alpha_b).to(up_b.dtype)
                     new_state_dict[f"{module}.lora_down.weight"] = down_b
-                    new_state_dict[f"{module}.alpha"] = state_b.get(f"{module}.alpha", torch.tensor(rank))
+                    new_state_dict[f"{module}.alpha"] = state_b.get(f"{module}.alpha", torch.tensor(float(down_b.shape[0])))
                 continue
-                
+
             if up_b is None or down_b is None:
                 # 只有 A 有
-                new_state_dict[f"{module}.lora_up.weight"] = up_a
+                new_state_dict[f"{module}.lora_up.weight"] = (up_a.float() * curr_alpha_a).to(up_a.dtype)
                 new_state_dict[f"{module}.lora_down.weight"] = down_a
-                new_state_dict[f"{module}.alpha"] = state_a.get(f"{module}.alpha", torch.tensor(rank))
+                new_state_dict[f"{module}.alpha"] = state_a.get(f"{module}.alpha", torch.tensor(float(down_a.shape[0])))
                 continue
 
             # 两者都有，进行 SVD 融合
-            # 1. 重建 Dense 权重 W = B @ A
+            # 1. 重建有效 Dense 权重 W_eff = (alpha / rank) * (B @ A)
             # 注意处理 Conv2d 和 Linear 的维度差异
-            def reconstruct(up, down):
+            def reconstruct(up, down, state, mod):
+                rank_dim = down.shape[0]
+                alpha_t = state.get(f"{mod}.alpha")
+                scale = (float(alpha_t) / float(rank_dim)) if alpha_t is not None else 1.0
                 if up.ndim == 4: # Conv2d
-                    # Up: (out, rank, 1, 1) -> (out, rank)
+                    # Up: (out, rank, 1, 1) -> (out, rank)   (reshape 而非 squeeze，rank=1 时不塌缩)
                     # Down: (rank, in, k, k) -> (rank, in*k*k)
-                    up_mat = up.squeeze()
+                    up_mat = up.reshape(up.shape[0], up.shape[1])
                     down_mat = down.reshape(down.shape[0], -1)
-                    w = up_mat @ down_mat
+                    w = (up_mat @ down_mat) * scale
                     return w, (up.shape[0], down.shape[1], down.shape[2], down.shape[3]) # return target shape
                 else: # Linear
-                    w = up @ down
+                    w = (up @ down) * scale
                     return w, w.shape
-            
-            # 决定当前层的 alpha (支持 layer_weights)
-            # 简化的 layer matching 逻辑，需要根据 module name 匹配 layer_weights key
-            curr_alpha_a = alpha_a
-            curr_alpha_b = alpha_b
-            if layer_weights:
-                for k, v in layer_weights.items():
-                    if k in module: # 模糊匹配: "input_blocks.1" in "lora_unet_input_blocks_1_..."
-                        curr_alpha_a = 1.0 - v # UI weight usually means Ratio B
-                        curr_alpha_b = v
-                        break
 
-            w_a, shape_a = reconstruct(up_a.float().to(self.device), down_a.float().to(self.device))
-            w_b, shape_b = reconstruct(up_b.float().to(self.device), down_b.float().to(self.device))
+            w_a, shape_a = reconstruct(up_a.float().to(self.device), down_a.float().to(self.device), state_a, module)
+            w_b, shape_b = reconstruct(up_b.float().to(self.device), down_b.float().to(self.device), state_b, module)
             
             # 2. 混合
             w_merged = w_a * curr_alpha_a + w_b * curr_alpha_b
@@ -233,10 +238,11 @@ class LoRASurgeon:
             w_merged_view = w_merged.reshape(shape_a)
             
             new_down, new_up = self._get_svd_lora(w_merged_view, rank)
-            
+
             new_state_dict[f"{module}.lora_up.weight"] = new_up.cpu()
             new_state_dict[f"{module}.lora_down.weight"] = new_down.cpu()
-            new_state_dict[f"{module}.alpha"] = torch.tensor(float(rank))
+            # w_merged 已是有效(alpha 缩放后)增量，alpha=实际 rank 使 scale=1.0
+            new_state_dict[f"{module}.alpha"] = torch.tensor(float(new_down.shape[0]))
             
             del w_merged, w_merged_view, new_down, new_up
             torch.cuda.empty_cache()
@@ -321,7 +327,7 @@ class LoRASurgeon:
                         # Reconstruct delta
                         # Conv2d handling
                         if up.ndim == 4:
-                            up = up.squeeze()
+                            up = up.reshape(up.shape[0], up.shape[1])  # rank=1 时 squeeze 会塌缩维度，用 reshape
                             down = down.reshape(down.shape[0], -1)
                             delta = (up @ down).reshape(w_base.shape)
                         else:

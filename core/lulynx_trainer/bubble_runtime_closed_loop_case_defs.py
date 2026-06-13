@@ -37,6 +37,8 @@ def _base_args(
     resolution: int,
     batch: int,
     workers: int,
+    seed: int = 1337,
+    checkpoint_policy: str = "",
     dataloader_prefetch_factor: int = 2,
     pin_memory: bool = True,
     phase_profile: bool = True,
@@ -51,6 +53,37 @@ def _base_args(
     controlled_rollback_slowdown_ratio: float = 1.0,
     controlled_rollback_after_apply_steps: int = 1,
     native_cache_mode: str = "",
+    newbie_latent_crop_size: int | None = None,
+    newbie_block_checkpointing: bool = False,
+    newbie_block_checkpointing_mode: str = "block",
+    lora_activation_recompute: str = "",
+    torch_compile: bool = False,
+    torch_compile_scope: str = "per_block",
+    torch_compile_mode: str = "default",
+    newbie_disable_safe_fallback: bool = False,
+    newbie_backward_op_profile: bool = False,
+    newbie_backward_op_profile_top_k: int = 12,
+    newbie_backward_op_profile_max_samples: int = 1,
+    newbie_backward_op_profile_shapes: bool = False,
+    newbie_module_timing_profile: bool = False,
+    newbie_module_timing_profile_top_k: int = 12,
+    newbie_module_timing_profile_max_samples: int = 1,
+    newbie_target_scope: str = "",
+    dit_compute_reducer_strategy: str = "",
+    dit_compute_reducer_keep_ratio: float = 1.0,
+    dit_compute_reducer_min_keep_tokens: int = 1,
+    dit_compute_reducer_compression_ratio: float = 1.0,
+    dit_compute_reducer_min_tokens: int = 1,
+    dit_compute_reducer_skip_ratio: float = 0.0,
+    dit_compute_reducer_skip_every: int = 0,
+    dit_compute_reducer_warmup_steps: int = 0,
+    dit_compute_reducer_min_block: int = 0,
+    dit_compute_reducer_score_mode: str = "l2",
+    triton_ops: bool = False,
+    triton_ops_inject_lora: bool = True,
+    triton_ops_inject_qkv: bool = True,
+    triton_ops_inject_adaln: bool = True,
+    triton_ops_fp32_backward: bool = False,
 ) -> tuple[str, ...]:
     args = [
         "--family",
@@ -85,6 +118,11 @@ def _base_args(
         "--bubble-controller-min-throughput-gain",
         "0.0",
     ]
+    if int(seed) != 1337:
+        args.extend(["--seed", str(max(int(seed), 0))])
+    checkpoint_policy_value = str(checkpoint_policy or "").strip().lower().replace("-", "_")
+    if checkpoint_policy_value in {"auto", "off", "full", "offloaded", "selective"}:
+        args.extend(["--checkpoint-policy", checkpoint_policy_value])
     if phase_profile:
         args.append("--phase-profile")
     if not pin_memory:
@@ -101,6 +139,104 @@ def _base_args(
         args.append("--bubble-controller-allow-dataloader-rebuild-current-run")
     if native_cache_mode:
         args.extend(["--native-cache-mode", str(native_cache_mode)])
+    if family == "newbie" and newbie_latent_crop_size is not None:
+        args.extend(["--newbie-latent-crop-size", str(max(int(newbie_latent_crop_size), 0))])
+    if family == "newbie" and bool(newbie_block_checkpointing):
+        args.append("--newbie-block-checkpointing")
+        checkpoint_mode = str(newbie_block_checkpointing_mode or "block").strip().lower().replace("-", "_")
+        if checkpoint_mode != "block":
+            checkpoint_mode = "block"
+        args.extend(["--newbie-block-checkpointing-mode", checkpoint_mode])
+    if family == "newbie" and bool(newbie_disable_safe_fallback):
+        args.append("--newbie-disable-safe-fallback")
+    if family == "newbie" and bool(newbie_backward_op_profile):
+        args.extend(
+            [
+                "--newbie-backward-op-profile",
+                "--newbie-backward-op-profile-top-k",
+                str(max(int(newbie_backward_op_profile_top_k), 1)),
+                "--newbie-backward-op-profile-max-samples",
+                str(max(int(newbie_backward_op_profile_max_samples), 1)),
+            ]
+        )
+        if bool(newbie_backward_op_profile_shapes):
+            args.append("--newbie-backward-op-profile-shapes")
+    if family == "newbie" and bool(newbie_module_timing_profile):
+        args.extend(
+            [
+                "--newbie-module-timing-profile",
+                "--newbie-module-timing-profile-top-k",
+                str(max(int(newbie_module_timing_profile_top_k), 1)),
+                "--newbie-module-timing-profile-max-samples",
+                str(max(int(newbie_module_timing_profile_max_samples), 1)),
+            ]
+        )
+    if family == "newbie" and str(newbie_target_scope or "").strip():
+        args.extend(["--newbie-target-scope", str(newbie_target_scope).strip()])
+    reducer_strategy = str(dit_compute_reducer_strategy or "").strip().lower().replace("-", "")
+    if family == "newbie" and reducer_strategy in {"tread", "diffcr", "blockskip"}:
+        args.extend(["--dit-compute-reducer-strategy", reducer_strategy])
+        if reducer_strategy == "tread":
+            args.extend(
+                [
+                    "--dit-compute-reducer-keep-ratio",
+                    str(min(max(float(dit_compute_reducer_keep_ratio), 0.0), 1.0)),
+                    "--dit-compute-reducer-min-keep-tokens",
+                    str(max(int(dit_compute_reducer_min_keep_tokens), 1)),
+                ]
+            )
+        elif reducer_strategy == "diffcr":
+            args.extend(
+                [
+                    "--dit-compute-reducer-compression-ratio",
+                    str(min(max(float(dit_compute_reducer_compression_ratio), 0.0), 1.0)),
+                    "--dit-compute-reducer-min-tokens",
+                    str(max(int(dit_compute_reducer_min_tokens), 1)),
+                ]
+            )
+        elif reducer_strategy == "blockskip":
+            args.extend(
+                [
+                    "--dit-compute-reducer-skip-ratio",
+                    str(min(max(float(dit_compute_reducer_skip_ratio), 0.0), 0.95)),
+                    "--dit-compute-reducer-skip-every",
+                    str(max(int(dit_compute_reducer_skip_every), 0)),
+                    "--dit-compute-reducer-warmup-steps",
+                    str(max(int(dit_compute_reducer_warmup_steps), 0)),
+                    "--dit-compute-reducer-min-block",
+                    str(max(int(dit_compute_reducer_min_block), 0)),
+                ]
+            )
+        args.extend(["--dit-compute-reducer-score-mode", str(dit_compute_reducer_score_mode or "l2")])
+    if bool(triton_ops):
+        args.append("--triton-ops")
+        if not bool(triton_ops_inject_lora):
+            args.append("--triton-ops-no-lora")
+        if not bool(triton_ops_inject_qkv):
+            args.append("--triton-ops-no-qkv")
+        if not bool(triton_ops_inject_adaln):
+            args.append("--triton-ops-no-adaln")
+        if bool(triton_ops_fp32_backward):
+            args.append("--triton-ops-fp32-backward")
+    recompute_mode = str(lora_activation_recompute or "").strip().lower()
+    if recompute_mode in {"auto", "on", "off"}:
+        args.extend(["--lora-activation-recompute", recompute_mode])
+    if torch_compile:
+        compile_scope = str(torch_compile_scope or "per_block").strip().lower().replace("-", "_")
+        if compile_scope not in {"per_block", "full", "full_core"}:
+            compile_scope = "per_block"
+        compile_mode = str(torch_compile_mode or "default").strip().lower()
+        if compile_mode not in {"default", "reduce-overhead", "max-autotune"}:
+            compile_mode = "default"
+        args.extend(
+            [
+                "--torch-compile",
+                "--torch-compile-scope",
+                compile_scope,
+                "--torch-compile-mode",
+                compile_mode,
+            ]
+        )
     if float(controlled_data_wait_share) > 0.0:
         args.extend(
             [
@@ -352,6 +488,956 @@ def _cache_miss_guard_cases() -> list[BubbleClosedLoopCase]:
     ]
 
 
+def _newbie_heavy_raw_cases() -> list[BubbleClosedLoopCase]:
+    return [
+        BubbleClosedLoopCase(
+            case_id="newbie_heavy_raw_decode_mixed_sidecars_long_window_natural_data_wait_probe",
+            family="newbie",
+            description="Newbie non-cache heavy raw decode mixed-sidecar longer-window natural data-wait probe.",
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=32,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=4,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_heavy_raw_decode_mixed_sidecars_batch1_long_queue_natural_data_wait_probe",
+            family="newbie",
+            description=(
+                "Newbie non-cache heavy raw decode mixed-sidecar batch1 probe; "
+                "keeps fixture size stable while increasing observable DataLoader batches."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=6,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_long_queue_natural_data_wait_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 probe; stresses the cached DataLoader "
+                "payload instead of relying on pre-step raw PNG cache materialization."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=6,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_lora_recompute_off_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 compute probe with LoRA activation "
+                "recompute forced off; checks whether backward autograd is dominated by recompute."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=6,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                lora_activation_recompute="off",
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_block_checkpoint_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 compute probe with existing native "
+                "DiT block checkpointing enabled; validates whether recompute changes the "
+                "FFN/backward-bound gate without changing source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                newbie_block_checkpointing=True,
+                newbie_block_checkpointing_mode="block",
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_checkpoint_off_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 paired compute baseline with "
+                "checkpoint_policy=off and no reducer; isolates checkpoint-off effects "
+                "from TREAD token-routing effects."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_tread_keep50_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 protected compute probe that enables "
+                "the default-off DiT compute reducer seam with TREAD keep_ratio=0.5; "
+                "checks whether token routing can reduce the FFN/backward-bound gate "
+                "without changing source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                dit_compute_reducer_strategy="tread",
+                dit_compute_reducer_keep_ratio=0.5,
+                dit_compute_reducer_min_keep_tokens=4,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_diffcr_compress50_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 protected compute probe that enables "
+                "the default-off DiT compute reducer seam with DiffCR compression_ratio=0.5; "
+                "compares token compression against the checkpoint-off/no-reducer baseline "
+                "without changing source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                dit_compute_reducer_strategy="diffcr",
+                dit_compute_reducer_compression_ratio=0.5,
+                dit_compute_reducer_min_tokens=4,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_blockskip_skip25_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 protected compute probe that enables "
+                "the default-off DiT compute reducer seam with BlockSkip skip_ratio=0.25; "
+                "checks whether sparse block execution can reduce the base DiT FFN/attention "
+                "backward-bound gate without changing source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                dit_compute_reducer_strategy="blockskip",
+                dit_compute_reducer_skip_ratio=0.25,
+                dit_compute_reducer_skip_every=4,
+                dit_compute_reducer_warmup_steps=4,
+                dit_compute_reducer_min_block=1,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_checkpoint_off_long_window_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window paired compute baseline "
+                "with checkpoint_policy=off and no reducer; keeps the BlockSkip follow-up "
+                "comparison on the same source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_blockskip_skip25_long_window_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window protected compute probe "
+                "that repeats BlockSkip skip_ratio=0.25 against a longer checkpoint-off "
+                "baseline without changing source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                dit_compute_reducer_strategy="blockskip",
+                dit_compute_reducer_skip_ratio=0.25,
+                dit_compute_reducer_skip_every=4,
+                dit_compute_reducer_warmup_steps=4,
+                dit_compute_reducer_min_block=1,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_checkpoint_off_long_window_seed2027_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window seed2027 paired compute "
+                "baseline with checkpoint_policy=off and no reducer; starts BlockSkip "
+                "multi-seed stability evidence without changing source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                seed=2027,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_blockskip_skip25_long_window_seed2027_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window seed2027 protected "
+                "compute probe that repeats BlockSkip skip_ratio=0.25 for multi-seed "
+                "stability review without changing source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                seed=2027,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                dit_compute_reducer_strategy="blockskip",
+                dit_compute_reducer_skip_ratio=0.25,
+                dit_compute_reducer_skip_every=4,
+                dit_compute_reducer_warmup_steps=4,
+                dit_compute_reducer_min_block=1,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_blockskip_skip10_long_window_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window protected compute probe "
+                "that uses a milder BlockSkip skip_ratio=0.10 to test whether the loss gate "
+                "can improve while preserving some checkpoint-off throughput gain."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                dit_compute_reducer_strategy="blockskip",
+                dit_compute_reducer_skip_ratio=0.10,
+                dit_compute_reducer_skip_every=10,
+                dit_compute_reducer_warmup_steps=4,
+                dit_compute_reducer_min_block=1,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_blockskip_skip10_long_window_seed2027_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window seed2027 protected "
+                "compute probe that repeats the milder BlockSkip skip_ratio=0.10 quality "
+                "gate candidate without changing source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                seed=2027,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                dit_compute_reducer_strategy="blockskip",
+                dit_compute_reducer_skip_ratio=0.10,
+                dit_compute_reducer_skip_every=10,
+                dit_compute_reducer_warmup_steps=4,
+                dit_compute_reducer_min_block=1,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_blockskip_late24_skip25_long_window_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window protected compute probe "
+                "that keeps BlockSkip skip_ratio=0.25 but limits skipping to late blocks "
+                "with min_block=24 to test a more quality-preserving schedule."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                dit_compute_reducer_strategy="blockskip",
+                dit_compute_reducer_skip_ratio=0.25,
+                dit_compute_reducer_skip_every=4,
+                dit_compute_reducer_warmup_steps=4,
+                dit_compute_reducer_min_block=24,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_blockskip_late24_skip25_long_window_seed2027_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window seed2027 protected "
+                "compute probe that repeats the late-block-only BlockSkip skip_ratio=0.25 "
+                "candidate without changing source/cache/target scope."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                seed=2027,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                dit_compute_reducer_strategy="blockskip",
+                dit_compute_reducer_skip_ratio=0.25,
+                dit_compute_reducer_skip_every=4,
+                dit_compute_reducer_warmup_steps=4,
+                dit_compute_reducer_min_block=24,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_compile_per_block_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 compute probe with torch.compile "
+                "per-block enabled through the normal trainer runtime contract."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=6,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                torch_compile=True,
+                torch_compile_scope="per_block",
+                torch_compile_mode="default",
+                newbie_disable_safe_fallback=True,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_backward_op_profile_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 diagnostic probe with one torch.profiler "
+                "sample around loss.backward() to identify dominant autograd ops."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                newbie_backward_op_profile=True,
+                newbie_backward_op_profile_top_k=12,
+                newbie_backward_op_profile_max_samples=1,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_triton_lora_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 protected compute probe that enables only "
+                "the existing Triton standard-LoRA fused path, while also sampling one backward op profile."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                newbie_backward_op_profile=True,
+                newbie_backward_op_profile_top_k=12,
+                newbie_backward_op_profile_max_samples=1,
+                triton_ops=True,
+                triton_ops_inject_lora=True,
+                triton_ops_inject_qkv=False,
+                triton_ops_inject_adaln=False,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_balanced_targets_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 protected compute probe that expands "
+                "LoRA targets from the historical layer0 attention axis to the balanced "
+                "Newbie target preset, while sampling one backward op profile."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                newbie_backward_op_profile=True,
+                newbie_backward_op_profile_top_k=12,
+                newbie_backward_op_profile_max_samples=1,
+                newbie_target_scope="balanced",
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_tail8_attention_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 protected compute probe that moves "
+                "LoRA targets from the historical layer0 attention axis to the last 8 "
+                "attention blocks. This tests whether shortening frozen-backbone autograd "
+                "depth reduces the FFN/backward matmul bottleneck without using BlockSkip."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                newbie_backward_op_profile=True,
+                newbie_backward_op_profile_top_k=12,
+                newbie_backward_op_profile_max_samples=1,
+                newbie_module_timing_profile=True,
+                newbie_module_timing_profile_top_k=12,
+                newbie_module_timing_profile_max_samples=1,
+                newbie_target_scope="tail8_attention",
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_tail8_attention_long_window_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window protected compute probe "
+                "that keeps checkpoint_policy=off and moves LoRA targets to the last 8 "
+                "attention blocks without profiler overhead, pairing against the existing "
+                "checkpoint-off long-window baseline."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                newbie_target_scope="tail8_attention",
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_tail8_attention_long_window_seed2027_compute_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 longer-window seed2027 protected "
+                "compute probe that repeats the tail8 attention target-depth candidate "
+                "without profiler overhead, reducer, Triton, compile, or target-scope "
+                "changes beyond the late attention target placement."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=48,
+                warmup=8,
+                tune_interval=8,
+                samples=8,
+                resolution=64,
+                batch=1,
+                seed=2027,
+                workers=0,
+                checkpoint_policy="off",
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                newbie_target_scope="tail8_attention",
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_backward_shape_profile_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 diagnostic probe that records compact "
+                "input-shape groups for backward matmul attribution."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                newbie_backward_op_profile=True,
+                newbie_backward_op_profile_top_k=12,
+                newbie_backward_op_profile_max_samples=1,
+                newbie_backward_op_profile_shapes=True,
+            ),
+        ),
+        BubbleClosedLoopCase(
+            case_id="newbie_cache_first_full_latent_batch1_module_timing_profile_probe",
+            family="newbie",
+            description=(
+                "Newbie cache-first full-latent batch1 diagnostic probe that attaches temporary "
+                "module hooks to attribute FFN/attention forward and backward timing groups."
+            ),
+            expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+            source_fixture="heavy_raw_decode_mixed_sidecars_v0",
+            source_fixture_samples=8,
+            source_fixture_size=6144,
+            build_natural_data_wait_evidence=True,
+            expected_natural_data_wait_statuses=NATURAL_DATA_WAIT_PROBE_STATUSES,
+            benchmark_args=_base_args(
+                "newbie",
+                steps=24,
+                warmup=4,
+                tune_interval=6,
+                samples=8,
+                resolution=64,
+                batch=1,
+                workers=0,
+                dataloader_prefetch_factor=2,
+                phase_profile=True,
+                data_transfer_profile=True,
+                data_transfer_profile_mode="event",
+                allow_dataloader_rebuild_current_run=True,
+                max_actions_per_run=2,
+                native_cache_mode="cache_first",
+                newbie_latent_crop_size=0,
+                newbie_module_timing_profile=True,
+                newbie_module_timing_profile_top_k=12,
+                newbie_module_timing_profile_max_samples=1,
+            ),
+        ),
+    ]
+
+
 def _real_material_base_args(
     family: str,
     *,
@@ -434,10 +1520,44 @@ def build_bubble_real_material_canary_cases(
     return {case.case_id: case for case in cases}
 
 
+def _anima_saturation_boundary_case() -> BubbleClosedLoopCase:
+    return BubbleClosedLoopCase(
+        case_id="anima_saturation_boundary_cache_first_compute_case",
+        family="anima",
+        description=(
+            "Anima saturation boundary cache-first compute case with a longer steady window; "
+            "uses real-material warm cache and the protected closed-loop runner."
+        ),
+        expected_evidence_statuses=CLOSED_LOOP_PROBE_STATUSES,
+        source_fixture="real_material_canary_v0",
+        source_fixture_samples=16,
+        source_fixture_size=0,
+        source_fixture_source="sucai/6_lulu",
+        benchmark_args=_base_args(
+            "anima",
+            steps=64,
+            warmup=8,
+            tune_interval=16,
+            samples=16,
+            resolution=64,
+            batch=32,
+            workers=2,
+            dataloader_prefetch_factor=4,
+            phase_profile=True,
+            data_transfer_profile=True,
+            data_transfer_profile_mode="event",
+            allow_dataloader_rebuild_current_run=True,
+            max_actions_per_run=2,
+            native_cache_mode="cache_first",
+        ),
+    )
+
+
 def default_bubble_closed_loop_cases() -> dict[str, BubbleClosedLoopCase]:
     """Return conservative real-training closed-loop cases."""
 
     cases = [
+        _anima_saturation_boundary_case(),
         BubbleClosedLoopCase(
             case_id="anima_sync_profiler_closed_loop_smoke",
             family="anima",
@@ -575,6 +1695,7 @@ def default_bubble_closed_loop_cases() -> dict[str, BubbleClosedLoopCase]:
             ),
         ),
         *_sdxl_heavy_raw_cases(),
+        *_newbie_heavy_raw_cases(),
         *_cache_miss_guard_cases(),
     ]
     return {case.case_id: case for case in cases}

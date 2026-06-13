@@ -33,10 +33,12 @@ from turbocore_native_update_release_review_package_smoke import (  # noqa: E402
 
 def run_smoke() -> dict[str, Any]:
     artifacts = _artifact_map()
+    stable_scope = _stable_first_release_scope()
     pending_package = build_native_update_release_review_package(gate_artifacts=artifacts)
     pending_archive = build_native_update_release_review_archive(
         release_review_package=pending_package,
         owner_release_review_record={},
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert pending_archive["ok"] is False, pending_archive
@@ -69,6 +71,10 @@ def run_smoke() -> dict[str, Any]:
     ] is True, pending_archive
     assert pending_archive["owner_release_review_record_summary"]["present"] is False, pending_archive
     assert pending_archive["owner_release_review_record_summary"]["release_review_recorded"] is False, pending_archive
+    assert pending_archive["summary"]["stable_first_release_turbocore_optimizer_blocker_count"] == 0, pending_archive
+    assert pending_archive["summary"]["turbocore_optimizer_default_off_release_scope_ready_count"] == 1, pending_archive
+    assert pending_archive["summary"]["owner_release_direction_recorded_count"] == 0, pending_archive
+    assert pending_archive["summary"]["owner_release_direction_approval_recorded_count"] == 0, pending_archive
     assert "archive_review_not_recorded" in "\n".join(pending_archive["blocked_reasons"]), pending_archive
     _assert_default_off(pending_archive)
 
@@ -85,6 +91,7 @@ def run_smoke() -> dict[str, Any]:
     signed_archive = build_native_update_release_review_archive(
         release_review_package=signed_package,
         owner_release_review_record=_signed_owner_release_review_record(),
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert signed_archive["ok"] is True, signed_archive
@@ -114,7 +121,28 @@ def run_smoke() -> dict[str, Any]:
     assert signed_archive["owner_release_review_record_summary"]["present"] is True, signed_archive
     assert signed_archive["owner_release_review_record_summary"]["signed_review_valid"] is True, signed_archive
     assert signed_archive["owner_release_review_record_summary"]["release_review_recorded"] is True, signed_archive
+    assert signed_archive["summary"]["stable_first_release_turbocore_optimizer_blocker_count"] == 0, signed_archive
+    assert signed_archive["summary"]["turbocore_optimizer_default_off_release_scope_ready_count"] == 1, signed_archive
+    assert signed_archive["summary"]["owner_release_direction_recorded_count"] == 0, signed_archive
+    assert signed_archive["summary"]["owner_release_direction_approval_recorded_count"] == 0, signed_archive
     _assert_default_off(signed_archive)
+
+    signed_direction_stable_scope = json.loads(json.dumps(stable_scope))
+    signed_direction_stable_scope["summary"]["owner_release_direction_recorded_count"] = 1
+    signed_direction_stable_scope["summary"]["owner_release_direction_approval_recorded_count"] = 1
+    signed_direction_archive = build_native_update_release_review_archive(
+        release_review_package=signed_package,
+        owner_release_review_record=_signed_owner_release_review_record(),
+        stable_first_release_scope=signed_direction_stable_scope,
+        write_artifact=False,
+    )
+    assert signed_direction_archive["summary"]["owner_release_direction_recorded_count"] == 1, (
+        signed_direction_archive
+    )
+    assert signed_direction_archive["summary"]["owner_release_direction_approval_recorded_count"] == 1, (
+        signed_direction_archive
+    )
+    _assert_default_off(signed_direction_archive)
 
     unsafe_package = {
         **signed_package,
@@ -122,6 +150,7 @@ def run_smoke() -> dict[str, Any]:
     }
     unsafe_archive = build_native_update_release_review_archive(
         release_review_package=unsafe_package,
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert unsafe_archive["ok"] is False, unsafe_archive
@@ -138,6 +167,7 @@ def run_smoke() -> dict[str, Any]:
     ] = False
     incomplete_archive = build_native_update_release_review_archive(
         release_review_package=incomplete_supplemental,
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert incomplete_archive["ok"] is False, incomplete_archive
@@ -156,6 +186,7 @@ def run_smoke() -> dict[str, Any]:
     ] = False
     incomplete_multitensor_archive = build_native_update_release_review_archive(
         release_review_package=incomplete_multitensor,
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert incomplete_multitensor_archive["ok"] is False, incomplete_multitensor_archive
@@ -173,6 +204,7 @@ def run_smoke() -> dict[str, Any]:
     ] = False
     source_payload_mismatch_archive = build_native_update_release_review_archive(
         release_review_package=source_payload_mismatch,
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert source_payload_mismatch_archive["ok"] is False, source_payload_mismatch_archive
@@ -190,6 +222,7 @@ def run_smoke() -> dict[str, Any]:
     package_state_mismatch["default_off"] = False
     package_state_mismatch_archive = build_native_update_release_review_archive(
         release_review_package=package_state_mismatch,
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert package_state_mismatch_archive["ok"] is False, package_state_mismatch_archive
@@ -212,6 +245,7 @@ def run_smoke() -> dict[str, Any]:
     ]["plugin_selected_native_ready_count"] = 1
     handoff_counts_mismatch_archive = build_native_update_release_review_archive(
         release_review_package=handoff_counts_mismatch,
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert handoff_counts_mismatch_archive["ok"] is False, handoff_counts_mismatch_archive
@@ -230,6 +264,7 @@ def run_smoke() -> dict[str, Any]:
     ]["plugin_selected_native_ready_count"] = 1
     supplemental_counts_mismatch_archive = build_native_update_release_review_archive(
         release_review_package=supplemental_counts_mismatch,
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert supplemental_counts_mismatch_archive["ok"] is False, supplemental_counts_mismatch_archive
@@ -250,6 +285,7 @@ def run_smoke() -> dict[str, Any]:
     ]["source_count"] = 99
     handoff_sources_mismatch_archive = build_native_update_release_review_archive(
         release_review_package=handoff_sources_mismatch,
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert handoff_sources_mismatch_archive["ok"] is False, handoff_sources_mismatch_archive
@@ -268,6 +304,7 @@ def run_smoke() -> dict[str, Any]:
     )
     handoff_digest_mismatch_archive = build_native_update_release_review_archive(
         release_review_package=handoff_digest_mismatch,
+        stable_first_release_scope=stable_scope,
         write_artifact=False,
     )
     assert handoff_digest_mismatch_archive["ok"] is False, handoff_digest_mismatch_archive
@@ -280,9 +317,28 @@ def run_smoke() -> dict[str, Any]:
     ), handoff_digest_mismatch_archive
     _assert_default_off(handoff_digest_mismatch_archive)
 
+    unsafe_stable_scope = json.loads(json.dumps(stable_scope))
+    unsafe_stable_scope["turbocore_optimizer_default_off_release_scope_ready"] = False
+    unsafe_stable_scope["native_training_claim_allowed"] = True
+    unsafe_stable_scope["summary"]["stable_first_release_turbocore_optimizer_blocker_count"] = 1
+    unsafe_stable_archive = build_native_update_release_review_archive(
+        release_review_package=signed_package,
+        stable_first_release_scope=unsafe_stable_scope,
+        write_artifact=False,
+    )
+    assert unsafe_stable_archive["ok"] is False, unsafe_stable_archive
+    assert "stable_scope_unsafe:native_training_claim_allowed" in "\n".join(
+        unsafe_stable_archive["blocked_reasons"]
+    ), unsafe_stable_archive
+    assert "stable_first_release_blockers_present" in "\n".join(
+        unsafe_stable_archive["blocked_reasons"]
+    ), unsafe_stable_archive
+    _assert_default_off(unsafe_stable_archive)
+
     real_package = _write_real_artifact_case(artifacts)
     real_pending_archive = build_native_update_release_review_archive(
         release_review_package=real_package,
+        stable_first_release_scope=stable_scope,
         write_artifact=True,
     )
     artifact = REPO_ROOT / "temp" / "turbocore_optimizer" / "native_update_release_review_archive.json"
@@ -310,6 +366,10 @@ def run_smoke() -> dict[str, Any]:
     assert loaded["release_review_package_summary"]["optimizer_family_counts"] == real_package[
         "supplemental_gate_summaries"
     ]["optimizer_family_coverage"]["optimizer_family_counts"], loaded
+    assert loaded["summary"]["stable_first_release_turbocore_optimizer_blocker_count"] == 0, loaded
+    assert loaded["summary"]["turbocore_optimizer_default_off_release_scope_ready_count"] == 1, loaded
+    assert loaded["summary"]["owner_release_direction_recorded_count"] == 0, loaded
+    assert loaded["summary"]["owner_release_direction_approval_recorded_count"] == 0, loaded
     _assert_optimizer_family_counts(
         loaded["release_review_package_summary"]["optimizer_family_counts"],
         allow_extra=True,
@@ -321,7 +381,39 @@ def run_smoke() -> dict[str, Any]:
         "pending_decision": pending_archive["decision"],
         "signed_decision": signed_archive["decision"],
         "real_artifact_checked": True,
+        "summary": loaded["summary"],
         "recommended_next_step": signed_archive["recommended_next_step"],
+    }
+
+
+def _stable_first_release_scope() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "artifact": "turbocore_optimizer_stable_first_release_scope_v0",
+        "gate": "optimizer_stable_first_release_default_off_scope",
+        "ok": True,
+        "stable_first_release_scope": "stable_baseline_with_turbocore_optimizer_default_off",
+        "stable_first_release_blocked_by_turbocore_optimizer": False,
+        "turbocore_optimizer_default_off_release_scope_ready": True,
+        "release_claim_allowed": True,
+        "native_training_claim_allowed": False,
+        "product_exposure_allowed": False,
+        "runtime_dispatch_allowed": False,
+        "native_dispatch_allowed": False,
+        "training_path_enabled": False,
+        "blocked_reasons": [],
+        "summary": {
+            "stable_first_release_turbocore_optimizer_blocker_count": 0,
+            "turbocore_optimizer_default_off_release_scope_ready_count": 1,
+            "owner_release_approval_recorded_count": 0,
+            "owner_release_direction_recorded_count": 0,
+            "owner_release_direction_approval_recorded_count": 0,
+            "product_exposure_decision_recorded_count": 0,
+            "product_training_route_binding_ready_count": 0,
+            "run_local_adapter_staged_count": 0,
+            "runtime_config_patch_applied_count": 0,
+            "training_path_enabled_count": 0,
+        },
     }
 
 

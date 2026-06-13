@@ -27,6 +27,7 @@ class LulynxEpochIterationGuardStageExecution:
 class LulynxEpochFinalizationStageExecution:
     result: dict[str, Any]
     epoch_callback_called: bool
+    native_update_executor_synced: bool
     native_update_executor_closed: bool
     orchestrator_runtime: dict[str, Any]
 
@@ -102,7 +103,8 @@ def run_lulynx_epoch_finalization_stage_handler(
     epoch: int,
     on_epoch_end: Callable[[int, dict[str, Any]], Any] | None,
     turbocore_native_update_defer_state_sync: bool,
-    close_turbocore_native_update_training_executor: Callable[[], Any] | None,
+    sync_turbocore_native_update_training_executor_to_pytorch: Callable[[str], Any] | None = None,
+    close_turbocore_native_update_training_executor: Callable[[], Any] | None = None,
 ) -> LulynxEpochFinalizationStageExecution:
     """Finalize one train epoch and preserve callback/close ordering."""
 
@@ -111,6 +113,12 @@ def run_lulynx_epoch_finalization_stage_handler(
     if callable(on_epoch_end):
         on_epoch_end(int(epoch), {"avg_loss": result["avg_loss"]})
         callback_called = True
+    executor_synced = False
+    if bool(turbocore_native_update_defer_state_sync) and callable(
+        sync_turbocore_native_update_training_executor_to_pytorch
+    ):
+        sync_turbocore_native_update_training_executor_to_pytorch("epoch_finalization_deferred_state_sync")
+        executor_synced = True
     executor_closed = False
     if not bool(turbocore_native_update_defer_state_sync) and callable(
         close_turbocore_native_update_training_executor
@@ -120,6 +128,7 @@ def run_lulynx_epoch_finalization_stage_handler(
     return LulynxEpochFinalizationStageExecution(
         result=result,
         epoch_callback_called=callback_called,
+        native_update_executor_synced=executor_synced,
         native_update_executor_closed=executor_closed,
         orchestrator_runtime=build_lulynx_stage_orchestrator_runtime(
             executed_stage_ids=("telemetry",),
@@ -128,6 +137,7 @@ def run_lulynx_epoch_finalization_stage_handler(
             extra={
                 "steps": result["steps"],
                 "epoch_callback_called": callback_called,
+                "native_update_executor_synced": executor_synced,
                 "native_update_executor_closed": executor_closed,
             },
         ),

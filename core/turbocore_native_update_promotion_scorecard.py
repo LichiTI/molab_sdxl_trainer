@@ -13,10 +13,14 @@ from core.turbocore_native_update_performance import build_native_update_perform
 from core.turbocore_native_update_promotion_blockers import split_promotion_blockers
 from core.turbocore_native_update_readiness import build_native_update_readiness_report
 from core.turbocore_native_update_review_evidence import (
+    compact_owner_release_direction_record,
     compact_product_exposure_decision,
     compact_release_review_package,
+    compact_stable_first_release_scope,
+    owner_release_direction_record_blockers,
     product_exposure_blockers,
     release_review_blockers,
+    stable_first_release_scope_blockers,
 )
 from core.turbocore_native_update_training_executor import build_native_update_training_executor
 from core.turbocore_update_gate import TurboCoreNativeUpdateGate, build_native_update_gate_config
@@ -65,6 +69,8 @@ def build_native_update_promotion_scorecard(
         _release_review_source(context),
         _owner_release_review_record_source(context),
     )
+    owner_release_direction = _owner_release_direction_record_source(context)
+    stable_first_release_scope = _stable_first_release_scope_source(context)
     gate = TurboCoreNativeUpdateGate(
         build_native_update_gate_config(
             mode,
@@ -131,6 +137,8 @@ def build_native_update_promotion_scorecard(
         + _strings(runtime_report.get("blocked_reasons"))
         + product_exposure_blockers(product_exposure)
         + release_review_blockers(release_review)
+        + owner_release_direction_record_blockers(owner_release_direction)
+        + stable_first_release_scope_blockers(stable_first_release_scope)
         + checks["failed_checks"]
     )
     blockers = _filter_promotion_blockers(
@@ -146,6 +154,8 @@ def build_native_update_promotion_scorecard(
         runtime_report=runtime_report,
         product_exposure=product_exposure,
         release_review=release_review,
+        owner_release_direction=owner_release_direction,
+        stable_first_release_scope=stable_first_release_scope,
     )
     blocker_layers = split_promotion_blockers(
         promotion_blockers,
@@ -194,6 +204,8 @@ def build_native_update_promotion_scorecard(
         "dispatch_runtime_diagnostic_replay": diagnostic_replay_report,
         "product_exposure_decision": compact_product_exposure_decision(product_exposure),
         "release_review_package": compact_release_review_package(release_review),
+        "owner_release_direction_record": compact_owner_release_direction_record(owner_release_direction),
+        "stable_first_release_scope": compact_stable_first_release_scope(stable_first_release_scope),
         "dispatch_diagnostic_execution_plan": _compact_execution_plan(
             _as_dict(diagnostic_replay_report.get("execution_plan"))
         ),
@@ -322,6 +334,22 @@ def _release_review_source(runtime_context: Mapping[str, Any]) -> dict[str, Any]
 
 def _owner_release_review_record_source(runtime_context: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("native_update_owner_release_review_record", "owner_release_review_record"):
+        value = _as_dict(runtime_context.get(key))
+        if value:
+            return value
+    return {}
+
+
+def _owner_release_direction_record_source(runtime_context: Mapping[str, Any]) -> dict[str, Any]:
+    for key in ("native_update_owner_release_direction_record", "owner_release_direction_record"):
+        value = _as_dict(runtime_context.get(key))
+        if value:
+            return value
+    return {}
+
+
+def _stable_first_release_scope_source(runtime_context: Mapping[str, Any]) -> dict[str, Any]:
+    for key in ("turbocore_optimizer_stable_first_release_scope", "stable_first_release_scope"):
         value = _as_dict(runtime_context.get(key))
         if value:
             return value
@@ -753,6 +781,8 @@ def _promotion_blockers(
     runtime_report: Mapping[str, Any],
     product_exposure: Mapping[str, Any],
     release_review: Mapping[str, Any],
+    owner_release_direction: Mapping[str, Any],
+    stable_first_release_scope: Mapping[str, Any],
 ) -> list[str]:
     required: list[str] = []
     native_runtime_ready = _native_training_execution_ready(runtime_report)
@@ -770,6 +800,8 @@ def _promotion_blockers(
         required.append("representative_performance_gate_missing")
     required.extend(product_exposure_blockers(product_exposure))
     required.extend(release_review_blockers(release_review))
+    required.extend(owner_release_direction_record_blockers(owner_release_direction))
+    required.extend(stable_first_release_scope_blockers(stable_first_release_scope))
     return _dedupe(required + blockers)
 
 

@@ -20,6 +20,7 @@ from .config import LulynxConfig
 from .model_loader import ModelLoader
 from .dataset_loader import CaptionDataset, create_dataloader
 from .training_loop import TrainingLoop
+from .turbocore_native_update_route_binding import build_turbocore_native_update_training_loop_kwargs
 from .runtime_optimizations import build_runtime_optimization_plan
 from .lllite import (
     inject_lllite,
@@ -297,6 +298,7 @@ class LLLiteTrainer(LulynxTrainer):
             training_type="lllite",
             deepspeed=bool(getattr(self.config, "deepspeed", False)),
             model_arch=getattr(self.config.model_arch, "value", self.config.model_arch),
+            **build_turbocore_native_update_training_loop_kwargs(self.config),
             lllite_encoder=self._lllite_encoder,
         )
         self.training_loop.steps_per_epoch = steps_per_epoch

@@ -41,6 +41,8 @@ def run_smoke() -> dict[str, Any]:
     assert current["training_loop_kwargs_patch"] == {}, current
     assert current_summary["training_loop_constructor_switch_field_count"] == 3, current
     assert current_summary["training_loop_constructor_mode_field_present_count"] == 1, current
+    assert current_summary["owner_release_direction_recorded_count"] == 0, current
+    assert current_summary["owner_release_direction_approval_recorded_count"] == 0, current
     assert current_summary["product_training_route_binding_config_patch_ready_count"] == 0, current
     assert "product_training_route_binding_preflight_not_ready" in current["blocked_reasons"], current
     _assert_default_off(current)
@@ -60,6 +62,8 @@ def run_smoke() -> dict[str, Any]:
     assert signed["product_training_route_binding_config_patch_ready"] is True, signed
     assert signed["blocked_reasons"] == [], signed
     assert signed_summary["product_training_route_binding_config_patch_ready_count"] == 1, signed
+    assert signed_summary["owner_release_direction_recorded_count"] == 1, signed
+    assert signed_summary["owner_release_direction_approval_recorded_count"] == 1, signed
     assert signed_summary["training_loop_kwargs_patch_field_count"] == 4, signed
     patch = signed["training_loop_kwargs_patch"]
     assert patch["turbocore_native_update_mode"] == "native_experimental", signed
@@ -83,6 +87,11 @@ def _signed_preflight(artifact_dir: Path) -> dict[str, Any]:
     return build_optimizer_product_training_route_binding_preflight(
         native_readiness_gap=_read_json(artifact_dir / "turbocore_optimizer_native_readiness_gap_scorecard.json"),
         owner_release_review_record={"ok": True, "approval_recorded": True, "release_review_recorded": True},
+        owner_release_direction_packet={
+            "ok": True,
+            "owner_release_direction_recorded": True,
+            "owner_release_approval_recorded": True,
+        },
         product_exposure_decision={
             "ok": True,
             "evidence_ready": True,

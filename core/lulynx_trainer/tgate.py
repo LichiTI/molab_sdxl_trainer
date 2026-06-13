@@ -245,3 +245,73 @@ class TGateExecutionStats:
             skip_rate=skip_rate,
         )
 
+
+# ============================================================================
+# T-GATE Generation-scoped execution context (the live opt-in driver)
+# ============================================================================
+#
+# The probe (``observe_attention_call`` / ``tgate_step_context``) decides *which*
+# cross-attention calls are eligible. This execution context is the generation-
+# scoped switch that actually reuses cached cross-attention outputs on those
+# eligible calls. It is published via a ContextVar so it survives the whole
+# denoise loop (mirroring the unified cache seam), and is **default-off**: when no
+# context is active (or it is disabled) the attention forward runs verbatim, so
+# the live path stays bitwise-identical to today.
+
+
+@dataclass(frozen=True)
+class TGateExecution:
+    """Holds the per-generation cross-attention cache and the enable switch."""
+
+    cache: TGateCache
+    enabled: bool = True
+
+
+_CURRENT_EXEC: ContextVar[Optional[TGateExecution]] = ContextVar("lulynx_tgate_exec", default=None)
+
+
+@contextmanager
+def tgate_execution_context(*, enabled: bool) -> Iterator[Optional[TGateExecution]]:
+    """Publish a fresh cross-attention cache for one generation when enabled.
+
+    When ``enabled`` is False this publishes ``None`` (full parity passthrough),
+    so callers can wrap unconditionally and only pay for the cache when opted in.
+    """
+    execution = TGateExecution(cache=TGateCache(), enabled=True) if enabled else None
+    token = _CURRENT_EXEC.set(execution)
+    try:
+        yield execution
+    finally:
+        _CURRENT_EXEC.reset(token)
+
+
+def get_active_tgate_execution() -> Optional[TGateExecution]:
+    """Return the active execution context only when it is enabled, else None."""
+    execution = _CURRENT_EXEC.get()
+    if execution is not None and execution.enabled:
+        return execution
+    return None
+
+
+def run_cross_attention_cached(
+    compute_fn: Callable[[], torch.Tensor],
+    module_name: str,
+    execution: TGateExecution,
+    eligible: bool,
+) -> torch.Tensor:
+    """Reuse/refresh a cross-attention output using a *precomputed* eligibility.
+
+    Unlike :func:`run_with_tgate_skip` this does NOT re-observe (the caller has
+    already counted the call for stats), so wiring it into a forward that already
+    calls ``observe_attention_call`` keeps the probe stats accurate. On an
+    eligible step with a warm cache it returns the cached tensor without invoking
+    ``compute_fn`` at all -- that is the real q/k/v/attention compute saving.
+    """
+    if eligible:
+        cached = execution.cache.get(module_name)
+        if cached is not None:
+            return cached
+    output = compute_fn()
+    execution.cache.set(module_name, output)
+    return output
+

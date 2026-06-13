@@ -175,7 +175,7 @@ def _normalize_config(
     payload = dict(value or {})
     group = optimizer.param_groups[0] if optimizer.param_groups else {}
     return MuonTrainingExecutorConfig(
-        optimizer_kind="muon",
+        optimizer_kind=str(payload.get("optimizer_kind") or group.get("optimizer_kind") or "muon"),
         lr=float(payload.get("lr", group.get("lr", 2.0e-2)) or 2.0e-2),
         momentum=float(payload.get("momentum", group.get("momentum", 0.95)) or 0.95),
         ns_steps=int(payload.get("ns_steps", group.get("ns_steps", 5)) or 5),

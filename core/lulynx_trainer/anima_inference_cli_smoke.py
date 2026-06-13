@@ -237,6 +237,108 @@ def test_newbie_tensorrt_opt_in_blocks_shape_mismatch():
     print("PASS: Newbie TensorRT opt-in blocks shape mismatch")
 
 
+# --------------------------------------------------------------------------- #
+# #133 — native-Anima faithful-forward inference producer + degrade predicate
+# --------------------------------------------------------------------------- #
+def _model_extra(request) -> dict:
+    return dict(getattr(request, "model_extra", None) or {})
+
+
+def _write_synthetic_dit(path: Path, *, with_adapter: bool) -> None:
+    """Write a tiny safetensors file, optionally carrying the llm_adapter key
+    the faithful loader keys off (``net.llm_adapter.embed.weight``)."""
+    from safetensors.torch import save_file
+
+    tensors = {"net.dummy.weight": torch.zeros(2, 2)}
+    if with_adapter:
+        tensors["net.llm_adapter.embed.weight"] = torch.zeros(4, 4)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(path))
+
+
+def test_anima_faithful_producer_on_off_auto():
+    """--anima_faithful on/off pins model_extra; auto (default) omits the key
+    so _load_model falls to its built-in auto (default-on + degrade)."""
+    cli = _load_cli()
+    base = ["--model_path", "models/anima", "--prompt", "a white fox"]
+
+    on = cli.build_generation_request_from_args(
+        cli.build_parser().parse_args(base + ["--anima_faithful", "on"]))
+    assert _model_extra(on).get("anima_faithful") is True, "on -> True"
+
+    off = cli.build_generation_request_from_args(
+        cli.build_parser().parse_args(base + ["--anima_faithful", "off"]))
+    assert _model_extra(off).get("anima_faithful") is False, "off -> False"
+
+    auto = cli.build_generation_request_from_args(
+        cli.build_parser().parse_args(base))  # default is auto
+    assert "anima_faithful" not in _model_extra(auto), "auto must omit the key"
+    print("PASS: --anima_faithful on/off pins model_extra; auto omits it")
+
+
+def test_anima_native_path_overrides_land_in_model_extra():
+    """Native path overrides reach request.model_extra only when non-empty."""
+    cli = _load_cli()
+    req = cli.build_generation_request_from_args(cli.build_parser().parse_args([
+        "--model_path", "models/anima",
+        "--prompt", "a white fox",
+        "--anima_dit_path", "X/dit.safetensors",
+        "--anima_vae_path", "X/vae.safetensors",
+        "--anima_qwen3_path", "X/qwen3.safetensors",
+        "--anima_t5_tokenizer_dir", "X/tok_t5",
+    ]))
+    extra = _model_extra(req)
+    assert extra.get("anima_dit_path") == "X/dit.safetensors"
+    assert extra.get("anima_vae_path") == "X/vae.safetensors"
+    assert extra.get("anima_qwen3_path") == "X/qwen3.safetensors"
+    assert extra.get("anima_t5_tokenizer_dir") == "X/tok_t5"
+
+    bare = _model_extra(cli.build_generation_request_from_args(
+        cli.build_parser().parse_args(["--model_path", "models/anima", "--prompt", "a white fox"])))
+    for k in ("anima_dit_path", "anima_vae_path", "anima_qwen3_path", "anima_t5_tokenizer_dir"):
+        assert k not in bare, f"empty {k} must not be injected"
+    print("PASS: native path overrides land in model_extra only when set")
+
+
+def test_faithful_assets_predicate_no_adapter():
+    """A stub/preview checkpoint (no llm_adapter) -> not faithful-capable."""
+    from core.lulynx_trainer.anima_native_inference import faithful_inference_assets_available
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dit = Path(tmp) / "diffusion_models" / "stub.safetensors"
+        _write_synthetic_dit(dit, with_adapter=False)
+        ok, reason = faithful_inference_assets_available(dit)
+        assert ok is False and reason == "checkpoint_no_llm_adapter", (ok, reason)
+    print("PASS: faithful predicate rejects a checkpoint with no llm_adapter")
+
+
+def test_faithful_assets_predicate_no_t5():
+    """Adapter present but no T5 tokenizer reachable -> degrade reason no_t5."""
+    from core.lulynx_trainer.anima_native_inference import faithful_inference_assets_available
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dit = Path(tmp) / "diffusion_models" / "base.safetensors"
+        _write_synthetic_dit(dit, with_adapter=True)
+        ok, reason = faithful_inference_assets_available(dit)
+        assert ok is False and reason == "no_t5_tokenizer", (ok, reason)
+    print("PASS: faithful predicate flags missing T5 tokenizer")
+
+
+def test_faithful_assets_predicate_available():
+    """Adapter + an explicit T5 tokenizer dir (spiece.model) -> available."""
+    from core.lulynx_trainer.anima_native_inference import faithful_inference_assets_available
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dit = Path(tmp) / "diffusion_models" / "base.safetensors"
+        _write_synthetic_dit(dit, with_adapter=True)
+        tok = Path(tmp) / "tok_t5"
+        tok.mkdir()
+        (tok / "spiece.model").write_bytes(b"")  # existence is all the resolver checks
+        ok, reason = faithful_inference_assets_available(dit, tok)
+        assert ok is True and reason is None, (ok, reason)
+    print("PASS: faithful predicate accepts adapter + resolvable T5 tokenizer")
+
+
 if __name__ == "__main__":
     test_resolve_dtype_known_aliases()
     test_resolve_dtype_unknown_raises()
@@ -249,4 +351,9 @@ if __name__ == "__main__":
     test_newbie_tensorrt_opt_in_replaces_unet_with_adapter()
     test_newbie_tensorrt_opt_in_requires_engine_path()
     test_newbie_tensorrt_opt_in_blocks_shape_mismatch()
+    test_anima_faithful_producer_on_off_auto()
+    test_anima_native_path_overrides_land_in_model_extra()
+    test_faithful_assets_predicate_no_adapter()
+    test_faithful_assets_predicate_no_t5()
+    test_faithful_assets_predicate_available()
     print("\nAll anima_inference_cli smoke tests passed!")

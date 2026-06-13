@@ -88,6 +88,34 @@ def _metrics(report: Mapping[str, Any]) -> Mapping[str, Any]:
     return {}
 
 
+def _comparison(report: Mapping[str, Any]) -> Mapping[str, Any]:
+    if report.get("report") == NATURAL_DATA_WAIT_AB_EVIDENCE_REPORT:
+        return _mapping(report.get("comparison"))
+    return {}
+
+
+def _compact_axes(axes: Mapping[str, Any]) -> dict[str, Any]:
+    keys = (
+        "family",
+        "native_cache_mode",
+        "resolution",
+        "train_batch_size",
+        "steps",
+        "samples",
+        "dataloader_workers",
+        "dataloader_prefetch_factor",
+        "pin_memory",
+        "source_fixture",
+        "fixture_samples",
+        "source_file_count",
+        "source_manifest_sha1",
+        "cache_state",
+        "cache_has_family_cache",
+        "material_source_label",
+    )
+    return {key: axes.get(key) for key in keys if key in axes}
+
+
 def _cache_gate(report: Mapping[str, Any], axes: Mapping[str, Any]) -> tuple[str, list[str]]:
     reasons: list[str] = []
     native_cache_mode = str(axes.get("native_cache_mode") or "").strip().lower()
@@ -275,6 +303,105 @@ def _next_actions(status: str, reasons: Sequence[str]) -> list[str]:
     return actions or ["inspect_blocked_natural_load_canary_evidence"]
 
 
+def _rerun_intent(status: str, reasons: Sequence[str]) -> str:
+    categories = {_reason_category(reason) for reason in reasons}
+    if status == "missing" or "missing_evidence" in categories:
+        return "collect_first_family_natural_load_canary"
+    if "cache_readiness" in categories:
+        return "prepare_warm_cache_then_collect_family_canary"
+    if "action_boundary" in categories:
+        return "capture_epoch_boundary_dataloader_rebuild_action"
+    if "data_wait_gate" in categories:
+        return "collect_stronger_baseline_data_wait_axis"
+    if "loss_guardrail" in categories:
+        return "rerun_with_loss_stability_review"
+    if "throughput_gate" in categories:
+        return "rerun_with_throughput_gain_review"
+    if "vram_guardrail" in categories:
+        return "rerun_with_vram_pressure_review"
+    if "release_claim_gate" in categories:
+        return "rebuild_case_specific_release_claim_after_gates_pass"
+    return "inspect_blocked_family_canary_evidence"
+
+
+def _candidate_rank(candidate: Mapping[str, Any]) -> tuple[int, str]:
+    reasons = set(_string_list(candidate.get("blocked_reasons")))
+    kind = str(candidate.get("kind") or "")
+    cache_reasons = {
+        reason
+        for reason in reasons
+        if _reason_category(reason) == "cache_readiness"
+    }
+    score = 100
+    if "dataloader_rebuild_epoch_boundary_action_missing" in reasons and not cache_reasons:
+        score = 10
+    elif _reason_category("natural_data_wait_below_threshold") not in {
+        _reason_category(reason) for reason in reasons
+    } and not cache_reasons:
+        score = 20
+    elif kind == "natural_ab" and not cache_reasons:
+        score = 30
+    elif not cache_reasons:
+        score = 40
+    return score, str(candidate.get("case_id") or "")
+
+
+def _preferred_blocked_candidate(candidates: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    blocked = [item for item in candidates if not _safe_bool(item.get("eligible"), False)]
+    if not blocked:
+        return {}
+    return sorted(blocked, key=_candidate_rank)[0]
+
+
+def _family_gpu_rerun_plan(
+    *,
+    family: str,
+    status: str,
+    reasons: Sequence[str],
+    candidates: Sequence[Mapping[str, Any]],
+    next_actions: Sequence[str],
+) -> dict[str, Any]:
+    if status == "ready":
+        return {
+            "status": "not_needed",
+            "family": family,
+            "requires_gpu_if_executed": False,
+            "manual_start_required": False,
+            "safe_to_auto_start": False,
+            "release_claim_allowed_after_success": False,
+        }
+
+    preferred = _preferred_blocked_candidate(candidates)
+    axes = _mapping(preferred.get("matrix_axes"))
+    command_profile = "family_real_material_canary"
+    if str(preferred.get("kind") or "") == "natural_closed_loop":
+        command_profile = "natural_closed_loop_epoch_boundary_canary"
+    elif str(preferred.get("kind") or "") == "natural_ab":
+        command_profile = "natural_data_wait_ab_conservative_recheck"
+    return {
+        "status": "manual_gpu_rerun_required" if status != "missing" else "manual_gpu_evidence_required",
+        "family": family,
+        "intent": _rerun_intent(status, reasons),
+        "recommended_command_profile": command_profile,
+        "source_candidate_case_id": str(preferred.get("case_id") or ""),
+        "source_candidate_kind": str(preferred.get("kind") or ""),
+        "blocked_reason_ids": list(reasons)[:16],
+        "next_actions": list(next_actions)[:12],
+        "candidate_axes": _compact_axes(axes),
+        "requires_gpu_if_executed": True,
+        "manual_start_required": True,
+        "safe_to_auto_start": False,
+        "release_claim_allowed_after_success": False,
+        "post_run_review_required": True,
+        "not_release_evidence_until_rebuilt": True,
+        "rebuild_required_after_success": [
+            "current_combined/evidence_pack.json",
+            "current_combined/natural_load_canary.json",
+            "current_combined/release_claims.json",
+        ],
+    }
+
+
 def _blocker_summary(families: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     categories: dict[str, dict[str, Any]] = {}
     for family in families:
@@ -296,6 +423,7 @@ def _blocker_summary(families: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 def _candidate(report: Mapping[str, Any]) -> dict[str, Any]:
     axes = _axes(report)
     metrics = _metrics(report)
+    comparison = _comparison(report)
     gates: dict[str, dict[str, Any]] = {}
     blocked: list[str] = []
     for name, (status, reasons) in {
@@ -321,6 +449,13 @@ def _candidate(report: Mapping[str, Any]) -> dict[str, Any]:
             "data_wait_share": metrics.get("data_wait_share"),
             "peak_vram_mb": metrics.get("peak_vram_mb"),
         },
+        "comparison": {
+            "data_wait_share_before": comparison.get("data_wait_share_before"),
+            "data_wait_share_after": comparison.get("data_wait_share_after"),
+            "steady_samples_per_second_gain_pct": comparison.get("steady_samples_per_second_gain_pct"),
+            "final_loss_delta": comparison.get("final_loss_delta"),
+        },
+        "matrix_axes": _compact_axes(axes),
         "action_boundary": {
             "release_scope": _mapping(report.get("release_claim")).get("scope"),
             "native_cache_mode": axes.get("native_cache_mode"),
@@ -356,6 +491,7 @@ def build_bubble_natural_load_canary_report(
         else:
             status = "missing"
             reasons = ["natural_load_canary_evidence_missing"]
+        next_actions = _next_actions(status, reasons)
         family_record = {
             "family": family,
             "status": status,
@@ -363,12 +499,23 @@ def build_bubble_natural_load_canary_report(
             "accepted_candidate_count": len(accepted),
             "blocked_reasons": reasons,
             "blocking_categories": sorted({_reason_category(reason) for reason in reasons}),
-            "next_actions": _next_actions(status, reasons),
+            "next_actions": next_actions,
+            "gpu_rerun_plan": _family_gpu_rerun_plan(
+                family=family,
+                status=status,
+                reasons=reasons,
+                candidates=family_candidates,
+                next_actions=next_actions,
+            ),
             "accepted_candidates": accepted[:5],
             "candidates": family_candidates[:10],
         }
         families.append(family_record)
     ready = all(item.get("status") == "ready" for item in families)
+    missing_families = [item["family"] for item in families if item.get("status") == "missing"]
+    blocked_families = [
+        item["family"] for item in families if item.get("status") in {"blocked", "missing"}
+    ]
     return {
         "schema_version": 1,
         "report": NATURAL_LOAD_CANARY_REPORT,
@@ -377,10 +524,31 @@ def build_bubble_natural_load_canary_report(
         "release_candidate_allowed": ready,
         "family_count": len(families),
         "ready_family_count": sum(1 for item in families if item.get("status") == "ready"),
-        "missing_families": [item["family"] for item in families if item.get("status") == "missing"],
-        "blocked_families": [item["family"] for item in families if item.get("status") == "blocked"],
+        "missing_families": missing_families,
+        "blocked_families": blocked_families,
+        "blocked_family_count": len(blocked_families),
+        "blocked_family_statuses": {
+            item["family"]: str(item.get("status") or "")
+            for item in families
+            if item.get("status") in {"blocked", "missing"}
+        },
         "families": families,
         "blocker_summary": _blocker_summary(families),
+        "gpu_rerun_plan": {
+            "status": "not_needed" if ready else "manual_gpu_rerun_required",
+            "manual_ready_family_count": sum(
+                1
+                for item in families
+                if str(_mapping(item.get("gpu_rerun_plan")).get("status") or "").startswith("manual_gpu")
+            ),
+            "safe_to_auto_start": False,
+            "release_claim_allowed_after_success": False,
+            "families": [
+                dict(_mapping(item.get("gpu_rerun_plan")))
+                for item in families
+                if str(_mapping(item.get("gpu_rerun_plan")).get("status") or "") != "not_needed"
+            ],
+        },
         "candidate_count": len(candidates),
         "accepted_candidate_count": sum(1 for item in candidates if item.get("eligible")),
     }

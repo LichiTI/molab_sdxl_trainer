@@ -40,6 +40,170 @@ def _copy_number_fields(source: Mapping[str, Any], fields: tuple[str, ...]) -> d
     return copied
 
 
+def _list(value: Any) -> list[Any]:
+    return [] if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)) else list(value)
+
+
+def summarize_newbie_backward_op_profile(profile: Mapping[str, Any] | None, *, top_k: int = 12) -> dict[str, Any]:
+    source = _mapping(profile)
+    if not source:
+        return {}
+
+    latest = _mapping(source.get("latest"))
+    top_ops = [_mapping(item) for item in _list(latest.get("top_ops")) if _mapping(item)]
+    summary: dict[str, Any] = {
+        "report": str(source.get("report") or ""),
+        "enabled": bool(source.get("enabled", False)),
+        "sample_count": _safe_int(source.get("sample_count")),
+        "max_samples": _safe_int(source.get("max_samples")),
+    }
+    if latest:
+        top_shape_groups = [
+            _mapping(item) for item in _list(latest.get("top_shape_groups")) if _mapping(item)
+        ]
+        top_matmul_shape_groups = [
+            _mapping(item) for item in _list(latest.get("top_matmul_shape_groups")) if _mapping(item)
+        ]
+        summary["latest"] = {
+            "report": str(latest.get("report") or ""),
+            "status": str(latest.get("status") or ""),
+            "step": _safe_int(latest.get("step")),
+            "sort_key": str(latest.get("sort_key") or ""),
+            "top_k": _safe_int(latest.get("top_k")),
+            "event_count": _safe_int(latest.get("event_count")),
+            "record_shapes": bool(latest.get("record_shapes", False)),
+            "shape_group_count": _safe_int(latest.get("shape_group_count")),
+            "cuda_activity_available": bool(latest.get("cuda_activity_available", False)),
+            "activities": [str(item) for item in _list(latest.get("activities"))],
+            "top_ops": [
+                {
+                    "key": str(row.get("key") or ""),
+                    "count": _safe_int(row.get("count")),
+                    "self_cuda_ms": _round(row.get("self_cuda_ms"), 4),
+                    "cuda_ms": _round(row.get("cuda_ms"), 4),
+                    "self_cpu_ms": _round(row.get("self_cpu_ms"), 4),
+                    "cpu_ms": _round(row.get("cpu_ms"), 4),
+                }
+                for row in top_ops[: max(int(top_k), 1)]
+            ],
+        }
+        if top_shape_groups:
+            summary["latest"]["top_shape_groups"] = [
+                {
+                    "key": str(row.get("key") or ""),
+                    "input_shapes": str(row.get("input_shapes") or ""),
+                    "count": _safe_int(row.get("count")),
+                    "self_cuda_ms": _round(row.get("self_cuda_ms"), 4),
+                    "cuda_ms": _round(row.get("cuda_ms"), 4),
+                    "self_cpu_ms": _round(row.get("self_cpu_ms"), 4),
+                    "cpu_ms": _round(row.get("cpu_ms"), 4),
+                }
+                for row in top_shape_groups[: max(int(top_k), 1)]
+            ]
+        if top_matmul_shape_groups:
+            summary["latest"]["top_matmul_shape_groups"] = [
+                {
+                    "key": str(row.get("key") or ""),
+                    "input_shapes": str(row.get("input_shapes") or ""),
+                    "count": _safe_int(row.get("count")),
+                    "self_cuda_ms": _round(row.get("self_cuda_ms"), 4),
+                    "cuda_ms": _round(row.get("cuda_ms"), 4),
+                    "self_cpu_ms": _round(row.get("self_cpu_ms"), 4),
+                    "cpu_ms": _round(row.get("cpu_ms"), 4),
+                }
+                for row in top_matmul_shape_groups[: max(int(top_k), 1)]
+            ]
+    return summary
+
+
+def summarize_newbie_module_timing_profile(profile: Mapping[str, Any] | None, *, top_k: int = 12) -> dict[str, Any]:
+    source = _mapping(profile)
+    if not source:
+        return {}
+
+    latest = _mapping(source.get("latest"))
+    top_groups = [_mapping(item) for item in _list(latest.get("top_groups")) if _mapping(item)]
+    summary: dict[str, Any] = {
+        "report": str(source.get("report") or ""),
+        "enabled": bool(source.get("enabled", False)),
+        "sample_count": _safe_int(source.get("sample_count")),
+        "max_samples": _safe_int(source.get("max_samples")),
+    }
+    if latest:
+        summary["latest"] = {
+            "report": str(latest.get("report") or ""),
+            "status": str(latest.get("status") or ""),
+            "step": _safe_int(latest.get("step")),
+            "top_k": _safe_int(latest.get("top_k")),
+            "tracked_module_count": _safe_int(latest.get("tracked_module_count")),
+            "group_count": _safe_int(latest.get("group_count")),
+            "cuda_activity_available": bool(latest.get("cuda_activity_available", False)),
+            "runtime_default_change": bool(latest.get("runtime_default_change", False)),
+            "probe_only": bool(latest.get("probe_only", False)),
+            "top_groups": [
+                {
+                    "group": str(row.get("group") or ""),
+                    "module_count": _safe_int(row.get("module_count")),
+                    "forward_count": _safe_int(row.get("forward_count")),
+                    "backward_count": _safe_int(row.get("backward_count")),
+                    "forward_cuda_ms": _round(row.get("forward_cuda_ms"), 4),
+                    "backward_cuda_ms": _round(row.get("backward_cuda_ms"), 4),
+                    "forward_cpu_ms": _round(row.get("forward_cpu_ms"), 4),
+                    "backward_cpu_ms": _round(row.get("backward_cpu_ms"), 4),
+                    "module_name_examples": [str(item) for item in _list(row.get("module_name_examples"))[:5]],
+                }
+                for row in top_groups[: max(int(top_k), 1)]
+            ],
+        }
+    return summary
+
+
+def summarize_triton_ops_runtime(profile: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = _mapping(profile)
+    if not source:
+        return {}
+    return {
+        "report": str(source.get("report") or ""),
+        "enabled": bool(source.get("enabled", False)),
+        "requested": bool(source.get("requested", False)),
+        "available": bool(source.get("available", False)),
+        "status": str(source.get("status") or ""),
+        "reason": str(source.get("reason") or ""),
+        "dtype": str(source.get("dtype") or ""),
+        "gpu": str(source.get("gpu") or ""),
+        "patched_lora_layers": _safe_int(source.get("patched_lora_layers")),
+        "patched_qkv_blocks": _safe_int(source.get("patched_qkv_blocks")),
+        "patched_adaln_blocks": _safe_int(source.get("patched_adaln_blocks")),
+        "inject_lora": bool(source.get("inject_lora", False)),
+        "inject_qkv": bool(source.get("inject_qkv", False)),
+        "inject_adaln": bool(source.get("inject_adaln", False)),
+        "fp32_backward": bool(source.get("fp32_backward", False)),
+    }
+
+
+def summarize_adapter_runtime(profile: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = _mapping(profile)
+    if not source:
+        return {}
+    return {
+        "source": str(source.get("source") or ""),
+        "enabled": bool(source.get("enabled", False)),
+        "model_arch": str(source.get("model_arch") or ""),
+        "adapter_method": str(source.get("adapter_method") or ""),
+        "rank": _safe_int(source.get("rank")),
+        "injected_layer_count": _safe_int(source.get("injected_layer_count")),
+        "newbie_target_scope": str(source.get("newbie_target_scope") or ""),
+        "newbie_target_module_count": _safe_int(source.get("newbie_target_module_count")),
+        "total_adapter_parameter_count": _safe_int(source.get("total_adapter_parameter_count")),
+        "trainable_adapter_parameter_count": _safe_int(source.get("trainable_adapter_parameter_count")),
+        "prefix_counts": {
+            str(key): _safe_int(value)
+            for key, value in _mapping(source.get("prefix_counts")).items()
+        },
+        "sample_layers": [str(item) for item in _list(source.get("sample_layers"))[:8]],
+    }
+
+
 def summarize_residency_profile(profile: Mapping[str, Any] | None) -> dict[str, Any]:
     source = _mapping(profile)
     if not source:
@@ -147,6 +311,12 @@ def summarize_training_loop_runtime(profile: Mapping[str, Any] | None) -> dict[s
     transfer = _mapping(evidence.get("transfer"))
     data_transfer = _mapping(source.get("data_transfer_profile"))
     last_transfer = _mapping(data_transfer.get("last"))
+    backward_op_profile = summarize_newbie_backward_op_profile(
+        _mapping(source.get("newbie_backward_op_profile"))
+    )
+    module_timing_profile = summarize_newbie_module_timing_profile(
+        _mapping(source.get("newbie_module_timing_profile"))
+    )
 
     summary: dict[str, Any] = {}
     if bubble:
@@ -227,6 +397,11 @@ def summarize_training_loop_runtime(profile: Mapping[str, Any] | None) -> dict[s
                 "recommendation": str(last_transfer.get("recommendation", "") or ""),
             }
 
+    if backward_op_profile:
+        summary["newbie_backward_op_profile"] = backward_op_profile
+    if module_timing_profile:
+        summary["newbie_module_timing_profile"] = module_timing_profile
+
     return summary
 
 
@@ -243,6 +418,14 @@ def build_runtime_feature_summary(manifest_extra: Mapping[str, Any] | None) -> d
     if loop:
         summary["training_loop_runtime"] = loop
 
+    triton_ops = summarize_triton_ops_runtime(_mapping(extra.get("triton_ops_runtime")))
+    if triton_ops:
+        summary["triton_ops_runtime"] = triton_ops
+
+    adapter = summarize_adapter_runtime(_mapping(extra.get("adapter_runtime")))
+    if adapter:
+        summary["adapter_runtime"] = adapter
+
     experiments = summarize_training_loop_runtime(_mapping(extra.get("anima_full_finetune_experiments")))
     if experiments:
         summary["anima_full_finetune_experiments"] = experiments
@@ -258,6 +441,10 @@ def load_runtime_feature_summary_from_manifest(path: Path) -> dict[str, Any]:
 __all__ = [
     "build_runtime_feature_summary",
     "load_runtime_feature_summary_from_manifest",
+    "summarize_adapter_runtime",
+    "summarize_newbie_backward_op_profile",
+    "summarize_newbie_module_timing_profile",
     "summarize_residency_profile",
     "summarize_training_loop_runtime",
+    "summarize_triton_ops_runtime",
 ]

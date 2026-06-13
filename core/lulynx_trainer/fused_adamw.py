@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: LicenseRef-PolyFormNoncommercial-1.0.0
-"""Fused AdamW optimizer -- minimises Python-level tensor operations per parameter
-by performing the entire Adam moment update + weight decay + parameter change
-in a single fused pass (``_fused_adamw_step_``) per parameter group.
+"""Fused AdamW optimizer -- batches the AdamW step across parameters with
+``torch._foreach_*`` multi-tensor ops, so kernel-launch count per step is
+O(buckets), not O(parameters).
 
-On CUDA devices the helper uses ``torch.where`` / fused-inplace ops so that
-each parameter incurs only *one* logical kernel launch instead of the
-half-dozen separate add/mul/div/copy calls that the default
-``torch.optim.AdamW`` performs.
+Parameters are bucketed by ``(device, dtype, step_count)`` inside each param
+group and each bucket runs the full moment update + weight decay + parameter
+write-back as a short sequence of multi-tensor launches. Step counters live on
+CPU (matching ``torch.optim`` convention for the non-capturable path), so bias
+correction needs no GPU->CPU sync. ``capturable`` / ``differentiable`` groups
+fall back to the per-parameter ``_fused_adamw_step_`` path, which stays
+autograd- and graph-capture-friendly.
 
-No custom C++/CUDA kernels are required -- the "fusion" is purely at the
-Python-dispatch level, but structured so that a future native-kernel
-replacement would only need to swap out ``_fused_adamw_step_``.
+No custom C++/CUDA kernels are required -- a future native-kernel replacement
+would only need to swap out the bucket update in ``_foreach_adamw_step_`` (or
+``_fused_adamw_step_`` for the fallback path).
 """
 from __future__ import annotations
 
@@ -82,6 +85,56 @@ def _fused_adamw_step_(
     param.addcdiv_(exp_avg, denom, value=-step_size)
 
 
+def _foreach_adamw_step_(
+    params: list[Tensor],
+    grads: list[Tensor],
+    exp_avgs: list[Tensor],
+    exp_avg_sqs: list[Tensor],
+    max_exp_avg_sqs: Optional[list[Tensor]],
+    new_step: float,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    weight_decay: float,
+    amsgrad: bool,
+    maximize: bool,
+) -> None:
+    """Multi-tensor AdamW update for one ``(device, dtype, step)`` bucket.
+
+    Op-for-op the same element-wise sequence as ``_fused_adamw_step_`` (mul/
+    add moments, sqrt/div/add denom, decoupled decay, addcdiv), so results
+    match the per-parameter path bit-for-bit on deterministic kernels -- only
+    the launch granularity changes.
+    """
+    bias_correction1 = 1 - beta1 ** new_step
+    bias_correction2 = 1 - beta2 ** new_step
+
+    if maximize:
+        grads = torch._foreach_neg(grads)
+
+    # --- moment updates (in-place) ---
+    torch._foreach_mul_(exp_avgs, beta1)
+    torch._foreach_add_(exp_avgs, grads, alpha=1 - beta1)
+    torch._foreach_mul_(exp_avg_sqs, beta2)
+    torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
+
+    if amsgrad:
+        torch._foreach_maximum_(max_exp_avg_sqs, exp_avg_sqs)
+        denom = torch._foreach_sqrt(max_exp_avg_sqs)
+    else:
+        denom = torch._foreach_sqrt(exp_avg_sqs)
+    torch._foreach_div_(denom, math.sqrt(bias_correction2))
+    torch._foreach_add_(denom, eps)
+
+    # --- weight decay (AdamW-style: decoupled, applied to param directly) ---
+    if weight_decay != 0.0:
+        torch._foreach_add_(params, params, alpha=-lr * weight_decay)
+
+    # --- parameter update ---
+    torch._foreach_addcdiv_(params, exp_avgs, denom, value=-(lr / bias_correction1))
+
+
 # ---------------------------------------------------------------------------
 # FusedAdamW Optimizer
 # ---------------------------------------------------------------------------
@@ -142,7 +195,7 @@ class FusedAdamW(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None) -> Optional[float]:
-        """Perform a single fused optimisation step.
+        """Perform a single batched optimisation step.
 
         If *closure* is supplied it will be evaluated (to recompute the
         loss) and its value returned; otherwise ``None`` is returned.
@@ -153,71 +206,110 @@ class FusedAdamW(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            beta1, beta2 = group["betas"]
-            lr = group["lr"]
-            eps = group["eps"]
-            weight_decay = group["weight_decay"]
-            amsgrad = group["amsgrad"]
-            maximize = group["maximize"]
-            capturable = group["capturable"]
-            differentiable = group["differentiable"]
+            if group["capturable"] or group["differentiable"]:
+                # Graph-capture / autograd paths keep the per-parameter kernel.
+                self._step_group_per_param(group)
+                continue
+            self._step_group_foreach(group)
 
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
+        return loss
 
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError(
-                        "FusedAdamW does not support sparse gradients"
-                    )
+    def _init_param_state(self, p: Tensor, *, amsgrad: bool, capturable: bool) -> dict:
+        state = self.state[p]
+        if len(state) == 0:
+            if capturable:
+                # Step must live with the params so the update is graph-capturable.
+                state["step"] = torch.tensor(0.0, device=p.device, dtype=p.dtype)
+            else:
+                # CPU step: bias correction reads it without a GPU sync.
+                state["step"] = torch.tensor(0.0, dtype=torch.float32)
+            state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            if amsgrad:
+                state["max_exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+        return state
 
-                state = self.state[p]
+    def _step_group_foreach(self, group: dict[str, Any]) -> None:
+        beta1, beta2 = group["betas"]
+        lr = group["lr"]
+        eps = group["eps"]
+        weight_decay = group["weight_decay"]
+        amsgrad = group["amsgrad"]
+        maximize = group["maximize"]
 
-                # ---- lazy state initialisation ----
-                if len(state) == 0:
-                    state["step"] = torch.tensor(0.0, device=p.device, dtype=torch.float32)
-                    # If capturable, keep step on same device/dtype as params
-                    if capturable:
-                        state["step"] = state["step"].to(device=p.device, dtype=p.dtype)
+        # (device, dtype, step_count) -> parallel tensor lists
+        buckets: dict[tuple, tuple[list, list, list, list, list, list]] = {}
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            if p.grad.is_sparse:
+                raise RuntimeError("FusedAdamW does not support sparse gradients")
+            state = self._init_param_state(p, amsgrad=amsgrad, capturable=False)
+            step_t = state["step"]
+            if step_t.device.type != "cpu":
+                # Legacy / warm-started checkpoints kept step on the param
+                # device; normalise once so later reads stay sync-free.
+                step_t = step_t.detach().to(device="cpu", dtype=torch.float32)
+                state["step"] = step_t
+            key = (p.device, p.dtype, float(step_t.item()))
+            bucket = buckets.setdefault(key, ([], [], [], [], [], []))
+            bucket[0].append(p)
+            bucket[1].append(p.grad)
+            bucket[2].append(state["exp_avg"])
+            bucket[3].append(state["exp_avg_sq"])
+            if amsgrad:
+                bucket[4].append(state["max_exp_avg_sq"])
+            bucket[5].append(step_t)
 
-                    state["exp_avg"] = torch.zeros_like(
-                        p, memory_format=torch.preserve_format
-                    )
-                    state["exp_avg_sq"] = torch.zeros_like(
-                        p, memory_format=torch.preserve_format
-                    )
-                    if amsgrad:
-                        state["max_exp_avg_sq"] = torch.zeros_like(
-                            p, memory_format=torch.preserve_format
-                        )
+        for (_device, _dtype, step_count), (params, grads, exp_avgs, exp_avg_sqs, max_sqs, steps) in buckets.items():
+            for step_t in steps:
+                step_t.add_(1)
+            _foreach_adamw_step_(
+                params=params,
+                grads=grads,
+                exp_avgs=exp_avgs,
+                exp_avg_sqs=exp_avg_sqs,
+                max_exp_avg_sqs=max_sqs if amsgrad else None,
+                new_step=step_count + 1.0,
+                lr=lr,
+                beta1=beta1,
+                beta2=beta2,
+                eps=eps,
+                weight_decay=weight_decay,
+                amsgrad=amsgrad,
+                maximize=maximize,
+            )
 
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-                step_t = state["step"]
-                max_exp_avg_sq = state.get("max_exp_avg_sq")
+    def _step_group_per_param(self, group: dict[str, Any]) -> None:
+        beta1, beta2 = group["betas"]
+        lr = group["lr"]
+        eps = group["eps"]
+        weight_decay = group["weight_decay"]
+        amsgrad = group["amsgrad"]
+        maximize = group["maximize"]
+        capturable = group["capturable"]
+        differentiable = group["differentiable"]
 
-                # -- differentiable path: run under autograd --
-                if differentiable:
-                    with torch.enable_grad():
-                        _fused_adamw_step_(
-                            param=p,
-                            grad=grad,
-                            step=step_t,
-                            exp_avg=exp_avg,
-                            exp_avg_sq=exp_avg_sq,
-                            max_exp_avg_sq=max_exp_avg_sq,
-                            lr=lr,
-                            beta1=beta1,
-                            beta2=beta2,
-                            eps=eps,
-                            weight_decay=weight_decay,
-                            amsgrad=amsgrad,
-                            maximize=maximize,
-                            capturable=capturable,
-                            differentiable=differentiable,
-                        )
-                else:
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+
+            grad = p.grad
+            if grad.is_sparse:
+                raise RuntimeError(
+                    "FusedAdamW does not support sparse gradients"
+                )
+
+            state = self._init_param_state(p, amsgrad=amsgrad, capturable=capturable)
+
+            exp_avg = state["exp_avg"]
+            exp_avg_sq = state["exp_avg_sq"]
+            step_t = state["step"]
+            max_exp_avg_sq = state.get("max_exp_avg_sq")
+
+            # -- differentiable path: run under autograd --
+            if differentiable:
+                with torch.enable_grad():
                     _fused_adamw_step_(
                         param=p,
                         grad=grad,
@@ -235,8 +327,24 @@ class FusedAdamW(torch.optim.Optimizer):
                         capturable=capturable,
                         differentiable=differentiable,
                     )
-
-        return loss
+            else:
+                _fused_adamw_step_(
+                    param=p,
+                    grad=grad,
+                    step=step_t,
+                    exp_avg=exp_avg,
+                    exp_avg_sq=exp_avg_sq,
+                    max_exp_avg_sq=max_exp_avg_sq,
+                    lr=lr,
+                    beta1=beta1,
+                    beta2=beta2,
+                    eps=eps,
+                    weight_decay=weight_decay,
+                    amsgrad=amsgrad,
+                    maximize=maximize,
+                    capturable=capturable,
+                    differentiable=differentiable,
+                )
 
 
 # ---------------------------------------------------------------------------

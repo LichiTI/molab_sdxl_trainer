@@ -81,6 +81,8 @@ class LyCORISAlgo(str, Enum):
     FULL = 'full'
     DIAG_OFT = 'diag-oft'
     LOCON = 'locon'
+    GLORA = 'glora'
+    GLOKR = 'glokr'
 
 class OptimizerType(str, Enum):
     ADAMW = 'AdamW'
@@ -227,7 +229,7 @@ class UnifiedTrainingConfig(BaseModel):
 
     # === Optimizer & Scheduler ===
     optimizer_type: OptimizerType = Field(default=OptimizerType.ADAMW_8BIT)
-    optimizer_backend: str = "auto"  # auto | torch_adamw | foreach_adamw | torch_fused | bnb_8bit | apex | lulynx_fused
+    optimizer_backend: str = "auto"  # auto | torch_adamw | foreach_adamw | torch_fused | bnb_8bit | ao_8bit | compiled_step | apex | lulynx_fused
     advanced_optimizer_strategy: str = "auto"  # auto | off | profile_only | lora_plus | rs_lora | galore
     learning_rate: float = Field(default=DEFAULT_LR)
     unet_lr: float = 0.0
@@ -307,6 +309,8 @@ class UnifiedTrainingConfig(BaseModel):
     torch_compile_fullgraph: bool = False
     torch_compile_scope: str = ""  # "", "per_block", "full" — per_block compiles each block separately
     torch_compile_allow_full_with_per_block: bool = False
+    dynamo_recompile_limit: int = 0  # pin dynamo recompile budget across compile contexts (0=leave default)
+    activation_memory_budget: float = 0.0  # AOT partitioner recompute cap in (0,1]; 0=off; skipped under grad-ckpt
     compile_runtime: str = "off"  # off | auto | compile | compile_cache | cudagraph | compile_cudagraph
     compile_shape_strategy: str = "auto"  # auto | fixed_pad | token_flatten | native
     compile_target_strategy: str = "auto"  # auto | block | inner_forward
@@ -368,6 +372,11 @@ class UnifiedTrainingConfig(BaseModel):
     turbocore_native_update_diagnostic_executor_replay: bool = False  # default-off cloned replay of owner-native shadow evidence
     turbocore_native_update_defer_state_sync: bool = False  # experimental perf path; syncs PyTorch optimizer state only on fallback/close
     turbocore_native_update_runtime_synchronization_policy: str = "context_synchronize"  # context_synchronize | borrowed_stream_event_chain
+    triton_ops_enabled: bool = False  # default-off fused LoRA/block kernels for protected probes
+    triton_ops_inject_lora: bool = True
+    triton_ops_inject_qkv: bool = True
+    triton_ops_inject_adaln: bool = True
+    triton_ops_fp32_backward: bool = False
 
     # === 显存优化 ===
     swap_granularity: str = "off"  # off | auto | block | merged_block | layer
@@ -437,6 +446,13 @@ class UnifiedTrainingConfig(BaseModel):
     data_transfer_profile_mode: str = "event"  # event | sync | off
     data_transfer_profile_window: int = 50
     step_phase_profile_enabled: bool = False  # benchmark-only; synchronizes CUDA to time forward/backward/update phases
+    newbie_backward_op_profile_enabled: bool = False  # benchmark-only; torch.profiler around Newbie loss.backward()
+    newbie_backward_op_profile_top_k: int = 12
+    newbie_backward_op_profile_max_samples: int = 1
+    newbie_backward_op_profile_record_shapes: bool = False
+    newbie_module_timing_profile_enabled: bool = False  # benchmark-only; hook-based Newbie module timing probe
+    newbie_module_timing_profile_top_k: int = 12
+    newbie_module_timing_profile_max_samples: int = 1
     bubble_controller_benchmark_data_wait_stall_ms: float = 0.0  # benchmark-only; injects real DataLoader item wait
     bubble_controller_benchmark_data_wait_direct_action: bool = False  # benchmark-only; bypass sync-profiler guard for stall probes
     cpu_offload_checkpointing: bool = False  # offload checkpoint activations to CPU during forward pass
@@ -526,6 +542,9 @@ class UnifiedTrainingConfig(BaseModel):
     activation_compression_enabled: bool = False  # experimental: compress autograd-saved activations on device
     activation_compression_dtype: str = "fp16"  # fp16 | bf16 | fp8_e4m3
     activation_compression_min_tensor_mb: float = 1.0
+    activation_cpu_offload_enabled: bool = False  # experimental: offload large saved activations to pinned CPU memory
+    activation_cpu_offload_min_tensor_mb: float = 1.0  # only activations at/above this size leave the GPU
+    activation_cpu_offload_pool_gb: float = 1.0  # pre-allocated pinned CPU pool for activation transfers
     anima_progressive_full_finetune_enabled: bool = False
     anima_progressive_full_finetune_schedule: str = ""  # e.g. "0:24-27,100:16-27,200:all"
     anima_progressive_full_finetune_default: str = "all"
@@ -566,6 +585,21 @@ class UnifiedTrainingConfig(BaseModel):
     adapter_target_policy_fraction: float = 1.0         # keep this top fraction of scored module types
     adapter_target_policy_top_k: int = 0                # keep top-k module types (0 = use fraction)
     adapter_target_policy_min_score: float = 0.0        # drop module types scoring below this threshold
+
+    # === FG-LoRA per-layer rank policy (frontier #4; default-off, two directions) ===
+    # A unified selector over the two rank-budget philosophies; the operator picks the
+    # direction, lulynx ships both as default-off reserves (real-model gain is the
+    # operator's A/B). "uniform" (default) keeps every target layer at network_dim ->
+    # bitwise identical to legacy injection. "coupled_prune" delegates to the
+    # adapter_target_policy engine (selects important layers, DROPS the rest, couples
+    # rank to score -> saves VRAM). "orthogonal_redistribute" keeps ALL target layers
+    # and only reallocates each layer's rank by a depth profile (efficiency; worst case
+    # = parity). See lulynx_trainer/fg_lora_rank_policy.py.
+    fg_lora_rank_policy: str = "uniform"                 # "uniform" | "coupled_prune" | "orthogonal_redistribute"
+    fg_lora_rank_min: int = 1                            # floor for any per-layer rank
+    fg_lora_rank_max: int = 64                           # ceiling for any per-layer rank
+    fg_lora_rank_profile: str = "center_peak"            # "center_peak" | "ascending" | "descending" | "flat"
+    fg_lora_rank_conserve_budget: bool = True            # keep sum(rank) ~= N*network_dim (pure redistribution)
 
     # === SRA2 + HASTE alignment auxiliary loss (default-off, additive) ===
     # When enabled, adds a VAE self-representation alignment loss on captured DiT
@@ -916,6 +950,9 @@ class UnifiedTrainingConfig(BaseModel):
     cooldown_until_temp: int = 0  # cool to target temp then resume (0=use time)
     cooldown_poll_seconds: int = 30  # polling interval for temperature-based cooldown
     gpu_power_limit_w: int = 0  # GPU power limit in watts (0=no limit)
+    gpu_duty_cycle: float = 1.0  # step-level GPU duty cycle; <1.0 sleeps between steps (1.0=off)
+    gpu_target_temp_c: int = 0  # closed-loop GPU temp target in C; auto-adjusts duty cycle (0=off)
+    gpu_lock_clocks_mhz: int = 0  # lock GPU core clock ceiling via nvidia-smi -lgc, needs admin (0=off)
 
     # === Training Engine & Control ===
     trainer_engine: str = "lulynx"
@@ -970,6 +1007,7 @@ class UnifiedTrainingConfig(BaseModel):
     sample_tgate_probe: bool = False
     sample_tgate_start_step: int = 0
     sample_tgate_min_block: int = 0
+    sample_tgate_skip: bool = False  # opt-in T-GATE real cross-attention reuse (default off -> parity)
     sample_spectrum_probe: bool = False
     sample_spectrum_window_size: float = 2.0
     sample_spectrum_flex_window: float = 0.25
@@ -978,7 +1016,7 @@ class UnifiedTrainingConfig(BaseModel):
     sample_smoothcache_probe: bool = False
     sample_smoothcache_error_threshold: float = 0.08
     sample_smoothcache_warmup_steps: int = 2
-    sample_cache_seam_backend: str = "none"  # none|spectrum|smoothcache (opt-in live cache execution)
+    sample_cache_seam_backend: str = "none"  # none|spectrum|smoothcache|deepcache|teacache (opt-in live cache execution)
     sample_cache_seam_window_size: float = 3.0
     sample_width: int = 0  # preview width (0 = use training resolution)
     sample_height: int = 0  # preview height (0 = use training resolution)
@@ -1165,6 +1203,20 @@ class UnifiedTrainingConfig(BaseModel):
     lokr_no_materialize_forward: bool = False  # Experimental: apply Kronecker factors without materializing full delta weight.
     lokr_no_materialize_strategy: str = "legacy"  # legacy | matmul | auto for the experimental no-materialize path.
     lokr_export_mode: str = "native"  # LoKr export mode: native or lora_compatible.
+    # GLoRA (Generalized LoRA: ΔW = W·A + B). Phase 1 standard + Phase 2 extras, all defaults off.
+    glora_rank_dropout: float = 0.0  # per-output-row dropout on the materialized ΔW
+    glora_module_dropout: float = 0.0  # whole-layer skip probability (returns 0)
+    glora_no_materialize_forward: bool = False  # fast path: chain matmuls without materializing A,B
+    glora_use_tucker: bool = False              # tucker B path for Conv2d when kernel > 1×1
+    glora_train_bias: bool = True               # adapt bias when the base module has one
+    glora_export_mode: str = "native"  # GLoRA export mode: native or lora_compatible
+    # GLoKr (Kronecker-parameterized Generalized adapter; project-original research).
+    glokr_factor: int = -1                       # Kronecker factor (-1 = auto)
+    glokr_rank_dropout: float = 0.0
+    glokr_module_dropout: float = 0.0
+    glokr_no_materialize_forward: bool = False
+    glokr_train_bias: bool = True
+    glokr_export_mode: str = "native"            # native | lora_compatible (bake delta)
     base_weight: float = 0.0  # base weight scalar for network merging
     base_weight_path: str = ""  # path to base weight file (LoRA base); comma-separated for multiple
     base_weights_multiplier: str = ""  # comma-separated multipliers matching base_weight_path order
@@ -1326,6 +1378,7 @@ class UnifiedTrainingConfig(BaseModel):
     newbie_gemma_model_path: str = ""
     newbie_clip_model_path: str = ""
     newbie_vae_path: str = ""
+    newbie_target_scope: str = "layer0_attention"
     newbie_target_modules: str = ""  # comma-separated custom target module list
     newbie_gemma_max_token_length: int = 512
     newbie_clip_max_token_length: int = 2048
@@ -1375,20 +1428,52 @@ class UnifiedTrainingConfig(BaseModel):
     anima_guidance_scale: float = 1.0  # CFG guidance scale for Anima flow training
     anima_model_prediction_type: str = "velocity"  # velocity, noise, epsilon, sample
     anima_mode_scale: float = 1.0  # scale for "mode" weighting scheme
+    # JLT-style EMA feature self-distillation alignment (default-off reserve,
+    # arXiv:2605.27102). Teacher = EMA-of-LoRA shadow evaluated at a smaller
+    # (cleaner) timestep; selected DiT block features are cosine-aligned.
+    # Layers are comma-separated block indices (teacher/student counts must
+    # match). Forces an eager forward when enabled (bypasses cudagraph/offload).
+    #
+    # STATUS: TECHNICAL RESERVE — intentionally NOT exposed in the webui.
+    # No positive-benefit evidence for LoRA fine-tuning (JLT's own headline
+    # result does not use it; it only appears in an async-teacher side script
+    # with no ablation). The cost is certain (≈2x forward + loses
+    # cudagraph/offload). Keep runtime-only until a real anima-LoRA A/B proves
+    # a gain; do not surface in UI before then. (2026-06-11 user decision)
+    anima_ema_feat_align_enabled: bool = False
+    anima_ema_feat_align_weight: float = 0.0
+    anima_ema_feat_align_teacher_layers: str = ""  # e.g. "9"
+    anima_ema_feat_align_student_layers: str = ""  # e.g. "4"
+    anima_ema_feat_align_decay: float = 0.9999
+    # EDM2-style learned per-sigma loss balancing (arXiv:2312.02696 eq.17) for
+    # the anima flow route. Default off; when enabled a tiny Fourier+linear
+    # head learns u(sigma) and the loss becomes loss/exp(u)+u (adaptive
+    # timestep weighting, no manual scheme tuning).
+    flow_uncertainty_weighting_enabled: bool = False
+    flow_uncertainty_weighting_lr: float = 1e-2  # separate no-decay param group lr
+    flow_uncertainty_weighting_channels: int = 128  # Fourier feature bank size
     anima_cached_training: bool = True  # cache-first native DiT training path
     anima_online_cache: bool = False  # generate missing Anima cache files from raw sidecars and persist them
     anima_cached_latent_crop_size: int = 0  # 0 = full cached latent, >0 = smoke/debug crop
     anima_cached_text_token_limit: int = 0  # 0 = full cached text, >0 = smoke/debug prefix
     anima_native_block_count: int = 28  # preview2 full DiT block count
+    # Opt-in faithful native forward for training (#147): feeds t=sigma in [0,1]
+    # (not sigma*1000), runs the frozen llm_adapter to build cross-attn context
+    # (not raw Qwen3 hidden), and enables 3D-RoPE self-attention. Default False ->
+    # the legacy (#132) path is bitwise-unchanged. Requires block-checkpoint /
+    # cache / reducer seams off and a cache carrying t5_input_ids.
+    anima_faithful_forward: bool = False
     anima_full_finetune_phase: str = "dit_only_cache_first"
     anima_full_finetune_train_text_encoder_requested: bool = False
     anima_full_finetune_text_encoder_policy: str = "dit_only"
     anima_block_residency: str = "resident"  # resident | streaming_offload | block_cpu_pinned
     anima_block_residency_min_params: int = 0  # minimum frozen Linear parameter count per base layer
     anima_block_checkpointing: bool = False  # recompute native Anima DiT blocks during backward
-    anima_block_checkpointing_mode: str = "block"  # block
+    anima_block_checkpointing_mode: str = "block"  # block | selective (op-level SAC: keep matmul/SDPA, recompute elementwise)
+    anima_block_checkpointing_interval: int = 1  # checkpoint every Nth block (1 = all blocks); N>1 trades VRAM for less recompute
     anima_block_prefetch: bool = False  # async prefetch CPU-pinned DiT Linear weights for streaming_offload
     anima_block_prefetch_depth: int = 1  # number of future DiT blocks to prefetch
+    anima_block_prefetch_mode: str = "original"  # original (fixed-depth) | adaptive (blockskip-aware + online depth-adaptive); default = byte-parity
     anima_train_llm_adapter: bool = False  # ordinary Anima LoRA keeps LLM adapter frozen/cached unless explicitly requested
     anima_fixed_text_tokens: int = 0  # 0 = dynamic batch pad, e.g. 512 for Anima fast profile
     anima_fixed_visual_tokens: int = 0  # 0 = keep cached size, e.g. 4096 for static-shape profile
@@ -1683,11 +1768,16 @@ class UnifiedTrainingConfig(BaseModel):
             "bnb": "bnb_8bit",
             "bitsandbytes": "bnb_8bit",
             "bitsandbytes_8bit": "bnb_8bit",
+            "torchao": "ao_8bit",
+            "torchao_8bit": "ao_8bit",
+            "ao": "ao_8bit",
+            "compile": "compiled_step",
+            "compiled": "compiled_step",
             "lulynx": "lulynx_fused",
             "lulynx_fused_adamw": "lulynx_fused",
         }
         optimizer_backend = optimizer_backend_aliases.get(optimizer_backend.replace(" ", ""), optimizer_backend)
-        if optimizer_backend not in {"auto", "torch_adamw", "foreach_adamw", "torch_fused", "bnb_8bit", "apex", "lulynx_fused"}:
+        if optimizer_backend not in {"auto", "torch_adamw", "foreach_adamw", "torch_fused", "bnb_8bit", "ao_8bit", "compiled_step", "apex", "lulynx_fused"}:
             optimizer_backend = "auto"
         normalized["optimizer_backend"] = optimizer_backend
         advanced_optimizer_strategy = str(normalized.get("advanced_optimizer_strategy", "auto") or "auto").strip().lower().replace("-", "_").replace("+", "_plus")
@@ -1731,6 +1821,8 @@ class UnifiedTrainingConfig(BaseModel):
                 "lycoris-ia3": "ia3",
                 "lycoris-full": "full",
                 "lycoris-diag-oft": "diag-oft",
+                "lycoris-glora": "glora",
+                "lycoris-glokr": "glokr",
                 "oft": "diag-oft",
             }
             normalized["lycoris_algo"] = lycoris_aliases.get(lycoris_algo, lycoris_algo)
@@ -2089,4 +2181,3 @@ class UnifiedTrainingConfig(BaseModel):
             warnings.append('mixed_precision=fp16 但 save_precision=bf16，在旧显卡上可能崩溃')
 
         return (len(errors) == 0, errors, warnings)
-

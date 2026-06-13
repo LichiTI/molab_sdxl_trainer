@@ -134,6 +134,27 @@ def _load_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def _annotate_gpu_bubble_report_case(path: Path, case: BubbleClosedLoopCase) -> None:
+    report = _load_json(path)
+    if str(report.get("report") or "") != "gpu_bubble_experiment_report_v0":
+        return
+    benchmark = dict(_mapping(report.get("benchmark")))
+    updated = False
+    for key, value in (
+        ("case_id", case.case_id),
+        ("case", case.case_id),
+        ("family", case.family),
+        ("description", case.description),
+    ):
+        if benchmark.get(key):
+            continue
+        benchmark[key] = value
+        updated = True
+    if updated or not isinstance(report.get("benchmark"), Mapping):
+        report["benchmark"] = benchmark
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def _manifest_has_closed_loop_state(path: Path) -> bool:
     try:
         extra = _mapping(_load_json(path).get("extra"))
@@ -340,6 +361,7 @@ def run_bubble_closed_loop_case(
         result["status"] = "failed"
         result["reason"] = "missing_gpu_bubble_report"
         return result
+    _annotate_gpu_bubble_report_case(report_path, case)
 
     manifests = _manifest_paths(case_dir)
     closed_loop_manifests = [path for path in manifests if _manifest_has_closed_loop_state(path)]

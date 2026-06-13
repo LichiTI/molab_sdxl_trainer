@@ -24,6 +24,7 @@ from .module_offload_contract import (
 from .device_state import capture_module_state, module_runtime_state
 from .activation_compression import ActivationCompressionContext
 from .step_phase_profile import StepPhaseProfiler
+from .newbie_backward_op_profile import NewbieModuleTimingProfiler
 from core.turbocore_native_update_dispatch_arming import TurboCoreNativeUpdateDispatchArmer
 from core.turbocore_native_update_dispatch_runtime import TurboCoreNativeUpdateDispatchRuntime
 from core.turbocore_native_update_probe_cache import (
@@ -80,6 +81,8 @@ from .training_step_orchestrator_handlers import (
     run_lulynx_turbocore_native_update_runtime_profile_stage_handler,
     run_lulynx_transfer_conditioning_stage_handler,
 )
+from .training_loop_turbocore_runtime import TrainingLoopTurbocoreRuntimeMixin
+from .training_loop_runtime_memory import TrainingLoopRuntimeMemoryMixin
 try:
     from tqdm import tqdm
 except ImportError:
@@ -160,6 +163,7 @@ def _module_offload_conflict_details(
     training_type: str,
     easy_control: Any,
     ip_adapter: Any,
+    easycontrol_v2_adapter: Any = None,
 ) -> Optional[tuple[str, str]]:
     if not request.requested:
         return None
@@ -171,7 +175,7 @@ def _module_offload_conflict_details(
     if deepspeed:
         return get_module_offload_conflict("deepspeed")
     route = str(training_type or "").strip().lower().replace("_", "-")
-    if easy_control is not None or ip_adapter is not None or any(
+    if easy_control is not None or ip_adapter is not None or easycontrol_v2_adapter is not None or any(
         token in route for token in ("controlnet", "ip-adapter", "lllite")
     ):
         return get_module_offload_conflict("pipeline")
@@ -190,7 +194,7 @@ def _module_offload_conflict_details(
     return None
 
 
-class TrainingLoop:
+class TrainingLoop(TrainingLoopTurbocoreRuntimeMixin, TrainingLoopRuntimeMemoryMixin):
     """训练循环"""
     
     def __init__(
@@ -209,6 +213,7 @@ class TrainingLoop:
         dtype: torch.dtype = torch.bfloat16,
         gradient_accumulation_steps: int = 4,
         gradient_accumulation_mode: str = "fast",
+        thermal_throttler: Optional[Any] = None,
         max_grad_norm: float = 1.0,
         noise_offset: float = 0.0,
         snr_gamma: Optional[float] = None,
@@ -307,6 +312,13 @@ class TrainingLoop:
         anima_weighting_scheme: str = "none",
         anima_model_prediction_type: str = "velocity",
         anima_mode_scale: float = 1.0,
+        anima_faithful_forward: bool = False,
+        # ── JLT EMA feature self-distillation alignment (default-off) ──
+        anima_ema_feat_align_enabled: bool = False,
+        anima_ema_feat_align_weight: float = 0.0,
+        anima_ema_feat_align_teacher_layers: str = "",
+        anima_ema_feat_align_student_layers: str = "",
+        anima_ema_feat_align_decay: float = 0.9999,
         # ── SDXL Flow Matching ──
         flow_model: str = "",
         sdxl_timestep_sampling: str = "uniform",
@@ -342,6 +354,7 @@ class TrainingLoop:
         enable_fixed_token_padding: bool = False,
         easy_control: Optional[torch.nn.Module] = None,
         ip_adapter: Optional[torch.nn.Module] = None,
+        easycontrol_v2_adapter: Optional[torch.nn.Module] = None,
         repa_enabled: bool = False,
         repa_target_modules: str = "",
         repa_loss_type: str = "cosine",
@@ -388,6 +401,9 @@ class TrainingLoop:
         activation_compression_enabled: bool = False,
         activation_compression_dtype: str = "fp16",
         activation_compression_min_tensor_mb: float = 1.0,
+        activation_cpu_offload_enabled: bool = False,
+        activation_cpu_offload_min_tensor_mb: float = 1.0,
+        activation_cpu_offload_pool_gb: float = 1.0,
         resolution_aware_batch_enabled: bool = False,
         resolution_aware_batch_base_resolution: int = 1024,
         resolution_aware_batch_max_factor: float = 4.0,
@@ -402,6 +418,7 @@ class TrainingLoop:
         spectral_noise_sigma: float = 4.0,
         huber_auto_percentile: float = 0.9,
         adaptive_loss_weighter: Optional[torch.nn.Module] = None,
+        flow_uncertainty_weighter: Optional[torch.nn.Module] = None,
         faster_dit_snr_weighter: Optional[torch.nn.Module] = None,
         sageattn_drift_check_interval: int = 0,
         sageattn_drift_threshold: float = 0.01,
@@ -472,6 +489,9 @@ class TrainingLoop:
         self.dtype = dtype
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.gradient_accumulation_mode = self._normalize_gradient_accumulation_mode(gradient_accumulation_mode)
+        # Step-boundary GPU duty-cycle/temperature governor (None = off).
+        self._thermal_throttler = thermal_throttler
+        self._last_thermal_throttle_report: Dict[str, Any] = {}
         self.max_grad_norm = max_grad_norm
         self.noise_offset = noise_offset
         self.snr_gamma = snr_gamma
@@ -572,6 +592,21 @@ class TrainingLoop:
         self.anima_weighting_scheme = anima_weighting_scheme
         self.anima_model_prediction_type = anima_model_prediction_type
         self.anima_mode_scale = anima_mode_scale
+        # Opt-in faithful native forward (#147): t=sigma in [0,1] + frozen
+        # llm_adapter cross-attn context + 3D-RoPE forward. Default False keeps
+        # the legacy (#132) path bitwise-unchanged.
+        self.anima_faithful_forward = bool(anima_faithful_forward)
+        # JLT EMA feature self-distillation alignment (default-off reserve).
+        # Shadow + captured student features are created lazily on the first
+        # enabled step (see forward/loss handlers), so the default path is
+        # untouched. See anima_ema_feature_align.py.
+        self.anima_ema_feat_align_enabled = bool(anima_ema_feat_align_enabled)
+        self.anima_ema_feat_align_weight = float(anima_ema_feat_align_weight or 0.0)
+        self.anima_ema_feat_align_teacher_layers = str(anima_ema_feat_align_teacher_layers or "")
+        self.anima_ema_feat_align_student_layers = str(anima_ema_feat_align_student_layers or "")
+        self.anima_ema_feat_align_decay = float(anima_ema_feat_align_decay or 0.9999)
+        self._ema_lora_shadow = None
+        self._ema_feat_student_features = None
         # SDXL Flow Matching
         self.flow_model = flow_model
         self.sdxl_timestep_sampling = sdxl_timestep_sampling
@@ -621,6 +656,7 @@ class TrainingLoop:
         self.spectral_noise_sigma = float(spectral_noise_sigma)
         self.huber_auto_percentile = float(huber_auto_percentile)
         self.adaptive_loss_weighter = adaptive_loss_weighter
+        self.flow_uncertainty_weighter = flow_uncertainty_weighter
         self.faster_dit_snr_weighter = faster_dit_snr_weighter
         self._drift_monitor = None
         if int(sageattn_drift_check_interval or 0) > 0:
@@ -702,6 +738,7 @@ class TrainingLoop:
         self.qwen3_tokenizer = qwen3_tokenizer
         self.easy_control = easy_control
         self.ip_adapter = ip_adapter
+        self.easycontrol_v2_adapter = easycontrol_v2_adapter
         self.repa_enabled = bool(repa_enabled) and float(repa_loss_weight or 0.0) > 0.0
         self.repa_loss_type = str(repa_loss_type or "cosine")
         self.repa_loss_weight = float(repa_loss_weight or 0.0)
@@ -818,6 +855,7 @@ class TrainingLoop:
         self._current_sync_gradients = True
         self._current_accumulation_group_start = True
         self._turbocore_direct_grad_lifecycle_report: Dict[str, Any] = {}
+        self._turbocore_native_update_direct_grad_lifecycle_report: Dict[str, Any] = {}
         self._should_stop = False
         self.pcgrad_enabled = False
         self.pcgrad_conflict_threshold = 0.0
@@ -926,6 +964,7 @@ class TrainingLoop:
             training_type=training_type,
             easy_control=easy_control,
             ip_adapter=ip_adapter,
+            easycontrol_v2_adapter=self.easycontrol_v2_adapter,
         )
         if module_offload_conflict is not None:
             _, self._module_offload_disabled_reason = module_offload_conflict
@@ -1100,6 +1139,26 @@ class TrainingLoop:
                 activation_compression_dtype,
                 float(activation_compression_min_tensor_mb or 0.0),
             )
+        from .activation_offload import ActivationCpuOffloadContext
+        self._activation_offload_ctx = ActivationCpuOffloadContext(
+            enabled=bool(activation_cpu_offload_enabled),
+            min_tensor_bytes=int(max(float(activation_cpu_offload_min_tensor_mb or 0.0), 0.0) * 1024 * 1024),
+            pool_gb=float(activation_cpu_offload_pool_gb or 1.0),
+            device=str(device),
+        )
+        if activation_cpu_offload_enabled:
+            guarded = self._activation_offload_ctx.register_parameter_guard(unet)
+            logger.info(
+                "Activation CPU offload enabled: min_tensor_mb=%.2f pool_gb=%.2f guarded_tensors=%d",
+                float(activation_cpu_offload_min_tensor_mb or 0.0),
+                float(activation_cpu_offload_pool_gb or 1.0),
+                guarded,
+            )
+            if activation_compression_enabled:
+                logger.warning(
+                    "Activation CPU offload and activation compression are both enabled; "
+                    "saved-tensor hooks do not nest, offload takes precedence."
+                )
 
         if self._turbocore_native_update_gate.requested:
             self._refresh_turbocore_native_update_readiness()
@@ -1212,11 +1271,22 @@ class TrainingLoop:
         """Return lightweight telemetry for experimental memory optimizers."""
 
         profile: Dict[str, Any] = {}
+        newbie_backward_op_profile = getattr(self, "_newbie_backward_op_profile", None)
+        if isinstance(newbie_backward_op_profile, dict) and newbie_backward_op_profile:
+            profile["newbie_backward_op_profile"] = dict(newbie_backward_op_profile)
+        newbie_module_timing_profile = getattr(self, "_newbie_module_timing_profile", None)
+        if isinstance(newbie_module_timing_profile, dict) and newbie_module_timing_profile:
+            profile["newbie_module_timing_profile"] = dict(newbie_module_timing_profile)
         if getattr(self, "_activation_compression_ctx", None) is not None:
             try:
                 profile["activation_compression"] = self._activation_compression_ctx.as_dict()
             except Exception as exc:
                 profile["activation_compression_error"] = f"{type(exc).__name__}: {exc}"
+        if getattr(self, "_activation_offload_ctx", None) is not None:
+            try:
+                profile["activation_cpu_offload"] = self._activation_offload_ctx.as_dict()
+            except Exception as exc:
+                profile["activation_cpu_offload_error"] = f"{type(exc).__name__}: {exc}"
         gr = getattr(self, "_gradient_release_manager", None)
         if gr is not None:
             try:
@@ -1314,6 +1384,89 @@ class TrainingLoop:
             self.memory_optimization_state["training_loop_runtime"] = dict(profile)
         return dict(profile)
 
+    def _should_profile_newbie_backward_ops(self) -> bool:
+        if str(getattr(self, "_model_arch", "") or "").strip().lower() != "newbie":
+            return False
+        if not bool(getattr(self, "newbie_backward_op_profile_enabled", False)):
+            return False
+        max_samples = max(int(getattr(self, "newbie_backward_op_profile_max_samples", 1) or 1), 1)
+        samples = getattr(self, "_newbie_backward_op_profile_samples", None)
+        return len(samples) < max_samples if isinstance(samples, list) else True
+
+    def _record_newbie_backward_op_profile(self, report: dict[str, Any]) -> None:
+        if not isinstance(report, dict) or not report:
+            return
+        sample = dict(report)
+        sample["step"] = int(getattr(self, "global_step", 0) or 0)
+        samples = getattr(self, "_newbie_backward_op_profile_samples", None)
+        if not isinstance(samples, list):
+            samples = []
+        samples.append(sample)
+        max_samples = max(int(getattr(self, "newbie_backward_op_profile_max_samples", 1) or 1), 1)
+        if len(samples) > max_samples:
+            samples = samples[-max_samples:]
+        self._newbie_backward_op_profile_samples = samples
+        self._newbie_backward_op_profile = {
+            "report": "newbie_backward_op_profile_window_v0",
+            "enabled": True,
+            "sample_count": len(samples),
+            "max_samples": max_samples,
+            "latest": dict(sample),
+            "samples": [dict(item) for item in samples],
+        }
+
+    def _should_profile_newbie_module_timing(self) -> bool:
+        if str(getattr(self, "_model_arch", "") or "").strip().lower() != "newbie":
+            return False
+        if not bool(getattr(self, "newbie_module_timing_profile_enabled", False)):
+            return False
+        max_samples = max(int(getattr(self, "newbie_module_timing_profile_max_samples", 1) or 1), 1)
+        samples = getattr(self, "_newbie_module_timing_profile_samples", None)
+        return len(samples) < max_samples if isinstance(samples, list) else True
+
+    def _start_newbie_module_timing_profile(self) -> NewbieModuleTimingProfiler | None:
+        if not self._should_profile_newbie_module_timing():
+            return None
+        try:
+            profiler = NewbieModuleTimingProfiler(
+                self.unet,
+                top_k=max(int(getattr(self, "newbie_module_timing_profile_top_k", 12) or 12), 1),
+            ).attach()
+        except Exception as exc:
+            self._record_newbie_module_timing_profile(
+                {
+                    "report": "newbie_module_timing_profile_v0",
+                    "status": "profile_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "runtime_default_change": False,
+                    "probe_only": True,
+                }
+            )
+            return None
+        return profiler if profiler.enabled else None
+
+    def _record_newbie_module_timing_profile(self, report: dict[str, Any]) -> None:
+        if not isinstance(report, dict) or not report:
+            return
+        sample = dict(report)
+        sample["step"] = int(getattr(self, "global_step", 0) or sample.get("step", 0) or 0)
+        samples = getattr(self, "_newbie_module_timing_profile_samples", None)
+        if not isinstance(samples, list):
+            samples = []
+        samples.append(sample)
+        max_samples = max(int(getattr(self, "newbie_module_timing_profile_max_samples", 1) or 1), 1)
+        if len(samples) > max_samples:
+            samples = samples[-max_samples:]
+        self._newbie_module_timing_profile_samples = samples
+        self._newbie_module_timing_profile = {
+            "report": "newbie_module_timing_profile_window_v0",
+            "enabled": True,
+            "sample_count": len(samples),
+            "max_samples": max_samples,
+            "latest": dict(sample),
+            "samples": [dict(item) for item in samples],
+        }
+
     @staticmethod
     def _normalize_gradient_accumulation_mode(mode: Optional[str]) -> str:
         normalized = str(mode or "fast").strip().lower()
@@ -1366,502 +1519,10 @@ class TrainingLoop:
             return prediction, target
         return prediction.float(), target.float()
 
-    @staticmethod
-    def _normalize_cuda_cache_release_strategy(strategy: Optional[str]) -> str:
-        normalized = str(strategy or "oom_only").strip().lower()
-        aliases = {
-            "none": "off",
-            "false": "off",
-            "0": "off",
-            "disabled": "off",
-            "oom": "oom_only",
-            "on_oom": "oom_only",
-            "safe": "oom_only",
-            "phase": "phase_boundary",
-            "boundary": "phase_boundary",
-            "component_offload": "phase_boundary",
-            "after_step": "aggressive",
-            "every_step": "aggressive",
-        }
-        normalized = aliases.get(normalized, normalized)
-        return (
-            normalized
-            if normalized in {"off", "oom_only", "phase_boundary", "after_optimizer", "aggressive"}
-            else "oom_only"
-        )
-
-    def _record_transfer_profile_sample(self, label: str, bytes_moved: int, elapsed_seconds: float) -> None:
-        self._transfer_profile_seconds += max(float(elapsed_seconds or 0.0), 0.0)
-        self._transfer_profile_bytes += int(bytes_moved)
-        self._transfer_profile_ops += 1
-        bucket = self._transfer_profile_by_label.setdefault(
-            label,
-            {"seconds": 0.0, "bytes": 0.0, "ops": 0.0},
-        )
-        bucket["seconds"] += max(float(elapsed_seconds or 0.0), 0.0)
-        bucket["bytes"] += float(bytes_moved)
-        bucket["ops"] += 1.0
-
-    def _flush_transfer_profile_events(self) -> None:
-        if not self._transfer_profile_pending_events:
-            return
-        pending = self._transfer_profile_pending_events
-        self._transfer_profile_pending_events = []
-        for event in pending:
-            end_event = event.get("end")
-            start_event = event.get("start")
-            try:
-                if end_event is not None:
-                    end_event.synchronize()
-                elapsed_ms = float(start_event.elapsed_time(end_event)) if start_event is not None and end_event is not None else 0.0
-            except Exception as exc:
-                logger.debug("data transfer CUDA event profiling sample skipped: %s", exc)
-                continue
-            self._record_transfer_profile_sample(
-                str(event.get("label", "unknown")),
-                int(event.get("bytes", 0) or 0),
-                elapsed_ms / 1000.0,
-            )
-
-    def _profiled_to(
-        self,
-        tensor: torch.Tensor,
-        *,
-        label: str,
-        device: Optional[Any] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> torch.Tensor:
-        target_device = self.device if device is None else device
-        non_blocking = bool(getattr(self, "data_transfer_non_blocking", True))
-        profile_enabled = bool(getattr(self, "data_transfer_profile_enabled", False))
-        profile_mode = self._normalize_data_transfer_profile_mode(
-            getattr(self, "data_transfer_profile_mode", "event")
-        )
-        profile_enabled = profile_enabled and profile_mode != "off"
-        bytes_moved = int(tensor.numel() * tensor.element_size())
-        cuda_profile = profile_enabled and torch.cuda.is_available() and str(target_device).startswith("cuda")
-
-        if cuda_profile and profile_mode == "sync":
-            torch.cuda.synchronize()
-        start_event = end_event = None
-        if cuda_profile and profile_mode == "event":
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-        start = time.perf_counter() if profile_enabled and (not cuda_profile or profile_mode == "sync") else 0.0
-        moved = tensor.to(device=target_device, dtype=dtype, non_blocking=non_blocking)
-        if profile_enabled:
-            if cuda_profile and profile_mode == "event":
-                end_event.record()
-                self._transfer_profile_pending_events.append(
-                    {
-                        "label": label,
-                        "bytes": bytes_moved,
-                        "start": start_event,
-                        "end": end_event,
-                    }
-                )
-            elif cuda_profile and profile_mode == "sync":
-                torch.cuda.synchronize()
-                self._record_transfer_profile_sample(label, bytes_moved, time.perf_counter() - start)
-            else:
-                self._record_transfer_profile_sample(label, bytes_moved, time.perf_counter() - start)
-        return moved
-
-    def _module_device_dtype(self, module: Optional[torch.nn.Module]) -> tuple[torch.device, torch.dtype]:
-        if module is None:
-            return self._runtime_device, self.dtype
-        try:
-            param = next(module.parameters())
-        except StopIteration:
-            return self._runtime_device, self.dtype
-        return param.device, param.dtype
-
-    def _move_module_for_runtime(
-        self,
-        module: Optional[torch.nn.Module],
-        *,
-        dtype: Optional[torch.dtype] = None,
-    ) -> tuple[bool, torch.device, torch.dtype]:
-        original_device, original_dtype = self._module_device_dtype(module)
-        if module is None:
-            return False, original_device, original_dtype
-        target_dtype = original_dtype if dtype is None else dtype
-        moved = original_device != self._runtime_device or original_dtype != target_dtype
-        if moved:
-            module.to(device=self._runtime_device, dtype=target_dtype)
-        return moved, original_device, original_dtype
-
-    def _restore_module_after_runtime(
-        self,
-        module: Optional[torch.nn.Module],
-        moved: bool,
-        original_device: torch.device,
-        original_dtype: torch.dtype,
-    ) -> None:
-        if module is None or not moved:
-            return
-        module.to(device=original_device, dtype=original_dtype)
-
-    def _refresh_module_offload_stats(self) -> None:
-        if self._module_offload_manager is not None:
-            self.memory_optimization_state["runtime_stats"] = self._module_offload_manager.stats_dict()
-
-    def _cuda_memory_snapshot(self) -> Dict[str, float]:
-        if not torch.cuda.is_available():
-            return {}
-        try:
-            torch.cuda.synchronize()
-        except Exception:
-            pass
-        allocated = float(torch.cuda.memory_allocated()) / (1024 * 1024)
-        reserved = float(torch.cuda.memory_reserved()) / (1024 * 1024)
-        peak_allocated = float(torch.cuda.max_memory_allocated()) / (1024 * 1024)
-        peak_reserved = float(torch.cuda.max_memory_reserved()) / (1024 * 1024)
-        return {
-            "allocated_mb": round(allocated, 1),
-            "reserved_mb": round(reserved, 1),
-            "peak_allocated_mb": round(peak_allocated, 1),
-            "peak_reserved_mb": round(peak_reserved, 1),
-            "reserved_gap_mb": round(max(reserved - allocated, 0.0), 1),
-            "peak_reserved_gap_mb": round(max(peak_reserved - peak_allocated, 0.0), 1),
-        }
-
-    def _build_peak_vram_diagnostics(self, stages: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
-        normalized = {
-            str(name): dict(snapshot)
-            for name, snapshot in stages.items()
-            if isinstance(snapshot, dict) and snapshot
-        }
-        if not normalized:
-            return {}
-        max_reserved_stage = max(
-            normalized,
-            key=lambda name: float(normalized[name].get("peak_reserved_mb", 0.0) or 0.0),
-        )
-        max_allocated_stage = max(
-            normalized,
-            key=lambda name: float(normalized[name].get("peak_allocated_mb", 0.0) or 0.0),
-        )
-        return {
-            "stages": normalized,
-            "max_reserved_stage": max_reserved_stage,
-            "max_reserved_mb": round(float(normalized[max_reserved_stage].get("peak_reserved_mb", 0.0) or 0.0), 1),
-            "max_allocated_stage": max_allocated_stage,
-            "max_allocated_mb": round(float(normalized[max_allocated_stage].get("peak_allocated_mb", 0.0) or 0.0), 1),
-            "allocator_cache_gap_mb": round(
-                max(
-                    float(normalized[max_reserved_stage].get("peak_reserved_mb", 0.0) or 0.0)
-                    - float(normalized[max_reserved_stage].get("peak_allocated_mb", 0.0) or 0.0),
-                    0.0,
-                ),
-                1,
-            ),
-        }
-
-    def _maybe_release_cuda_cache(self, phase: str, step: int, *, force: bool = False) -> Dict[str, Any]:
-        strategy = self._cuda_cache_release_strategy
-        if not force and strategy == "off":
-            return {}
-        if not torch.cuda.is_available():
-            return {}
-        phase = str(phase or "")
-        if not force:
-            allowed = False
-            phase_key = phase
-            if strategy == "oom_only":
-                allowed = False
-            elif strategy == "after_optimizer":
-                allowed = phase == "after_optimizer"
-            elif strategy == "phase_boundary":
-                allowed = phase == "phase_boundary"
-            elif strategy == "aggressive":
-                allowed = phase in {"after_optimizer", "phase_boundary", "swap_prepare"}
-            if not allowed:
-                return {}
-            interval = max(int(self._cuda_cache_release_interval or 1), 1)
-            if int(step or 0) % interval != 0:
-                return {}
-            seen_step = self._cuda_cache_release_seen_steps.get(phase_key)
-            if seen_step == int(step or 0):
-                return {}
-        else:
-            phase_key = phase
-        before = self._cuda_memory_snapshot()
-        started = time.perf_counter()
-        try:
-            torch.cuda.empty_cache()
-            after = self._cuda_memory_snapshot()
-        except Exception as exc:
-            report = {
-                "strategy": strategy,
-                "phase": phase,
-                "step": int(step or 0),
-                "forced": bool(force),
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-            self._last_cuda_cache_release = report
-            return report
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        before_reserved = float(before.get("reserved_mb", 0.0) or 0.0)
-        after_reserved = float(after.get("reserved_mb", 0.0) or 0.0)
-        before_allocated = float(before.get("allocated_mb", 0.0) or 0.0)
-        after_allocated = float(after.get("allocated_mb", 0.0) or 0.0)
-        report = {
-            "strategy": strategy,
-            "phase": phase,
-            "step": int(step or 0),
-            "forced": bool(force),
-            "ok": True,
-            "elapsed_ms": round(elapsed_ms, 2),
-            "before": before,
-            "after": after,
-            "released_reserved_mb": round(max(before_reserved - after_reserved, 0.0), 1),
-            "released_allocated_mb": round(max(before_allocated - after_allocated, 0.0), 1),
-        }
-        self._cuda_cache_release_seen_steps[phase_key] = int(step or 0)
-        self._last_cuda_cache_release = report
-        return report
-
-    def _update_precision_swap_observations(
-        self,
-        step_wall_seconds: float,
-        step_info: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        profile = self.memory_optimization_state.get("precision_swap_profile")
-        if not isinstance(profile, dict):
-            return
-        self._runtime_observation_steps += 1
-        self._runtime_observation_total_step_seconds += max(float(step_wall_seconds or 0.0), 0.0)
-        stats = getattr(getattr(self, "_block_offloader", None), "stats", None)
-        observations: Dict[str, Any] = dict(profile.get("runtime_observations") or {})
-        observations.update(
-            {
-                "steps_observed": int(self._runtime_observation_steps),
-                "last_step_wall_seconds": round(float(step_wall_seconds or 0.0), 4),
-                "avg_step_wall_seconds": round(
-                    self._runtime_observation_total_step_seconds / max(self._runtime_observation_steps, 1),
-                    4,
-                ),
-            }
-        )
-        if stats is not None:
-            observations.update(
-                {
-                    "swap_count": int(getattr(stats, "swap_count", 0) or 0),
-                    "wait_count": int(getattr(stats, "wait_count", 0) or 0),
-                    "total_swap_ms": round(float(getattr(stats, "total_swap_ms", 0.0) or 0.0), 2),
-                    "prepare_count": int(getattr(stats, "prepare_count", 0) or 0),
-                    "total_prepare_ms": round(float(getattr(stats, "total_prepare_ms", 0.0) or 0.0), 2),
-                }
-            )
-        if isinstance(step_info, dict) and isinstance(step_info.get("peak_vram_stages"), dict):
-            observations["peak_vram_stages"] = dict(step_info["peak_vram_stages"])
-        if isinstance(step_info, dict) and isinstance(step_info.get("peak_vram_diagnostics"), dict):
-            observations["peak_vram_diagnostics"] = dict(step_info["peak_vram_diagnostics"])
-        if isinstance(step_info, dict) and isinstance(step_info.get("cuda_cache_release"), dict):
-            observations["cuda_cache_release"] = dict(step_info["cuda_cache_release"])
-        if isinstance(step_info, dict) and isinstance(step_info.get("precision_swap_offload"), dict):
-            observations["precision_swap_offload"] = dict(step_info["precision_swap_offload"])
-        profile["runtime_observations"] = observations
-        self.memory_optimization_state["precision_swap_profile"] = profile
-        self.memory_optimization_state["runtime_observations"] = observations
-
-    def _update_block_swap_profile(self) -> None:
-        offloader = getattr(self, "_block_offloader", None)
-        profile_fn = getattr(offloader, "profile_state", None)
-        if not callable(profile_fn):
-            return
-        try:
-            self.memory_optimization_state["block_swap_profile"] = profile_fn()
-        except Exception as exc:
-            self.memory_optimization_state["block_swap_profile_error"] = str(exc)
-
-    def _update_vram_smart_sensing_runtime(
-        self,
-        step_wall_seconds: float,
-        step_info: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Runtime-only slowdown sensing. It never mutates training strategy."""
-
-        if not self.vram_smart_sensing_enabled:
-            return {}
-        step_seconds = max(float(step_wall_seconds or 0.0), 0.0)
-        if step_seconds <= 0.0:
-            return {}
-        self._smart_sensing_observed_steps += 1
-        observed = int(self._smart_sensing_observed_steps)
-        baseline_steps = int(self.vram_smart_sensing_baseline_steps)
-        if observed <= baseline_steps:
-            self._smart_sensing_baseline_total_seconds += step_seconds
-            if observed < baseline_steps:
-                return {}
-        baseline_avg = self._smart_sensing_baseline_total_seconds / max(min(observed, baseline_steps), 1)
-        if observed == baseline_steps:
-            report = {
-                "enabled": True,
-                "phase": "baseline_ready",
-                "observed_steps": observed,
-                "baseline_steps": baseline_steps,
-                "baseline_avg_step_seconds": round(float(baseline_avg), 4),
-                "slowdown_ratio_threshold": round(float(self.vram_smart_sensing_slowdown_ratio), 3),
-                "action": "observe",
-                "recommendations": [],
-            }
-            self._last_vram_smart_sensing_report = report
-            return report
-
-        self._smart_sensing_recent_seconds.append(step_seconds)
-        if len(self._smart_sensing_recent_seconds) > self.vram_smart_sensing_window_steps:
-            self._smart_sensing_recent_seconds.pop(0)
-        window_avg = sum(self._smart_sensing_recent_seconds) / max(len(self._smart_sensing_recent_seconds), 1)
-        ratio = window_avg / max(baseline_avg, 1e-6)
-        if ratio < self.vram_smart_sensing_slowdown_ratio:
-            return {}
-
-        cuda = self._cuda_memory_snapshot()
-        free_mb = 0.0
-        total_mb = 0.0
-        used_fraction = 0.0
-        if torch.cuda.is_available():
-            try:
-                free_bytes, total_bytes = torch.cuda.mem_get_info()
-                free_mb = float(free_bytes) / (1024.0 * 1024.0)
-                total_mb = float(total_bytes) / (1024.0 * 1024.0)
-                used_fraction = 1.0 - (free_mb / max(total_mb, 1.0))
-            except Exception:
-                free_mb = 0.0
-                total_mb = 0.0
-        reserved_mb = float(cuda.get("reserved_mb", 0.0) or 0.0)
-        reserved_fraction = reserved_mb / max(total_mb, 1.0) if total_mb > 0.0 else 0.0
-        vram_pressure = bool(
-            (total_mb > 0.0 and used_fraction >= 0.92)
-            or (total_mb > 0.0 and reserved_fraction >= 0.90)
-            or (free_mb > 0.0 and free_mb <= 768.0)
-        )
-        recommendations = ["check_shared_vram_or_pageable_memory"]
-        if vram_pressure:
-            recommendations.extend([
-                "enable_streaming_offload",
-                "enable_streaming_prefetch",
-                "enable_sparse_swap",
-                "enable_delta_cache_observe",
-            ])
-        else:
-            recommendations.append("inspect_data_or_cpu_pipeline")
-        report = {
-            "enabled": True,
-            "phase": "runtime_slowdown",
-            "observed_steps": observed,
-            "baseline_steps": baseline_steps,
-            "baseline_avg_step_seconds": round(float(baseline_avg), 4),
-            "window_steps": len(self._smart_sensing_recent_seconds),
-            "window_avg_step_seconds": round(float(window_avg), 4),
-            "last_step_wall_seconds": round(float(step_seconds), 4),
-            "slowdown_ratio": round(float(ratio), 3),
-            "slowdown_ratio_threshold": round(float(self.vram_smart_sensing_slowdown_ratio), 3),
-            "vram_pressure": vram_pressure,
-            "shared_vram_suspected": bool(vram_pressure),
-            "cuda": {
-                **cuda,
-                "free_mb": round(float(free_mb), 1),
-                "total_mb": round(float(total_mb), 1),
-                "used_fraction": round(float(used_fraction), 4),
-                "reserved_fraction": round(float(reserved_fraction), 4),
-            },
-            "action": "recommend_only",
-            "recommendations": recommendations,
-            "notes": [
-                "runtime sensing is advisory only; it does not change residency, cache, or transfer format mid-run",
-                "shared_vram_suspected is inferred from slowdown plus CUDA memory pressure, not a direct OS shared-memory counter",
-            ],
-        }
-        if isinstance(step_info, dict) and isinstance(step_info.get("data_transfer_profile"), dict):
-            report["data_transfer_profile"] = dict(step_info["data_transfer_profile"])
-        self._last_vram_smart_sensing_report = report
-        return report
-
-    def _verify_phase_module_states(self, phase: str) -> None:
-        if not self._module_offload_verify_state:
-            return
-        expected = {
-            "unet": (self.unet, self._runtime_device, True, None),
-            "vae": (self.vae, torch.device("cpu") if self._vae_cpu_residency else self._runtime_device, False, False),
-            "text_encoder_1": (
-                self.text_encoder_1,
-                torch.device("cpu") if self._text_encoder_cpu_residency else self._runtime_device,
-                self._train_text_encoder_1,
-                None if self._train_text_encoder_1 else False,
-            ),
-            "text_encoder_2": (
-                self.text_encoder_2,
-                torch.device("cpu") if self._text_encoder_cpu_residency else self._runtime_device,
-                self._train_text_encoder_2,
-                None if self._train_text_encoder_2 else False,
-            ),
-        }
-        for name, (module, expected_device, expected_training, expected_requires_grad) in expected.items():
-            state = capture_module_state(module)
-            if state is None:
-                continue
-            expected_device = torch.device(expected_device)
-            if name == "unet" and self._module_offload_manager is not None:
-                pass
-            elif state.device.type != expected_device.type:
-                if name == "unet" and module is not None:
-                    active_param = next((param for param in module.parameters() if param.requires_grad), None)
-                    if active_param is not None and active_param.device.type == expected_device.type:
-                        continue
-                message = f"[module-offload-state] {phase}: {name} is on {state.device}, expected {expected_device}"
-                if name == "unet":
-                    raise RuntimeError(message)
-                logger.warning(message)
-            if state.training != bool(expected_training):
-                logger.warning(
-                    "[module-offload-state] %s: %s training=%s expected=%s",
-                    phase,
-                    name,
-                    state.training,
-                    expected_training,
-                )
-            if expected_requires_grad is not None and state.requires_grad != bool(expected_requires_grad):
-                logger.warning(
-                    "[module-offload-state] %s: %s requires_grad=%s expected=%s",
-                    phase,
-                    name,
-                    state.requires_grad,
-                    expected_requires_grad,
-                )
-
-    def _ensure_cpu_resident_components(self, phase: str) -> None:
-        """Keep frozen SDXL helper modules out of VRAM between encode phases."""
-        moved_from_cuda = False
-
-        def _move_to_cpu(module: Optional[torch.nn.Module], name: str) -> None:
-            nonlocal moved_from_cuda
-            state = capture_module_state(module)
-            if module is None or state is None:
-                return
-            needs_grad_fix = state.requires_grad is not False
-            needs_mode_fix = state.training is not False
-            if state.device.type == "cpu" and state.dtype == torch.float32 and not needs_grad_fix and not needs_mode_fix:
-                return
-            if state.device.type == "cuda":
-                moved_from_cuda = True
-            module.eval()
-            module.requires_grad_(False)
-            module.to(device="cpu", dtype=torch.float32)
-            logger.debug("[component-residency] %s: moved %s to cpu/float32", phase, name)
-
-        if self._vae_cpu_residency:
-            _move_to_cpu(self.vae, "vae")
-        if self._text_encoder_cpu_residency:
-            _move_to_cpu(self.text_encoder_1, "text_encoder_1")
-            _move_to_cpu(self.text_encoder_2, "text_encoder_2")
-
-        if moved_from_cuda and torch.cuda.is_available():
-            self._maybe_release_cuda_cache("phase_boundary", self.global_step)
+    # ------------------------------------------------------------------
+    # A vram/offload/transfer methods moved to training_loop_runtime_memory.TrainingLoopRuntimeMemoryMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _encode_latents_with_vae(self, images: torch.Tensor) -> torch.Tensor:
         self._ensure_cpu_resident_components("before_vae_encode")
@@ -1880,163 +1541,10 @@ class TrainingLoop:
         self._verify_phase_module_states("vae_encode")
         return result
 
-    def _record_transfer_profile_step(self, step_wall_seconds: float) -> Optional[Dict[str, Any]]:
-        if not bool(getattr(self, "data_transfer_profile_enabled", False)):
-            return None
-        self._flush_transfer_profile_events()
-        self._transfer_profile_steps += 1
-        self._transfer_profile_step_seconds += max(float(step_wall_seconds or 0.0), 0.0)
-        window = max(int(getattr(self, "data_transfer_profile_window", 50) or 50), 1)
-
-        total_step = max(self._transfer_profile_step_seconds, 1e-9)
-        transfer = self._transfer_profile_seconds
-        mib = self._transfer_profile_bytes / (1024.0 * 1024.0)
-        bandwidth = mib / max(transfer, 1e-9) if transfer > 0 else 0.0
-        top = sorted(
-            self._transfer_profile_by_label.items(),
-            key=lambda item: item[1].get("seconds", 0.0),
-            reverse=True,
-        )[:5]
-        step_share = transfer / total_step
-        recommendation = self._transfer_profile_recommendation(step_share)
-        snapshot: Dict[str, Any] = {
-            "steps": self._transfer_profile_steps,
-            "window": window,
-            "window_complete": self._transfer_profile_steps >= window,
-            "step_seconds": self._transfer_profile_step_seconds,
-            "transfer_seconds": transfer,
-            "step_share": step_share,
-            "ops": self._transfer_profile_ops,
-            "bytes": self._transfer_profile_bytes,
-            "mib": mib,
-            "bandwidth_mib_s": bandwidth,
-            "recommendation": recommendation,
-            "top": [
-                {
-                    "label": name,
-                    "seconds": float(stats.get("seconds", 0.0)),
-                    "ops": int(stats.get("ops", 0.0)),
-                    "bytes": int(stats.get("bytes", 0.0)),
-                }
-                for name, stats in top
-            ],
-        }
-        self._last_transfer_profile_snapshot = snapshot
-
-        if self._transfer_profile_steps < window:
-            return snapshot
-
-        top_summary = ", ".join(
-            f"{name}:{stats['seconds'] * 1000.0:.1f}ms/{stats['ops']:.0f}ops"
-            for name, stats in top
-        ) or "none"
-        logger.info(
-            '[data-transfer-profile] steps=%d transfer=%.2fms step_share=%.2f%% ops=%d bytes=%.1fMiB bandwidth=%.1fMiB/s top=%s advice="%s"',
-            self._transfer_profile_steps,
-            transfer * 1000.0,
-            step_share * 100.0,
-            self._transfer_profile_ops,
-            mib,
-            bandwidth,
-            top_summary,
-            recommendation,
-        )
-
-        self._transfer_profile_steps = 0
-        self._transfer_profile_step_seconds = 0.0
-        self._transfer_profile_seconds = 0.0
-        self._transfer_profile_bytes = 0
-        self._transfer_profile_ops = 0
-        self._transfer_profile_by_label.clear()
-        return snapshot
-
-    def _infer_step_timing_samples(self, accumulation_steps: int) -> tuple[int, str]:
-        """Best-effort physical sample count without touching CUDA state."""
-
-        trace = getattr(self, "_pipeline_trace", None)
-        metadata = getattr(trace, "_metadata", {}) if trace is not None else {}
-        batch_contract = metadata.get("batch_contract") if isinstance(metadata, dict) else None
-        if isinstance(batch_contract, dict):
-            inferred = int(batch_contract.get("inferred_physical_batch_size") or 0)
-            if inferred > 0:
-                return inferred, "pipeline_batch_contract"
-            expected = int(batch_contract.get("expected_physical_batch_size") or 0)
-            if expected > 0:
-                return expected, "pipeline_batch_contract_expected"
-        fallback = max(int(accumulation_steps or 1), 1)
-        return fallback, "accumulation_steps_fallback"
-
-    def _record_step_timing_window(
-        self,
-        step_wall_seconds: float,
-        *,
-        global_step: int,
-        accumulation_steps: int,
-        samples_seen: Optional[int] = None,
-        samples_source: str = "",
-    ) -> Dict[str, Any]:
-        step_seconds = max(float(step_wall_seconds or 0.0), 0.0)
-        if samples_seen is None:
-            samples_seen, samples_source = self._infer_step_timing_samples(accumulation_steps)
-        sample_count = max(int(samples_seen or 0), 0)
-        source = str(samples_source or "provided")
-        item = {
-            "step": int(global_step or 0),
-            "step_wall_seconds": step_seconds,
-            "samples_seen": sample_count,
-            "samples_source": source,
-        }
-        history = getattr(self, "_step_timing_history", None)
-        if not isinstance(history, list):
-            history = []
-            self._step_timing_history = history
-        history.append(item)
-        max_history = max(int(getattr(self, "_step_timing_max_history", 128) or 128), 1)
-        if len(history) > max_history:
-            del history[: len(history) - max_history]
-
-        first = history[0]
-        warmup = max(int(getattr(self, "_step_timing_steady_warmup_steps", 1) or 1), 0)
-        steady = history[warmup:] if len(history) > warmup else []
-        steady_seconds = [float(row.get("step_wall_seconds", 0.0) or 0.0) for row in steady]
-        steady_samples = sum(int(row.get("samples_seen", 0) or 0) for row in steady)
-        steady_total = sum(steady_seconds)
-        sorted_seconds = sorted(steady_seconds)
-        median = 0.0
-        if sorted_seconds:
-            mid = len(sorted_seconds) // 2
-            if len(sorted_seconds) % 2:
-                median = sorted_seconds[mid]
-            else:
-                median = (sorted_seconds[mid - 1] + sorted_seconds[mid]) / 2.0
-        summary = {
-            "profile": "lulynx_step_timing_window_v0",
-            "observed_steps": len(history),
-            "window": max_history,
-            "steady_warmup_steps": warmup,
-            "first_step_ms": round(float(first.get("step_wall_seconds", 0.0) or 0.0) * 1000.0, 4),
-            "last_step_ms": round(step_seconds * 1000.0, 4),
-            "steady_steps": len(steady_seconds),
-            "steady_mean_step_ms": round((steady_total / len(steady_seconds)) * 1000.0, 4)
-            if steady_seconds
-            else 0.0,
-            "steady_median_step_ms": round(median * 1000.0, 4) if steady_seconds else 0.0,
-            "steady_total_seconds": round(steady_total, 6),
-            "samples_seen": steady_samples,
-            "samples_per_second": round(steady_samples / steady_total, 4) if steady_total > 0.0 else 0.0,
-            "samples_source": source,
-            "sync_cuda": False,
-        }
-        self._last_step_timing_window = summary
-        return summary
-
-    @staticmethod
-    def _transfer_profile_recommendation(step_share: float) -> str:
-        if step_share < 0.01:
-            return "H2D transfer below 1%; async prefetch is unlikely to help"
-        if step_share < 0.05:
-            return "H2D transfer is visible; tune cached DataLoader and non_blocking before async prefetch"
-        return "H2D transfer exceeds 5%; async prefetch / batch prepare is worth testing"
+    # ------------------------------------------------------------------
+    # B step-timing/transfer methods moved to training_loop_runtime_memory.TrainingLoopRuntimeMemoryMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _compute_diffusion_loss(
         self,
@@ -2074,13 +1582,29 @@ class TrainingLoop:
             return torch.tensor(base * scale, device=reference.device, dtype=reference.dtype)
 
         steps = timesteps.to(device=reference.device, dtype=torch.float32).view(-1)
+        # Normalize timesteps to sigma in [0, 1] so schedules are scale-correct
+        # for every route: DDPM steps are 0..num_train_timesteps, flow routes
+        # carry sigma*1000, and the anima faithful forward carries raw sigma.
+        arch = str(getattr(self, "_model_arch", "") or "").strip().lower()
+        uses_flow = arch in {"anima", "newbie"} or bool(getattr(self, "flow_model", False))
+        if uses_flow:
+            t_scale = 1.0 if (arch == "anima" and bool(getattr(self, "anima_faithful_forward", False))) else 1000.0
+        else:
+            t_scale = float(getattr(getattr(self.noise_scheduler, "config", None), "num_train_timesteps", 1000) or 1000)
+        sigma_norm = (steps / max(t_scale, 1.0)).clamp(0.0, 1.0)
         if schedule == "exponential":
-            max_steps = float(getattr(getattr(self.noise_scheduler, "config", None), "num_train_timesteps", 1000) or 1000)
-            # Smoothly decays from scale at t=0 toward base*scale at the final diffusion step.
-            alpha = -torch.log(torch.tensor(base, device=reference.device, dtype=torch.float32)) / max(max_steps, 1.0)
-            delta = torch.exp(-alpha * steps) * scale
+            # Smoothly decays from scale at sigma=0 toward base*scale at sigma=1
+            # (identical curve to the old steps/max_steps form on DDPM routes).
+            log_base = torch.log(torch.tensor(base, device=reference.device, dtype=torch.float32))
+            delta = torch.exp(log_base * sigma_norm) * scale
         elif schedule == "snr":
-            snr = self._compute_snr(steps.long()).to(device=reference.device, dtype=torch.float32)
+            if uses_flow:
+                # Rectified flow has no DDPM alphas_cumprod table; its SNR is
+                # ((1 - sigma) / sigma)^2 by construction of x_t.
+                sigma_f = sigma_norm.clamp(1e-6, 1.0 - 1e-6)
+                snr = torch.square((1.0 - sigma_f) / sigma_f)
+            else:
+                snr = self._compute_snr(steps.long()).to(device=reference.device, dtype=torch.float32)
             sigma = torch.rsqrt(torch.clamp(snr, min=1e-8))
             delta = ((1.0 - base) / torch.square(1.0 + sigma) + base) * scale
         elif schedule == "auto":
@@ -2512,86 +2036,10 @@ class TrainingLoop:
     # CUDAGraph capture
     # ------------------------------------------------------------------
 
-    def _cudagraph_eligible(self) -> bool:
-        """Check if CUDA graph capture is possible for this training loop."""
-        if self._model_arch not in {"anima", "newbie"}:
-            return False
-        if self._block_offloader is not None:
-            return False
-        if self._module_offload_manager is not None:
-            return False
-        if self.cpu_offload_checkpointing:
-            return False
-        if self.safe_fallback:
-            return False
-        if self._torch_compile_active:
-            return False
-        if not torch.cuda.is_available() or not hasattr(torch.cuda, "CUDAGraph"):
-            return False
-        return True
-
-    def _try_init_cudagraph(self, unet_kwargs: Dict[str, Any]) -> bool:
-        """Attempt to warmup and capture a CUDA graph for the UNet forward pass.
-
-        Returns True if capture succeeded, False otherwise.  On success,
-        ``self._cudagraph_active`` is set to True and subsequent steps use
-        ``replay()`` instead of a full forward pass.
-
-        Only called when ``anima_compile_scope == "full_cudagraph"`` and
-        fixed token counts are configured (``anima_fixed_text_tokens`` /
-        ``anima_fixed_visual_tokens``).
-        """
-        if not self._cudagraph_eligible():
-            logger.info("[CUDAGraph] Not eligible — skipping capture")
-            return False
-
-        from .cudagraph_capture import CUDAGraphCapture, cudagraph_available
-
-        if not cudagraph_available():
-            logger.info("[CUDAGraph] CUDA graphs not available on this system")
-            return False
-
-        try:
-            # Build sample inputs matching what unet_kwargs will look like
-            # during training.  Shapes must be static for the graph.
-            sample_inputs = {}
-            for k, v in unet_kwargs.items():
-                if isinstance(v, torch.Tensor):
-                    sample_inputs[k] = torch.zeros_like(v)
-                elif isinstance(v, dict):
-                    sample_inputs[k] = {
-                        dk: torch.zeros_like(dv) if isinstance(dv, torch.Tensor) else dv
-                        for dk, dv in v.items()
-                    }
-                else:
-                    sample_inputs[k] = v
-
-            capture = CUDAGraphCapture(self.unet, sample_inputs, device=self.device)
-            capture.warmup(num_steps=3)
-            capture.capture()
-
-            self._cudagraph_capture = capture
-            self._cudagraph_active = True
-            logger.info("[CUDAGraph] Capture successful — forward pass will use graph replay")
-            return True
-
-        except Exception as exc:
-            logger.warning("[CUDAGraph] Capture failed: %s — falling back to eager", exc)
-            self._cudagraph_capture = None
-            self._cudagraph_active = False
-            return False
-
-    def _cudagraph_replay(self, unet_kwargs: Dict[str, Any]):
-        """Replay the captured CUDA graph with new inputs.
-
-        Returns the model output (same as self.unet(**unet_kwargs)).sample.
-        """
-        if self._cudagraph_capture is None or not self._cudagraph_active:
-            return None
-        output = self._cudagraph_capture.replay(unet_kwargs)
-        # Output shape matches what unet() returns — typically a
-        # UNet2DOutput or similar with a .sample attribute.
-        return output
+    # ------------------------------------------------------------------
+    # C cudagraph methods moved to training_loop_runtime_memory.TrainingLoopRuntimeMemoryMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _get_timestep_embedding(self, batch_size: int, original_sizes, target_sizes, crop_coords):
         """获取 SDXL 时间步嵌入"""
@@ -2676,925 +2124,11 @@ class TrainingLoop:
             from core.lulynx_trainer.dit_compute_reducer_seam import compute_reducer_seam_context
         return compute_reducer_seam_context(seam)
 
-    def _refresh_turbocore_native_update_readiness(
-        self,
-        shadow_report: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        try:
-            self._turbocore_native_update_readiness = build_training_loop_native_update_readiness(
-                optimizer=self.optimizer,
-                params=self._get_trainable_params(),
-                mode=self._turbocore_native_update_gate.config.mode,
-                runtime_context=self._turbocore_native_update_runtime_context(),
-                shadow_config=self._turbocore_update_shadow.config,
-                save_owner_state=bool(self._turbocore_update_shadow_save_owner_state),
-                shadow_report=shadow_report,
-            )
-        except Exception as exc:
-            self._turbocore_native_update_readiness = {
-                "schema_version": 1,
-                "report": "turbocore_native_update_readiness_v0",
-                "ok": False,
-                "training_path_enabled": False,
-                "native_kernel_present": False,
-                "performance_test_ready": False,
-                "stream_lifetime_bound": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "blocked_reasons": ["readiness_error"],
-            }
-            logger.debug("TurboCore native update readiness probe skipped: %s", exc)
-        return dict(self._turbocore_native_update_readiness)
-
-    def _refresh_turbocore_native_update_runtime_profile(
-        self,
-        *,
-        shadow_report: Optional[Dict[str, Any]] = None,
-        gate_report: Optional[Dict[str, Any]] = None,
-        dispatch_arming: Optional[Dict[str, Any]] = None,
-        dispatch_runtime_report: Optional[Dict[str, Any]] = None,
-        dispatch_recovery: Optional[Dict[str, Any]] = None,
-        diagnostic_replay: Optional[Dict[str, Any]] = None,
-        runtime_context: Optional[Dict[str, Any]] = None,
-        step: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        execution = run_lulynx_turbocore_native_update_runtime_profile_stage_handler(
-            shadow=self._turbocore_update_shadow,
-            gate=self._turbocore_native_update_gate,
-            readiness=self._turbocore_native_update_readiness,
-            runtime_context=runtime_context or self._turbocore_native_update_runtime_context(),
-            dispatch_runtime=self._turbocore_native_update_dispatch_runtime,
-            dispatch_armer=self._turbocore_native_update_dispatch_armer,
-            shadow_report=shadow_report,
-            gate_report=gate_report,
-            dispatch_arming=dispatch_arming,
-            dispatch_runtime_report=dispatch_runtime_report,
-            dispatch_recovery=dispatch_recovery,
-            diagnostic_replay=diagnostic_replay,
-            step=step,
-            memory_optimization_state=self.memory_optimization_state,
-        )
-        self._turbocore_native_update_runtime_profile = dict(execution.profile or {})
-        return dict(self._turbocore_native_update_runtime_profile)
-
-    def get_turbocore_native_update_runtime_profile(self) -> Dict[str, Any]:
-        if not getattr(self, "_turbocore_native_update_runtime_profile", None):
-            self._refresh_turbocore_native_update_runtime_profile()
-        return dict(getattr(self, "_turbocore_native_update_runtime_profile", {}) or {})
-
-    def _turbocore_native_update_runtime_context(self) -> Dict[str, Any]:
-        context = build_native_update_runtime_context(
-            multi_gpu=self.multi_gpu,
-            num_processes=self.num_processes,
-            num_machines=self.num_machines,
-            deepspeed=self.deepspeed,
-            gradient_release_active=self._gradient_release_manager is not None,
-        )
-        explicit_training = bool(
-            self._turbocore_native_update_gate.config.dispatch_enabled
-            and self._turbocore_native_update_training_path_enabled
-            and self._turbocore_native_update_require_native_cuda
-        )
-        context.update(
-            {
-                "training_path_enabled": explicit_training,
-                "native_update_training_dispatch_enabled": explicit_training,
-                "native_update_runtime_dispatch_available": explicit_training,
-                "native_update_executor_present": explicit_training,
-                "native_update_runtime_execution_guard_enabled": explicit_training,
-                "native_update_training_mutation_guard_enabled": explicit_training,
-                "native_update_allow_short_training_dispatch_evidence": bool(
-                    explicit_training and self._turbocore_native_update_gate.config.allow_missing_native_kernel
-                ),
-                "native_update_owner_gradient_sync_guard_enabled": explicit_training,
-                "native_update_owner_gradient_sync_bound": explicit_training,
-                "native_update_flat_owner_training_guard_enabled": explicit_training,
-                "native_update_flat_owner_bound": explicit_training,
-                "native_update_training_dispatch_kernel_guard_enabled": explicit_training,
-                "native_update_training_dispatch_kernel_bound": explicit_training,
-                "native_update_stream_lifetime_ownership_guard_enabled": explicit_training,
-                "native_update_stream_lifetime_ownership_bound": explicit_training,
-                "native_update_direct_gradient_write_guard_enabled": bool(
-                    explicit_training and self._turbocore_update_shadow.config.direct_grad
-                ),
-                "native_update_direct_gradient_write_bound": bool(
-                    explicit_training and self._turbocore_update_shadow.config.direct_grad
-                ),
-                "native_update_training_executor_config": self._turbocore_native_update_training_executor_config(),
-            }
-        )
-        return context
-
-    def _turbocore_native_update_training_executor_config(self) -> Dict[str, Any]:
-        group = self.optimizer.param_groups[0] if self.optimizer and self.optimizer.param_groups else {}
-        betas = group.get("betas", (0.9, 0.999))
-        lr = group.get("lr")
-        if lr is None:
-            lr = getattr(self, "learning_rate", 0.0)
-        eps_value = group.get("eps", 1e-8)
-        if isinstance(eps_value, (tuple, list)):
-            eps_value = eps_value[0] if eps_value else 1e-8
-        config = {
-            "optimizer_kind": self._turbocore_native_update_quantized_optimizer_kind,
-            "lr": float(lr or 0.0),
-            "betas": [float(betas[0]), float(betas[1])],
-            "eps": float(eps_value),
-            "weight_decay": float(group.get("weight_decay", 0.0)),
-            "max_grad_norm": float(self.max_grad_norm or 0.0),
-            "prefer_native_cuda": True,
-            "require_native_cuda": bool(self._turbocore_native_update_require_native_cuda),
-            "prefer_triton": False,
-            "sync_optimizer_state_each_step": not bool(self._turbocore_native_update_defer_state_sync),
-            "sync_params_from_optimizer_each_step": not bool(self._turbocore_native_update_defer_state_sync),
-            "sync_pytorch_optimizer_state_each_step": not bool(self._turbocore_native_update_defer_state_sync),
-            "native_runtime_synchronization_policy": self._turbocore_native_update_runtime_synchronization_policy,
-            "native_runtime_stream_lifetime_lease_evidence": self._turbocore_native_update_stream_lifetime_lease_request(),
-        }
-        if self._turbocore_native_update_quantized_optimizer_kind == "adamg":
-            beta3 = betas[2] if len(betas) >= 3 else group.get("beta3", 0.95)
-            config["betas"] = [float(betas[0]), float(betas[1]), float(beta3)]
-            config["p"] = float(group.get("p", getattr(self.optimizer, "p", 0.2)))
-            config["q"] = float(group.get("q", getattr(self.optimizer, "q", 0.24)))
-            config["weight_decouple"] = bool(group.get("weight_decouple", False))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["maximize"] = bool(group.get("maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "schedulefree_sgd":
-            config["momentum"] = float(group.get("momentum", 0.9))
-            config["warmup_steps"] = int(group.get("warmup_steps", 0) or 0)
-            config["r"] = float(group.get("r", 0.0))
-            config["weight_lr_power"] = float(group.get("weight_lr_power", 2.0))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "schedulefree_radam":
-            config["silent_sgd_phase"] = bool(group.get("silent_sgd_phase", True))
-            config["r"] = float(group.get("r", 0.0))
-            config["weight_lr_power"] = float(group.get("weight_lr_power", 2.0))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "radam":
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["adam_debias"] = bool(group.get("adam_debias", False))
-            config["n_sma_threshold"] = int(getattr(self.optimizer, "n_sma_threshold", 5) or 5)
-            config["degenerated_to_sgd"] = bool(getattr(self.optimizer, "degenerated_to_sgd", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "muon":
-            config["momentum"] = float(group.get("momentum", 0.95))
-            config["ns_steps"] = int(group.get("ns_steps", 5) or 5)
-            config["nesterov"] = bool(group.get("nesterov", True))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "sgdsai":
-            config["momentum"] = float(group.get("momentum", 0.9))
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "pnm":
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "padam":
-            config["partial"] = float(group.get("partial", 0.25))
-            config["weight_decouple"] = bool(group.get("weight_decouple", False))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "yogi":
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["adam_debias"] = bool(group.get("adam_debias", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "dualadam":
-            config["switch_rate"] = float(group.get("switch_rate", 1e-2))
-            config["weight_decouple"] = bool(group.get("weight_decouple", False))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "exadam":
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "qhadam":
-            nus = group.get("nus", (1.0, 1.0))
-            config["nus"] = [float(nus[0]), float(nus[1])]
-            config["weight_decouple"] = bool(group.get("weight_decouple", False))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "nadam":
-            config["momentum_decay"] = float(group.get("momentum_decay", 0.004))
-            config["decoupled_weight_decay"] = bool(group.get("decoupled_weight_decay", False))
-            config["maximize"] = bool(group.get("maximize", getattr(self.optimizer, "maximize", False)))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "grokfastadamw":
-            config["grokfast_alpha"] = float(group.get("grokfast_alpha", 0.98))
-            config["grokfast_lamb"] = float(group.get("grokfast_lamb", 2.0))
-            config["grokfast_after_step"] = int(group.get("grokfast_after_step", 0) or 0)
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "ranger":
-            config["alpha"] = float(group.get("alpha", 0.5))
-            config["k"] = int(group.get("k", 6) or 6)
-            config["n_sma_threshold"] = int(getattr(self.optimizer, "n_sma_threshold", 5) or 5)
-            config["degenerated_to_sgd"] = bool(getattr(self.optimizer, "degenerated_to_sgd", False))
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "ranger21":
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["agc_eps"] = float(getattr(self.optimizer, "agc_eps", 1e-3))
-            config["agc_clip"] = float(getattr(self.optimizer, "agc_clipping_value", 1e-2))
-            config["norm_loss_factor"] = float(getattr(self.optimizer, "norm_loss_factor", 1e-4))
-            config["use_softplus"] = bool(getattr(self.optimizer, "use_softplus", True))
-            config["beta_softplus"] = float(getattr(self.optimizer, "beta_softplus", 50.0))
-            config["lookahead_merge_time"] = int(getattr(self.optimizer, "lookahead_merge_time", 5) or 5)
-            config["lookahead_blending_alpha"] = float(getattr(self.optimizer, "lookahead_blending_alpha", 0.5))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "ranger25":
-            beta3 = betas[2] if len(betas) >= 3 else 0.9999
-            config["betas"] = [float(betas[0]), float(betas[1]), float(beta3)]
-            config["alpha"] = float(group.get("alpha", 5.0))
-            config["cautious"] = bool(getattr(self.optimizer, "cautious", True))
-            config["stable_adamw"] = bool(getattr(self.optimizer, "stable_adamw", True))
-            config["orthograd"] = bool(getattr(self.optimizer, "orthograd", True))
-            config["lookahead_merge_time"] = int(getattr(self.optimizer, "lookahead_merge_time", 5) or 5)
-            config["lookahead_blending_alpha"] = float(getattr(self.optimizer, "lookahead_blending_alpha", 0.5))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "novograd":
-            config["weight_decouple"] = bool(group.get("weight_decouple", False))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["grad_averaging"] = bool(group.get("grad_averaging", False))
-            config["adam_debias"] = bool(group.get("adam_debias", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "stableadamw":
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["kahan_sum"] = bool(group.get("kahan_sum", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "adamwsn":
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["sn"] = bool(group.get("sn", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "adams":
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["ams_bound"] = bool(group.get("ams_bound", False))
-            config["adanorm"] = bool(group.get("adanorm", False))
-            config["adam_debias"] = bool(group.get("adam_debias", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "lamb":
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["rectify"] = bool(group.get("rectify", False))
-            config["pre_norm"] = bool(getattr(self.optimizer, "pre_norm", False))
-            config["adanorm"] = bool(group.get("adanorm", False))
-            config["grad_averaging"] = bool(group.get("grad_averaging", True))
-            config["adam_debias"] = bool(group.get("adam_debias", False))
-            config["adam"] = bool(group.get("adam", False))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "fadam":
-            config["weight_decay"] = float(group.get("weight_decay", 0.1))
-            config["clip"] = float(group.get("clip", 1.0))
-            config["p"] = float(group.get("p", 0.5))
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "flashadamw":
-            config["decouple_lr"] = bool(group.get("decouple_lr", False))
-            config["quantize"] = bool(group.get("quantize", False))
-            config["master_bytewidth"] = int(group.get("master_bytewidth", 0) or 0)
-            config["initial_lr"] = float(group.get("initial_lr", group.get("lr", lr or 0.0)) or 0.0)
-            config["maximize"] = bool(getattr(self.optimizer, "maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "adamod":
-            beta3 = betas[2] if len(betas) >= 3 else group.get("beta3", 0.9999)
-            config["betas"] = [float(betas[0]), float(betas[1]), float(beta3)]
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["maximize"] = bool(group.get("maximize", False))
-        elif self._turbocore_native_update_quantized_optimizer_kind == "adamp":
-            config["betas"] = [float(betas[0]), float(betas[1])]
-            config["weight_decouple"] = bool(group.get("weight_decouple", True))
-            config["fixed_decay"] = bool(group.get("fixed_decay", False))
-            config["delta"] = float(group.get("delta", 0.1))
-            config["wd_ratio"] = float(group.get("wd_ratio", 0.1))
-            config["nesterov"] = bool(group.get("nesterov", False))
-            config["adam_debias"] = bool(group.get("adam_debias", False))
-            config["maximize"] = bool(group.get("maximize", getattr(self.optimizer, "maximize", False)))
-        elif self._turbocore_native_update_quantized_optimizer_kind in {"lion8bit", "paged_lion8bit"}:
-            config["betas"] = [float(betas[0]), float(betas[1] if len(betas) >= 2 else 0.99)]
-        elif self._turbocore_native_update_quantized_optimizer_kind == "sgd_nesterov8bit":
-            config["momentum"] = float(group.get("momentum", 0.9))
-        return config
-
-    @staticmethod
-    def _normalize_turbocore_simple_optimizer_kind(value: Any) -> str:
-        kind = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-        if kind in {"sgd", "plain_sgd", "torch_sgd"}:
-            return "sgd"
-        if kind in {"sgdnesterov", "sgd_nesterov"}:
-            return "sgd_nesterov"
-        if kind in {"signmomentum", "sign_momentum", "signsgd", "tiger"}:
-            return "sign_momentum"
-        if kind == "qhm":
-            return "qhm"
-        if kind in {"accsgd", "acc_sgd"}:
-            return "accsgd"
-        if kind == "fromage":
-            return "fromage"
-        if kind == "rmsprop":
-            return "rmsprop"
-        if kind == "lars":
-            return "lars"
-        if kind == "pid":
-            return "pid"
-        if kind == "sgdp":
-            return "sgdp"
-        if kind == "gravity":
-            return "gravity"
-        if kind == "aggmo":
-            return "aggmo"
-        if kind == "asgd":
-            return "asgd"
-        if kind == "madgrad":
-            return "madgrad"
-        if kind == "nero":
-            return "nero"
-        if kind == "vsgd":
-            return "vsgd"
-        if kind == "lion":
-            return "lion"
-        return ""
-
-    @staticmethod
-    def _normalize_turbocore_quantized_optimizer_kind(value: Any) -> str:
-        kind = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-        if kind in {"adamw8bit", "adamw_8bit"}:
-            return "adamw8bit"
-        if kind in {"kahanadamw8bit", "kahan_adamw8bit"}:
-            return "kahan_adamw8bit"
-        if kind in {"pagedadamw8bit", "paged_adamw8bit"}:
-            return "paged_adamw8bit"
-        if kind in {"pagedadamw", "paged_adamw"}:
-            return "paged_adamw"
-        if kind in {"pagedadamw32bit", "paged_adamw32bit"}:
-            return "paged_adamw32bit"
-        if kind in {"lion8bit", "lion_8bit"}:
-            return "lion8bit"
-        if kind in {"pagedlion8bit", "paged_lion8bit", "paged_lion_8bit"}:
-            return "paged_lion8bit"
-        if kind in {"sgdnesterov8bit", "sgd_nesterov8bit", "sgd_nesterov_8bit", "sgd8bit"}:
-            return "sgd_nesterov8bit"
-        if kind in {"automagicpp", "automagic_plus_plus", "automagic++"}:
-            return "automagicpp"
-        if kind in {"animafactoredadamw", "anima_factored_adamw", "anima_factored"}:
-            return "anima_factored_adamw"
-        if kind in {"adafactor", "ada_factor"}:
-            return "adafactor"
-        if kind in {"adamwschedulefree", "adamw_schedule_free", "schedulefreeadamw", "schedulefree_adamw"}:
-            return "adamw_schedule_free"
-        if kind in {"autoprodigy", "auto_prodigy", "prodigy", "prodigyplusschedulefree", "prodigy_plus_schedule_free"}:
-            return "prodigy"
-        if kind in {"muon", "builtin_muon"}:
-            return "muon"
-        if kind in {"sgdsai", "sgd_sai"}:
-            return "sgdsai"
-        if kind == "pnm":
-            return "pnm"
-        if kind in {
-            "dadapt",
-            "dadaptation",
-            "dadaptadampreprint",
-            "dadapt_adam_preprint",
-            "dadaptadagrad",
-            "dadapt_adagrad",
-            "dadaptadam",
-            "dadapt_adam",
-            "dadaptadan",
-            "dadapt_adan",
-            "dadaptadanip",
-            "dadapt_adan_ip",
-            "dadaptlion",
-            "dadapt_lion",
-            "dadaptsgd",
-            "dadapt_sgd",
-        }:
-            return "dadapt"
-        if kind in {"schedulefreesgd", "schedulefree_sgd"}:
-            return "schedulefree_sgd"
-        if kind in {"schedulefreeradam", "schedulefree_radam"}:
-            return "schedulefree_radam"
-        if kind == "radam":
-            return "radam"
-        if kind == "padam":
-            return "padam"
-        if kind == "yogi":
-            return "yogi"
-        if kind == "dualadam":
-            return "dualadam"
-        if kind == "exadam":
-            return "exadam"
-        if kind == "qhadam":
-            return "qhadam"
-        if kind == "nadam":
-            return "nadam"
-        if kind in {"grokfastadamw", "grokfast_adamw"}:
-            return "grokfastadamw"
-        if kind == "ranger":
-            return "ranger"
-        if kind == "ranger21":
-            return "ranger21"
-        if kind == "ranger25":
-            return "ranger25"
-        if kind == "novograd":
-            return "novograd"
-        if kind in {"stableadamw", "stable_adamw"}:
-            return "stableadamw"
-        if kind in {"adamwsn", "adamw_sn"}:
-            return "adamwsn"
-        if kind in {"adams", "adam_s"}:
-            return "adams"
-        if kind == "lamb":
-            return "lamb"
-        if kind == "fadam":
-            return "fadam"
-        if kind in {"flashadamw", "flash_adamw"}:
-            return "flashadamw"
-        if kind == "adam":
-            return "adam"
-        if kind == "adamax":
-            return "adamax"
-        if kind == "adamc":
-            return "adamc"
-        if kind == "adamg":
-            return "adamg"
-        if kind == "adamod":
-            return "adamod"
-        if kind == "adamp":
-            return "adamp"
-        return ""
-
-    def _turbocore_simple_optimizer_training_executor_config(self) -> Dict[str, Any]:
-        group = self.optimizer.param_groups[0] if self.optimizer and self.optimizer.param_groups else {}
-        lr = group.get("lr")
-        if lr is None:
-            lr = getattr(self, "learning_rate", 0.0)
-        kind = self._turbocore_native_update_simple_optimizer_kind
-        config: Dict[str, Any] = {
-            "optimizer_kind": kind,
-            "lr": float(lr or 0.0),
-            "weight_decay": float(group.get("weight_decay", 0.0)),
-            "block_size": int(group.get("block_size", 128) or 128),
-            "require_native_cuda": bool(self._turbocore_native_update_require_native_cuda),
-        }
-        if kind == "lion":
-            betas = group.get("betas", (0.9, 0.99))
-            config["betas"] = [float(betas[0]), float(betas[1])]
-        elif kind in {"sgd", "sgd_nesterov"}:
-            config["momentum"] = float(group.get("momentum", 0.9))
-        elif kind == "sign_momentum":
-            config["momentum"] = float(group.get("momentum", group.get("beta", 0.9)))
-        elif kind == "qhm":
-            config["momentum"] = float(group.get("momentum", 0.0))
-            config["nu"] = float(group.get("nu", 1.0))
-        elif kind == "accsgd":
-            config["kappa"] = float(group.get("kappa", 1000.0))
-            config["xi"] = float(group.get("xi", 10.0))
-            config["constant"] = float(group.get("constant", 0.7))
-        elif kind == "rmsprop":
-            config["alpha"] = float(group.get("alpha", 0.99))
-            config["eps"] = float(group.get("eps", 1e-8))
-        elif kind == "lars":
-            config["momentum"] = float(group.get("momentum", 0.9))
-            config["dampening"] = float(group.get("dampening", 0.0))
-            config["trust_coefficient"] = float(group.get("trust_coefficient", 1e-3))
-        elif kind == "sgdp":
-            config["momentum"] = float(group.get("momentum", 0.0))
-            config["dampening"] = float(group.get("dampening", 0.0))
-        elif kind == "gravity":
-            config["beta"] = float(group.get("beta", 0.9))
-        elif kind == "aggmo":
-            betas = group.get("betas", (0.0, 0.9, 0.99))
-            config["betas"] = [float(betas[0]), float(betas[1] if len(betas) >= 2 else 0.9)]
-            config["beta"] = float(betas[2] if len(betas) >= 3 else 0.99)
-        elif kind == "asgd":
-            config["beta"] = float(group.get("theta", 1.0))
-            config["dampening"] = float(group.get("dampening", 1.0))
-            config["eps"] = float(group.get("eps", 1e-5))
-        elif kind == "madgrad":
-            config["momentum"] = float(group.get("momentum", 0.9))
-            config["eps"] = float(group.get("eps", 1e-6))
-        elif kind == "nero":
-            config["beta"] = float(group.get("beta", 0.999))
-            config["eps"] = float(group.get("eps", 1e-8))
-        elif kind == "vsgd":
-            config["alpha"] = float(group.get("tau1", 0.81))
-            config["beta"] = float(group.get("tau2", 0.9))
-            config["eps"] = float(group.get("eps", 1e-8))
-        return config
-
-    def _turbocore_native_update_stream_lifetime_lease_request(self) -> Dict[str, Any]:
-        explicit_training = bool(
-            self._turbocore_native_update_gate.config.dispatch_enabled
-            and self._turbocore_native_update_training_path_enabled
-            and self._turbocore_native_update_require_native_cuda
-        )
-        recovery_ready = bool(
-            explicit_training
-            and self._turbocore_native_update_runtime_synchronization_policy == "borrowed_stream_event_chain"
-        )
-        return build_single_step_lifetime_lease_request(
-            explicit_training_context=explicit_training,
-            recovery_ready=recovery_ready,
-            lease_scope="native_update_training_step",
-        )
-
-    def _get_turbocore_native_update_training_executor(self, trainable_params: List[torch.nn.Parameter]) -> Any:
-        if self._turbocore_native_update_training_executor is None:
-            if self._turbocore_native_update_quantized_optimizer_kind == "kahan_adamw8bit":
-                self._turbocore_native_update_training_executor = build_kahan_adamw8bit_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind in {"adamw8bit", "paged_adamw8bit"}:
-                from core.turbocore_paged_adamw8bit_training_executor import build_paged_adamw8bit_training_executor
-
-                self._turbocore_native_update_training_executor = build_paged_adamw8bit_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind in {"paged_adamw", "paged_adamw32bit"}:
-                from core.turbocore_paged_adamw32_training_executor import build_paged_adamw32_training_executor
-
-                self._turbocore_native_update_training_executor = build_paged_adamw32_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind in {
-                "lion8bit",
-                "paged_lion8bit",
-                "sgd_nesterov8bit",
-            }:
-                from core.turbocore_simple_quantized_optimizer_training_executor import (
-                    build_simple_quantized_optimizer_training_executor,
-                )
-
-                self._turbocore_native_update_training_executor = build_simple_quantized_optimizer_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "automagicpp":
-                from core.turbocore_automagicpp_training_executor import build_automagicpp_training_executor
-
-                self._turbocore_native_update_training_executor = build_automagicpp_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "anima_factored_adamw":
-                from core.turbocore_anima_factored_adamw_training_executor import (
-                    build_anima_factored_adamw_training_executor,
-                )
-
-                self._turbocore_native_update_training_executor = build_anima_factored_adamw_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adafactor":
-                from core.turbocore_adafactor_training_executor import build_adafactor_training_executor
-
-                self._turbocore_native_update_training_executor = build_adafactor_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adamw_schedule_free":
-                from core.turbocore_adamw_schedule_free_training_executor import (
-                    build_adamw_schedule_free_training_executor,
-                )
-
-                self._turbocore_native_update_training_executor = build_adamw_schedule_free_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind in {"prodigy", "dadapt"}:
-                from core.turbocore_adaptive_lr_training_executor import build_adaptive_lr_training_executor
-
-                self._turbocore_native_update_training_executor = build_adaptive_lr_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "muon":
-                from core.turbocore_muon_training_executor import build_muon_training_executor
-
-                self._turbocore_native_update_training_executor = build_muon_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "sgdsai":
-                from core.turbocore_sgdsai_training_executor import build_sgdsai_training_executor
-
-                self._turbocore_native_update_training_executor = build_sgdsai_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "pnm":
-                from core.turbocore_pnm_training_executor import build_pnm_training_executor
-
-                self._turbocore_native_update_training_executor = build_pnm_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "schedulefree_sgd":
-                from core.turbocore_plugin_schedulefree_sgd_training_executor import (
-                    build_plugin_schedulefree_sgd_training_executor,
-                )
-
-                self._turbocore_native_update_training_executor = build_plugin_schedulefree_sgd_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "schedulefree_radam":
-                from core.turbocore_plugin_schedulefree_radam_training_executor import (
-                    build_plugin_schedulefree_radam_training_executor,
-                )
-
-                self._turbocore_native_update_training_executor = build_plugin_schedulefree_radam_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "radam":
-                from core.turbocore_plugin_radam_training_executor import build_plugin_radam_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_radam_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "padam":
-                from core.turbocore_plugin_padam_training_executor import build_plugin_padam_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_padam_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "yogi":
-                from core.turbocore_plugin_yogi_training_executor import build_plugin_yogi_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_yogi_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "dualadam":
-                from core.turbocore_plugin_dualadam_training_executor import build_plugin_dualadam_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_dualadam_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "exadam":
-                from core.turbocore_plugin_exadam_training_executor import build_plugin_exadam_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_exadam_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "qhadam":
-                from core.turbocore_plugin_qhadam_training_executor import build_plugin_qhadam_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_qhadam_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "nadam":
-                from core.turbocore_plugin_nadam_training_executor import build_plugin_nadam_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_nadam_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "grokfastadamw":
-                from core.turbocore_plugin_grokfastadamw_training_executor import (
-                    build_plugin_grokfastadamw_training_executor,
-                )
-
-                self._turbocore_native_update_training_executor = build_plugin_grokfastadamw_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "ranger":
-                from core.turbocore_plugin_ranger_training_executor import build_plugin_ranger_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_ranger_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "ranger21":
-                from core.turbocore_plugin_ranger21_training_executor import build_plugin_ranger21_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_ranger21_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "ranger25":
-                from core.turbocore_plugin_ranger25_training_executor import build_plugin_ranger25_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_ranger25_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "novograd":
-                from core.turbocore_plugin_novograd_training_executor import build_plugin_novograd_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_novograd_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "stableadamw":
-                from core.turbocore_plugin_stableadamw_training_executor import (
-                    build_plugin_stableadamw_training_executor,
-                )
-
-                self._turbocore_native_update_training_executor = build_plugin_stableadamw_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adamwsn":
-                from core.turbocore_plugin_adamwsn_training_executor import build_plugin_adamwsn_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_adamwsn_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adams":
-                from core.turbocore_plugin_adams_training_executor import build_plugin_adams_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_adams_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "lamb":
-                from core.turbocore_plugin_lamb_training_executor import build_plugin_lamb_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_lamb_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "fadam":
-                from core.turbocore_plugin_fadam_training_executor import build_plugin_fadam_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_fadam_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "flashadamw":
-                from core.turbocore_plugin_flashadamw_training_executor import (
-                    build_plugin_flashadamw_training_executor,
-                )
-
-                self._turbocore_native_update_training_executor = build_plugin_flashadamw_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adam":
-                from core.turbocore_plugin_adam_training_executor import build_plugin_adam_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_adam_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adamax":
-                from core.turbocore_plugin_adamax_training_executor import build_plugin_adamax_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_adamax_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adamc":
-                from core.turbocore_plugin_adamc_training_executor import build_plugin_adamc_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_adamc_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adamg":
-                from core.turbocore_plugin_adamg_training_executor import build_plugin_adamg_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_adamg_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adamod":
-                from core.turbocore_plugin_adamod_training_executor import build_plugin_adamod_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_adamod_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_quantized_optimizer_kind == "adamp":
-                from core.turbocore_plugin_adamp_training_executor import build_plugin_adamp_training_executor
-
-                self._turbocore_native_update_training_executor = build_plugin_adamp_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-            elif self._turbocore_native_update_simple_optimizer_kind:
-                self._turbocore_native_update_training_executor = build_simple_optimizer_training_executor(
-                    params=trainable_params,
-                    config=self._turbocore_simple_optimizer_training_executor_config(),
-                )
-            else:
-                self._turbocore_native_update_training_executor = build_native_update_training_executor(
-                    optimizer=self.optimizer,
-                    params=trainable_params,
-                    config=self._turbocore_native_update_training_executor_config(),
-                )
-        return self._turbocore_native_update_training_executor
-
-    def _sync_turbocore_native_update_training_executor_to_pytorch(self, reason: str) -> Dict[str, Any]:
-        executor = getattr(self, "_turbocore_native_update_training_executor", None)
-        sync = getattr(executor, "sync_optimizer_state_to_pytorch", None)
-        if not callable(sync):
-            return {}
-        try:
-            return dict(sync(reason=reason) or {})
-        except Exception as exc:
-            logger.debug("TurboCore native update optimizer-state sync skipped: %s", exc)
-            return {
-                "schema_version": 1,
-                "synced": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "reason": str(reason or "sync_error"),
-            }
-
-    def _can_retain_turbocore_native_update_gate(
-        self,
-        previous_gate: Dict[str, Any],
-        shadow_report: Dict[str, Any],
-        dispatch_runtime_report: Dict[str, Any],
-    ) -> bool:
-        return can_retain_native_update_probe_evidence(
-            previous_gate=previous_gate,
-            shadow_report=shadow_report,
-            dispatch_runtime_report=dispatch_runtime_report,
-            defer_state_sync=bool(self._turbocore_native_update_defer_state_sync),
-        )
-
-    def _close_turbocore_native_update_training_executor(self) -> None:
-        executor = getattr(self, "_turbocore_native_update_training_executor", None)
-        self._turbocore_native_update_training_executor = None
-        if executor is None:
-            return
-        close = getattr(executor, "close", None)
-        if callable(close):
-            close()
-
-    def get_turbocore_update_checkpoint_state(self) -> Dict[str, Any]:
-        if not getattr(self, "_turbocore_update_shadow", None) or not self._turbocore_update_shadow.enabled:
-            return {
-                "schema_version": 1,
-                "state": "turbocore_update_shadow_checkpoint_v0",
-                "enabled": False,
-                "training_path_enabled": False,
-            }
-        return self._turbocore_update_shadow.checkpoint_state(
-            include_owner_state=bool(getattr(self, "_turbocore_update_shadow_save_owner_state", False))
-        )
-
-    def load_turbocore_update_checkpoint_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        if not getattr(self, "_turbocore_update_shadow", None):
-            return {
-                "schema_version": 1,
-                "state": "turbocore_update_shadow_checkpoint_v0",
-                "loaded": False,
-                "reason": "shadow_unavailable",
-                "training_path_enabled": False,
-            }
-        return self._turbocore_update_shadow.load_checkpoint_state(state, self._get_trainable_params())
+    # ------------------------------------------------------------------
+    # Turbocore native-update runtime methods moved to
+    # training_loop_turbocore_runtime.TrainingLoopTurbocoreRuntimeMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _clone_to_cpu(self, value):
         if isinstance(value, torch.Tensor):
@@ -4195,6 +2729,22 @@ class TrainingLoop:
     ) -> float | torch.Tensor:
         """Internal training step implementation."""
         accumulation_steps = max(int(accumulation_steps or self.gradient_accumulation_steps), 1)
+        _newbie_compute_substage_enabled = str(self._model_arch or "").strip().lower() == "newbie"
+
+        def _newbie_compute_substage_start(*, sync_cuda: bool = False) -> Any:
+            if not _newbie_compute_substage_enabled:
+                return None
+            return self._step_phase_profiler.start() if sync_cuda else self._step_phase_profiler.start_cpu()
+
+        def _record_newbie_compute_substage(label: str, started: Any, *, sync_cuda: bool = False) -> None:
+            if started is None:
+                return
+            phase_label = f"train_step_compute_substage.newbie.{label}"
+            if sync_cuda:
+                self._step_phase_profiler.record(phase_label, started)
+            else:
+                self._step_phase_profiler.record_cpu(phase_label, started)
+
         batch_contract_execution = run_lulynx_batch_contract_stage_handler(
             batch=batch,
             model_arch=self._model_arch,
@@ -4297,6 +2847,7 @@ class TrainingLoop:
             anima_discrete_flow_shift=self.anima_discrete_flow_shift,
             anima_weighting_scheme=self.anima_weighting_scheme,
             anima_model_prediction_type=self.anima_model_prediction_type,
+            anima_faithful_forward=self.anima_faithful_forward,
             sdxl_timestep_sampling=self.sdxl_timestep_sampling,
             sdxl_sigmoid_scale=self.sdxl_sigmoid_scale,
             sdxl_flow_shift=self.sdxl_flow_shift,
@@ -4347,6 +2898,7 @@ class TrainingLoop:
             and self._cudagraph_eligible()
             and not self.cpu_offload_checkpointing
         )
+        _forward_input_substage_start = _newbie_compute_substage_start()
         forward_input_execution = run_lulynx_forward_input_stage_handler(
             batch=batch,
             noisy_latents=noisy_latents,
@@ -4361,13 +2913,18 @@ class TrainingLoop:
             target_dtype=self.dtype,
             easy_control=self.easy_control,
             ip_adapter=self.ip_adapter,
+            easycontrol_v2_adapter=self.easycontrol_v2_adapter,
+            easycontrol_v2_clean_latents=latents,
             cudagraph_active=self._cudagraph_active,
             cudagraph_requested=_should_try_cudagraph,
             cpu_offload_checkpointing=self.cpu_offload_checkpointing,
             offloaded_checkpoint_context_available=self._offloaded_checkpoint_ctx is not None,
             profiled_to=self._profiled_to,
             get_timestep_embedding=self._get_timestep_embedding,
+            anima_faithful_forward=self.anima_faithful_forward,
+            anima_llm_adapter=getattr(self.unet, "anima_llm_adapter", None),
         )
+        _record_newbie_compute_substage("forward_input_prepare", _forward_input_substage_start)
         noisy_latents = forward_input_execution.noisy_latents
         prompt_embeds = forward_input_execution.prompt_embeds
         unet_kwargs = forward_input_execution.unet_kwargs
@@ -4375,7 +2932,9 @@ class TrainingLoop:
 
         self._step_phase_profiler.record("train_batch_prepare", _train_prepare_phase_start)
         _forward_phase_start = self._step_phase_profiler.start()
+        _newbie_module_timing_profiler = self._start_newbie_module_timing_profile()
         with self._compute_reducer_context():
+            _forward_model_substage_start = _newbie_compute_substage_start(sync_cuda=True)
             forward_execution = run_lulynx_forward_execution_stage_handler(
                 owner=self,
                 unet_kwargs=unet_kwargs,
@@ -4386,12 +2945,18 @@ class TrainingLoop:
                 multi_batch_execution_strategy_gate=batch_contract_execution.execution_strategy_gate,
                 logger=logger,
             )
+            _record_newbie_compute_substage(
+                "forward_model_execution",
+                _forward_model_substage_start,
+                sync_cuda=True,
+            )
         noise_pred = forward_execution.noise_pred
         _vram_diag_step = forward_execution.vram_diag_step
         _entropy_probe_step = forward_execution.entropy_probe_step
         self._training_step_orchestrator_runtime_profile = forward_execution.orchestrator_runtime
         self._step_phase_profiler.record("forward_total", _forward_phase_start)
         _loss_phase_start = self._step_phase_profiler.start()
+        _loss_plan_substage_start = _newbie_compute_substage_start()
         loss_plan_execution = run_lulynx_loss_plan_stage_handler(
             batch=batch,
             model_arch=self._model_arch,
@@ -4418,9 +2983,11 @@ class TrainingLoop:
             do_backward=do_backward,
             trace=self._pipeline_trace,
         )
+        _record_newbie_compute_substage("loss_plan", _loss_plan_substage_start)
         self._training_step_orchestrator_runtime_profile = loss_plan_execution.orchestrator_runtime
         
         _lt = self._loss_tracker
+        _loss_execution_substage_start = _newbie_compute_substage_start(sync_cuda=True)
         loss_execution = run_lulynx_loss_execution_stage_handler(
             owner=self,
             batch=batch,
@@ -4436,6 +3003,7 @@ class TrainingLoop:
             loss_scalars=loss_scalars,
             logger=logger,
         )
+        _record_newbie_compute_substage("loss_execution", _loss_execution_substage_start, sync_cuda=True)
         loss = loss_execution.loss
         _lt_val = loss_execution.loss_tracker_value
         self._training_step_orchestrator_runtime_profile = loss_execution.orchestrator_runtime
@@ -4444,6 +3012,7 @@ class TrainingLoop:
         raw_loss = loss
         if do_backward:
             _backward_phase_start = self._step_phase_profiler.start()
+            _backward_plugin_substage_start = _newbie_compute_substage_start()
             plugin_hook_execution = run_lulynx_loss_plugin_hook_stage_handler(
                 hook_context=hook_context,
                 loss=loss,
@@ -4453,6 +3022,7 @@ class TrainingLoop:
                 loss_tracker=_lt,
                 mutation_from_report=self._mutation_from_report,
             )
+            _record_newbie_compute_substage("backward_plugin_hook", _backward_plugin_substage_start)
             loss = plugin_hook_execution.loss
             raw_loss = plugin_hook_execution.raw_loss
             raw_loss_value = plugin_hook_execution.raw_loss_value
@@ -4484,11 +3054,19 @@ class TrainingLoop:
                 _vram_forward_diag = self._cuda_memory_snapshot()
                 _vram_forward_mb = float(_vram_forward_diag.get("peak_reserved_mb", 0.0) or 0.0)
                 torch.cuda.reset_peak_memory_stats()
+            _backward_prepare_substage_start = _newbie_compute_substage_start()
             self._turbocore_direct_grad_lifecycle_report = {}
+            self._turbocore_native_update_direct_grad_lifecycle_report = {}
+            trainable_params_for_direct_grad = self._get_trainable_params()
+            self._turbocore_native_update_direct_grad_lifecycle_report = (
+                self._prepare_turbocore_native_update_direct_grad_executor_before_backward(
+                    trainable_params_for_direct_grad
+                )
+            )
             if self._turbocore_update_shadow.enabled and bool(self._turbocore_update_shadow.config.direct_grad):
                 try:
                     self._turbocore_direct_grad_lifecycle_report = self._turbocore_update_shadow.prepare_before_backward(
-                        self._get_trainable_params(),
+                        trainable_params_for_direct_grad,
                         optimizer=self.optimizer,
                         max_grad_norm=self.max_grad_norm,
                         step=self.global_step,
@@ -4522,6 +3100,11 @@ class TrainingLoop:
                     loss,
                     float(self.optimizer.param_groups[0].get("lr", 0.0)) if self.optimizer and self.optimizer.param_groups else 0.0,
                 )
+            _record_newbie_compute_substage(
+                "backward_pre_autograd_prepare",
+                _backward_prepare_substage_start,
+            )
+            _backward_plan_substage_start = _newbie_compute_substage_start()
             backward_plan_execution = run_lulynx_backward_plan_stage_handler(
                 do_backward=do_backward,
                 sync_gradients=sync_gradients,
@@ -4534,15 +3117,51 @@ class TrainingLoop:
                 create_graph_backward=bool(optimizer_requires_create_graph_backward(self.optimizer)),
                 trace=self._pipeline_trace,
             )
+            _record_newbie_compute_substage("backward_plan", _backward_plan_substage_start)
             self._training_step_orchestrator_runtime_profile = backward_plan_execution.orchestrator_runtime
+            _backward_autograd_substage_start = _newbie_compute_substage_start(sync_cuda=True)
+            _newbie_backward_op_profile_enabled = self._should_profile_newbie_backward_ops()
             backward_execution = run_lulynx_backward_execution_stage_handler(
                 loss=loss,
                 gradient_release_context=_gr_ctx,
                 optimizer_used_fused_backward=bool(_optimizer_used_fused_backward),
                 optimizer_deferred_step_closure=bool(_optimizer_deferred_step_closure),
                 create_graph_backward=bool(optimizer_requires_create_graph_backward(self.optimizer)),
+                step_phase_profiler=self._step_phase_profiler,
+                substage_label_prefix="train_step_compute_substage.newbie"
+                if _newbie_compute_substage_enabled
+                else "",
+                backward_op_profile_enabled=_newbie_backward_op_profile_enabled,
+                backward_op_profile_top_k=max(int(getattr(self, "newbie_backward_op_profile_top_k", 12) or 12), 1),
+                backward_op_profile_record_shapes=bool(
+                    getattr(self, "newbie_backward_op_profile_record_shapes", False)
+                ),
+                backward_op_profile_sink=self._record_newbie_backward_op_profile
+                if _newbie_backward_op_profile_enabled
+                else None,
+            )
+            if _newbie_module_timing_profiler is not None:
+                try:
+                    self._record_newbie_module_timing_profile(
+                        _newbie_module_timing_profiler.snapshot(step=int(getattr(self, "global_step", 0) or 0))
+                    )
+                finally:
+                    _newbie_module_timing_profiler.detach()
+                    _newbie_module_timing_profiler = None
+            _record_newbie_compute_substage(
+                "backward_autograd_execution",
+                _backward_autograd_substage_start,
+                sync_cuda=True,
             )
             self._training_step_orchestrator_runtime_profile = backward_execution.orchestrator_runtime
+            # EasyControl v2: the condition was set per-step in the input handler and
+            # read by the patched blocks. Clear it only NOW (after backward), because
+            # under use_reentrant=False block checkpointing the blocks are recomputed
+            # during backward and must see the same condition as the forward pass.
+            # No-op when disabled. The next step's handler re-sets or clears it.
+            if self.easycontrol_v2_adapter is not None:
+                self.easycontrol_v2_adapter.clear_cond()
+            _backward_postprocess_substage_start = _newbie_compute_substage_start()
             # ── Peak VRAM: capture backward, reset for optimizer ──
             if _vram_diag_step:
                 _vram_backward_diag = self._cuda_memory_snapshot()
@@ -4575,8 +3194,11 @@ class TrainingLoop:
                 and not optimizer_step_closure_requires_initial_backward(self.optimizer)
             ):
                 self.optimizer.zero_grad(set_to_none=True)
+            _record_newbie_compute_substage("backward_postprocess", _backward_postprocess_substage_start)
             self._step_phase_profiler.record("backward_total", _backward_phase_start)
 
+        if _newbie_module_timing_profiler is not None:
+            _newbie_module_timing_profiler.detach()
 
         try:
             # 必须清理捕获的特征，防止显存泄漏
@@ -4826,6 +3448,12 @@ class TrainingLoop:
                 trainable_params = self._get_trainable_params()
                 _gr = self._gradient_release_manager
                 _turbocore_native_update_runtime_context = self._turbocore_native_update_runtime_context()
+                _loss_value_for_optimizer_step = loss
+                if isinstance(_loss_value_for_optimizer_step, torch.Tensor):
+                    _loss_value_for_optimizer_step = float(_loss_value_for_optimizer_step.detach().float().item())
+                _turbocore_native_update_runtime_context["optimizer_loss_value_for_step"] = float(
+                    _loss_value_for_optimizer_step
+                )
                 self._step_phase_profiler.record_optimizer_update_substage(
                     "optimizer_update_pre_step_setup",
                     _optimizer_update_substage_start,
@@ -5161,6 +3789,9 @@ class TrainingLoop:
                             "precision_swap_offload": _precision_swap_offload_report,
                             "turbocore_update_shadow": _turbocore_update_shadow_report,
                             "turbocore_direct_grad_lifecycle": self._turbocore_direct_grad_lifecycle_report,
+                            "turbocore_native_update_direct_grad_lifecycle": (
+                                self._turbocore_native_update_direct_grad_lifecycle_report
+                            ),
                             "turbocore_native_update_dispatch_arming": _turbocore_native_update_dispatch_arming,
                             "turbocore_native_update_runtime_recovery_observation": (
                                 _turbocore_native_update_runtime_recovery_observation
@@ -5267,6 +3898,14 @@ class TrainingLoop:
                     self._training_step_orchestrator_runtime_profile = telemetry_execution.orchestrator_runtime
                     self._refresh_training_loop_runtime_profile()
                 
+                if self._thermal_throttler is not None:
+                    # Duty-cycle/temperature governor: sleeps the configured
+                    # share of the measured busy time at the step boundary.
+                    # Async dataloader prefetch keeps filling during the sleep.
+                    _thermal_report = self._thermal_throttler.on_step_boundary()
+                    if _thermal_report:
+                        self._last_thermal_throttle_report = _thermal_report
+
                 tail_execution = run_lulynx_accumulation_group_tail_stage_handler(
                     auditor=self.auditor,
                     auditor_interval=self.auditor_interval,
@@ -5299,6 +3938,9 @@ class TrainingLoop:
             epoch=epoch,
             on_epoch_end=self.on_epoch_end,
             turbocore_native_update_defer_state_sync=bool(self._turbocore_native_update_defer_state_sync),
+            sync_turbocore_native_update_training_executor_to_pytorch=(
+                self._sync_turbocore_native_update_training_executor_to_pytorch
+            ),
             close_turbocore_native_update_training_executor=(
                 self._close_turbocore_native_update_training_executor
             ),

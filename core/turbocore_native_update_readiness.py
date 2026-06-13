@@ -144,6 +144,16 @@ def _owner_checks(
     direct_gradient_write_default_off = bool(direct_gradient_write_boundary_ready and not explicit_training_context)
     direct_lifecycle_integrated = bool(shadow.get("direct_grad_lifecycle_integrated", False))
     checkpoint_metadata_integrated = bool(shadow.get("checkpoint_metadata_integrated", False))
+    trainer_state_metadata_integrated = bool(
+        shadow.get("trainer_state_metadata_integrated", checkpoint_metadata_integrated)
+    )
+    trainer_state_save_sync_verified = bool(shadow.get("trainer_state_save_sync_verified", False))
+    resume_owner_state_guard_verified = bool(shadow.get("resume_owner_state_guard_verified", False))
+    trainer_checkpoint_integration = bool(
+        trainer_state_metadata_integrated
+        and trainer_state_save_sync_verified
+        and resume_owner_state_guard_verified
+    )
     checkpoint_owner_state_enabled = bool(shadow.get("checkpoint_owner_state_enabled", False))
     copyback_probe_integrated = bool(
         shadow.get("copyback_scratch_probe_integrated", False)
@@ -160,7 +170,7 @@ def _owner_checks(
     owner_gradient_sync_boundary_ready = bool(flat_layout_possible and flat_owner.get("owns_parameter_buffer", False) and flat_owner.get("owns_gradient_buffer", False))
     owner_gradient_sync_supported = owner_gradient_sync_boundary_ready
     owner_gradient_sync_default_off = bool(owner_gradient_sync_boundary_ready and not explicit_training_context)
-    owner_gradient_sync_training_integrated = bool(copyback_dispatch_enabled and checkpoint_metadata_integrated)
+    owner_gradient_sync_training_integrated = bool(copyback_dispatch_enabled and trainer_checkpoint_integration)
     owner_gradient_sync_guard_enabled = bool(context.get("native_update_owner_gradient_sync_guard_enabled", False))
     owner_gradient_sync_bound = bool(context.get("native_update_owner_gradient_sync_bound", False))
     direct_gradient_write_optional_blocked: list[str] = []
@@ -190,8 +200,12 @@ def _owner_checks(
         blocked.append("parameter_owner_copyback_dispatch_not_validated")
     else:
         copyback_scratch_validated = True
-    if not checkpoint_metadata_integrated:
+    if not trainer_state_metadata_integrated:
         blocked.append("trainer_checkpoint_integration_missing")
+    if not trainer_state_save_sync_verified:
+        blocked.append("trainer_state_save_sync_guard_missing")
+    if not resume_owner_state_guard_verified:
+        blocked.append("trainer_resume_owner_state_guard_missing")
     if not checkpoint_owner_state_enabled:
         blocked.append("trainer_checkpoint_owner_state_not_enabled")
     return {
@@ -199,7 +213,11 @@ def _owner_checks(
         "persistent_flat_owner_contract_present": bool(flat_owner),
         "flat_layout_possible": flat_layout_possible,
         "python_owner_state_dict_available": True,
-        "trainer_checkpoint_integration": checkpoint_metadata_integrated,
+        "trainer_checkpoint_integration": trainer_checkpoint_integration,
+        "trainer_checkpoint_metadata_integrated": checkpoint_metadata_integrated,
+        "trainer_state_metadata_integrated": trainer_state_metadata_integrated,
+        "trainer_state_save_sync_verified": trainer_state_save_sync_verified,
+        "resume_owner_state_guard_verified": resume_owner_state_guard_verified,
         "trainer_checkpoint_owner_state_enabled": checkpoint_owner_state_enabled,
         "direct_gradient_write_boundary_ready": direct_gradient_write_boundary_ready,
         "direct_gradient_write_native_supported": direct_gradient_write_native_supported,

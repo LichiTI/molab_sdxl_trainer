@@ -278,6 +278,9 @@ class RuntimeOptimizationPlan:
     attention_early_deletion: bool = False  # del Q/K/V immediately after attention
     amd_sdpa_slice_trigger_gb: float = 0.0
     amd_sdpa_slice_target_gb: float = 0.0
+    dynamo_recompile_limit: int = 0  # 0 = leave torch default
+    activation_memory_budget: float = 0.0  # 0 = off; (0,1] caps AOT partitioner saved set
+    gradient_checkpointing: bool = False  # mirrored for the budget mutual-exclusion guard
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -331,6 +334,9 @@ def build_runtime_optimization_plan(config: Any) -> RuntimeOptimizationPlan:
         attention_early_deletion=_boolish(getattr(config, "attention_early_deletion", False), default=False),
         amd_sdpa_slice_trigger_gb=float(getattr(config, "amd_sdpa_slice_trigger_gb", 0.0) or 0.0),
         amd_sdpa_slice_target_gb=float(getattr(config, "amd_sdpa_slice_target_gb", 0.0) or 0.0),
+        dynamo_recompile_limit=int(getattr(config, "dynamo_recompile_limit", 0) or 0),
+        activation_memory_budget=float(getattr(config, "activation_memory_budget", 0.0) or 0.0),
+        gradient_checkpointing=_boolish(getattr(config, "gradient_checkpointing", False), default=False),
     )
 
     resolved_shape_strategy, shape_reason = _resolve_compile_shape_strategy(
@@ -661,6 +667,34 @@ def apply_attention_backend(model: Any, plan: RuntimeOptimizationPlan) -> None:
         raise
 
 
+def apply_dynamo_budgets_if_requested(plan: RuntimeOptimizationPlan) -> None:
+    """Apply recompile-limit pin and activation-memory budget before compiling.
+
+    Idempotent: the pin only ever raises (max of current and requested) and the
+    budget assignment is a plain module attr. Both knobs default to 0 = leave
+    torch untouched. Must run BEFORE the torch.compile calls so the budgets are
+    in place when the first graph (and its backward) is traced.
+    """
+    if plan.dynamo_recompile_limit > 0:
+        try:
+            from .dynamo_budget import pin_recompile_limit
+
+            pin_recompile_limit(plan.dynamo_recompile_limit, log=plan.reasons.append)
+        except Exception as exc:  # noqa: BLE001 - never block compile on a budget knob
+            plan.warnings.append(f"dynamo recompile-limit pin failed: {exc}")
+    if plan.activation_memory_budget > 0.0:
+        try:
+            from .dynamo_budget import apply_activation_memory_budget
+
+            apply_activation_memory_budget(
+                plan.activation_memory_budget,
+                gradient_checkpointing=plan.gradient_checkpointing,
+                log=plan.reasons.append,
+            )
+        except Exception as exc:  # noqa: BLE001
+            plan.warnings.append(f"activation_memory_budget apply failed: {exc}")
+
+
 def apply_torch_compile_if_requested(module: Any, plan: RuntimeOptimizationPlan, *, label: str) -> Any:
     if module is None or not plan.torch_compile:
         return module
@@ -671,6 +705,7 @@ def apply_torch_compile_if_requested(module: Any, plan: RuntimeOptimizationPlan,
         plan.reasons.append(f"skipped full torch.compile for {label} because torch_compile_scope=per_block")
         return module
 
+    apply_dynamo_budgets_if_requested(plan)
     try:
         compiled = torch.compile(
             module,
@@ -714,6 +749,7 @@ def apply_per_block_compile(
     if not plan.torch_compile or plan.torch_compile_scope != "per_block":
         return
 
+    apply_dynamo_budgets_if_requested(plan)
     unet = getattr(model, "unet", None) or model
     compiled_count = 0
     route_name = str(route or _infer_compile_route(model)).strip().lower()
@@ -885,6 +921,7 @@ def apply_full_core_compile(
     if not plan.torch_compile or plan.torch_compile_scope not in {"full", "full_core"}:
         return False
 
+    apply_dynamo_budgets_if_requested(plan)
     route_name = str(route or "").strip().lower()
     _candidate_type, detect_compile_targets = _load_compile_target_detector()
     candidates = [

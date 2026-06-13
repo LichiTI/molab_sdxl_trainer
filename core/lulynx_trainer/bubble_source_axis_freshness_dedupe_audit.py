@@ -33,6 +33,13 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+
+
 def _family_key(value: Any) -> str:
     family = str(value or "").strip().lower().replace("-", "_")
     return "newbie" if family in {"dit", "newbie_dit"} else family
@@ -52,7 +59,13 @@ def _current_roots(requirement: Mapping[str, Any], intake: Mapping[str, Any]) ->
     roots: set[str] = set()
     for raw in _list(requirement.get("families")):
         roots.update(_strings(_mapping(raw).get("current_source_roots")))
-    roots.update(_strings(_mapping(intake.get("source_axis")).get("current_source_roots")))
+    source_axis = _mapping(intake.get("source_axis"))
+    roots.update(_strings(source_axis.get("current_source_roots")))
+    roots.update(_strings(source_axis.get("known_source_roots")))
+    for raw in _list(source_axis.get("roots")):
+        item = _mapping(raw)
+        if str(item.get("intake_status") or "") == "current_axis_duplicate":
+            roots.add(str(item.get("root") or ""))
     return sorted(root for root in roots if root)
 
 
@@ -90,6 +103,83 @@ def _axis_key(axis: Mapping[str, Any]) -> tuple[str, str, int, str]:
     )
 
 
+def _scout_axis_by_family_root_offset(source_axis_scout: Mapping[str, Any]) -> dict[tuple[str, str, int], Mapping[str, Any]]:
+    rows: dict[tuple[str, str, int], Mapping[str, Any]] = {}
+    for axis in _ranked_axes(source_axis_scout):
+        key = (
+            _family_key(axis.get("family")),
+            _norm_path(axis.get("source_data")),
+            _safe_int(axis.get("sample_offset")),
+        )
+        if key[0] and key[1] and key not in rows:
+            rows[key] = axis
+    return rows
+
+
+def _warm_cache_inventory_axes(
+    newbie_warm_cache_inventory: Mapping[str, Any],
+    *,
+    source_axis_scout: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    scout_by_axis = _scout_axis_by_family_root_offset(source_axis_scout)
+    rows: list[dict[str, Any]] = []
+    for raw in _list(newbie_warm_cache_inventory.get("axes")):
+        axis = _mapping(raw)
+        source_data = str(axis.get("source_data") or "")
+        sample_offset = _safe_int(axis.get("sample_offset"))
+        scout_axis = scout_by_axis.get(("newbie", _norm_path(source_data), sample_offset), {})
+        manifest = str(axis.get("source_manifest_sha1") or "").strip() or str(
+            scout_axis.get("source_manifest_sha1") or ""
+        ).strip()
+        if not source_data or sample_offset <= 0:
+            continue
+        completed_count = _safe_int(axis.get("completed_canary_command_count"))
+        do_not_rerun = bool(axis.get("do_not_rerun_without_new_axis"))
+        completed_or_stale = completed_count > 0 or do_not_rerun
+        blocked_reasons = set(_strings(axis.get("blocked_reasons")))
+        if str(newbie_warm_cache_inventory.get("status") or ""):
+            blocked_reasons.add(str(newbie_warm_cache_inventory.get("status") or ""))
+        if completed_or_stale:
+            blocked_reasons.add("candidate_axis_already_attempted_or_completed")
+        if do_not_rerun:
+            blocked_reasons.add("do_not_rerun_without_new_axis")
+        caption_coverage = _safe_float(
+            scout_axis.get("caption_sample_coverage"),
+            _safe_float(_mapping(axis.get("manifest")).get("caption_coverage")),
+        )
+        candidate_rank_score = _safe_float(scout_axis.get("candidate_rank_score"))
+        caption_ok = caption_coverage >= 0.875
+        rank_score_ok = bool(scout_axis) and candidate_rank_score >= 4.0
+        if not scout_axis:
+            blocked_reasons.add("candidate_rank_score_missing_from_scout")
+        if not caption_ok:
+            blocked_reasons.add("caption_coverage_below_scout_threshold")
+        if not rank_score_ok:
+            blocked_reasons.add("candidate_rank_score_below_scout_threshold")
+        cache_ready = bool(axis.get("cache_ready"))
+        rows.append(
+            {
+                "family": "newbie",
+                "source_data": source_data,
+                "sample_offset": sample_offset,
+                "source_manifest_sha1": manifest,
+                "state": str(axis.get("status") or axis.get("axis_kind") or ""),
+                "axis_kind": str(axis.get("axis_kind") or ""),
+                "cache_ready": cache_ready,
+                "quality_ok": bool(cache_ready and caption_ok and rank_score_ok),
+                "claimable": bool(axis.get("claimable")),
+                "do_not_rerun_without_new_axis": do_not_rerun,
+                "completed_canary_command_count": completed_count,
+                "attempted_or_completed": completed_or_stale,
+                "completed_existing_evidence": completed_count > 0,
+                "planned_followup_attempt": False,
+                "attempted_in_followup_plan": False,
+                "blocked_reasons": sorted(blocked_reasons),
+            }
+        )
+    return rows
+
+
 def _identity_digest(parts: Sequence[Any]) -> str:
     text = "|".join(str(part or "") for part in parts)
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -98,6 +188,7 @@ def _identity_digest(parts: Sequence[Any]) -> str:
 def _source_axis_identity_registry(
     *,
     source_axis_scout: Mapping[str, Any],
+    newbie_warm_cache_inventory: Mapping[str, Any],
     candidate: Mapping[str, Any],
     candidate_audit: Mapping[str, Any],
     current_roots: Sequence[str],
@@ -125,6 +216,11 @@ def _source_axis_identity_registry(
         attempted_in_followup_plan: bool = False,
         candidate_fresh: bool = False,
         candidate_duplicate_or_stale: bool = False,
+        axis_kind: str = "",
+        claimable: bool = False,
+        do_not_rerun_without_new_axis: bool = False,
+        completed_canary_command_count: int = 0,
+        blocked_reasons: Sequence[str] = (),
     ) -> None:
         normalized_root = _norm_path(source_root)
         offset_text = "" if sample_offset is None else str(_safe_int(sample_offset))
@@ -150,9 +246,24 @@ def _source_axis_identity_registry(
         existing = seen.get(identity_key)
         if existing is not None:
             existing["source_kind"] = str(existing.get("source_kind") or source_kind)
+            existing["source_kinds"] = sorted(
+                set(_strings(existing.get("source_kinds")) + [source_kind])
+            )
             existing["state"] = state or str(existing.get("state") or "")
+            existing["axis_kind"] = axis_kind or str(existing.get("axis_kind") or "")
             existing["cache_ready"] = bool(existing.get("cache_ready")) or cache_ready
             existing["quality_ok"] = bool(existing.get("quality_ok")) or quality_ok
+            existing["claimable"] = bool(existing.get("claimable")) or claimable
+            existing["do_not_rerun_without_new_axis"] = (
+                bool(existing.get("do_not_rerun_without_new_axis")) or do_not_rerun_without_new_axis
+            )
+            existing["completed_canary_command_count"] = max(
+                _safe_int(existing.get("completed_canary_command_count")),
+                _safe_int(completed_canary_command_count),
+            )
+            existing["blocked_reasons"] = sorted(
+                set(_strings(existing.get("blocked_reasons")) + _strings(blocked_reasons))
+            )
             existing["attempted_or_completed"] = bool(existing.get("attempted_or_completed")) or attempted_or_completed
             existing["completed_existing_evidence"] = (
                 bool(existing.get("completed_existing_evidence")) or completed_existing_evidence
@@ -172,6 +283,7 @@ def _source_axis_identity_registry(
         row = {
             "row_id": f"{source_kind}:{digest[7:23]}",
             "source_kind": source_kind,
+            "source_kinds": [source_kind],
             "identity_scope": identity_scope,
             "identity_key": identity_key,
             "identity_digest": digest,
@@ -181,8 +293,13 @@ def _source_axis_identity_registry(
             "sample_offset": _safe_int(sample_offset) if sample_offset is not None else None,
             "source_manifest_sha1": manifest,
             "state": state,
+            "axis_kind": axis_kind,
             "cache_ready": cache_ready,
             "quality_ok": quality_ok,
+            "claimable": claimable,
+            "do_not_rerun_without_new_axis": do_not_rerun_without_new_axis,
+            "completed_canary_command_count": _safe_int(completed_canary_command_count),
+            "blocked_reasons": _strings(blocked_reasons),
             "attempted_or_completed": attempted_or_completed,
             "completed_existing_evidence": completed_existing_evidence,
             "planned_followup_attempt": planned_followup_attempt,
@@ -218,6 +335,31 @@ def _source_axis_identity_registry(
             completed_existing_evidence=bool(axis.get("completed_existing_evidence")),
             planned_followup_attempt=bool(axis.get("planned_followup_attempt")),
             attempted_in_followup_plan=bool(axis.get("attempted_in_followup_plan")),
+            blocked_reasons=_strings(axis.get("blocked_reasons")),
+        )
+    for axis in _warm_cache_inventory_axes(
+        newbie_warm_cache_inventory,
+        source_axis_scout=source_axis_scout,
+    ):
+        add_row(
+            source_kind="warm_cache_inventory_axis",
+            identity_scope="axis",
+            family=str(axis.get("family") or ""),
+            source_root=str(axis.get("source_data") or ""),
+            sample_offset=axis.get("sample_offset"),
+            source_manifest_sha1=str(axis.get("source_manifest_sha1") or ""),
+            state=str(axis.get("state") or ""),
+            cache_ready=bool(axis.get("cache_ready")),
+            quality_ok=bool(axis.get("quality_ok")),
+            attempted_or_completed=bool(axis.get("attempted_or_completed")),
+            completed_existing_evidence=bool(axis.get("completed_existing_evidence")),
+            planned_followup_attempt=bool(axis.get("planned_followup_attempt")),
+            attempted_in_followup_plan=bool(axis.get("attempted_in_followup_plan")),
+            axis_kind=str(axis.get("axis_kind") or ""),
+            claimable=bool(axis.get("claimable")),
+            do_not_rerun_without_new_axis=bool(axis.get("do_not_rerun_without_new_axis")),
+            completed_canary_command_count=_safe_int(axis.get("completed_canary_command_count")),
+            blocked_reasons=_strings(axis.get("blocked_reasons")),
         )
     if str(candidate.get("family") or "") or str(candidate.get("root") or ""):
         add_row(
@@ -242,6 +384,9 @@ def _source_axis_identity_registry(
     full_axis_rows = [row for row in rows if bool(row.get("full_axis_identity_present"))]
     duplicate_rows = [row for row in rows if bool(row.get("duplicate_or_stale_axis"))]
     fresh_rows = [row for row in rows if bool(row.get("fresh_axis_candidate"))]
+    warm_cache_rows = [
+        row for row in rows if "warm_cache_inventory_axis" in _strings(row.get("source_kinds"))
+    ]
     return {
         "summary_version": 1,
         "roadmap": ROADMAP,
@@ -254,6 +399,10 @@ def _source_axis_identity_registry(
         "new_source_root_count": len(new_roots),
         "duplicate_or_stale_axis_count": len(duplicate_rows),
         "fresh_axis_candidate_count": len(fresh_rows),
+        "warm_cache_inventory_axis_count": len(warm_cache_rows),
+        "warm_cache_inventory_duplicate_or_stale_axis_count": sum(
+            1 for row in warm_cache_rows if bool(row.get("duplicate_or_stale_axis"))
+        ),
         "unsafe_row_count": len(unsafe_row_ids),
         "unsafe_row_ids": unsafe_row_ids[:20],
         "rows": rows,
@@ -443,6 +592,7 @@ def build_source_axis_freshness_dedupe_audit(
     source_cache_axis_admission_preflight: Mapping[str, Any] | None = None,
     source_cache_axis_manual_canary_plan: Mapping[str, Any] | None = None,
     external_input_replay_plan: Mapping[str, Any] | None = None,
+    newbie_warm_cache_inventory: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a non-GPU audit that separates fresh axes from duplicates."""
 
@@ -452,12 +602,14 @@ def build_source_axis_freshness_dedupe_audit(
     preflight = _mapping(source_cache_axis_admission_preflight)
     manual_plan = _mapping(source_cache_axis_manual_canary_plan)
     replay_plan = _mapping(external_input_replay_plan)
+    warm_cache = _mapping(newbie_warm_cache_inventory)
     roots = _current_roots(requirement, intake)
     new_roots = _new_roots(intake)
     cand = _candidate(preflight)
     candidate_audit = _candidate_audit(candidate=cand, source_axis_scout=scout, current_roots=roots)
     identity_registry = _source_axis_identity_registry(
         source_axis_scout=scout,
+        newbie_warm_cache_inventory=warm_cache,
         candidate=cand,
         candidate_audit=candidate_audit,
         current_roots=roots,
@@ -465,7 +617,7 @@ def build_source_axis_freshness_dedupe_audit(
     )
     preflight_admitted = bool(cand.get("preflight_admitted"))
     manual_plan_ready = str(manual_plan.get("status") or "") == "protected_manual_canary_plan_ready"
-    external_detected = bool(intake.get("external_input_detected")) or bool(new_roots)
+    external_detected = bool(new_roots)
     if candidate_audit["duplicate_or_stale"]:
         status = "duplicate_or_stale_candidate_blocked"
     elif candidate_audit["status"] == "fresh_candidate_review_ready" and preflight_admitted:

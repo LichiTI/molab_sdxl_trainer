@@ -33,6 +33,8 @@ LYCORIS_METHODS = frozenset({
     "ia3",
     "full",
     "diag-oft",
+    "glora",
+    "glokr",
 })
 
 SUPPORTED_FAMILIES = frozenset({"sdxl", "anima", "newbie"})
@@ -75,6 +77,10 @@ def normalize_adapter_method(value: Any) -> str:
         "diag-oft": "diag-oft",
         "oft": "diag-oft",
         "networks.oft": "diag-oft",
+        "lycoris_glora": "glora",
+        "generalized_lora": "glora",
+        "lycoris_glokr": "glokr",
+        "generalized_lokr": "glokr",
         "lora+": "lora_plus",
         "loraplus": "lora_plus",
         "rslora": "rs_lora",
@@ -122,6 +128,27 @@ def resolve_adapter_method(config: Any = None, *, family: str = "", method: str 
         if canonical in {"ia3", "diag-oft"}:
             safe_merge = False
             warnings.append(f"{canonical} merge/export needs method-aware validation before broad release.")
+        if canonical == "glora":
+            # GLoRA delta is ΔW = W·A + B (depends on the frozen base weight).
+            # Merge/export must be roundtrip-verified against the model the adapter
+            # was trained against; tooling that mixes adapters across base models
+            # is out of contract.
+            safe_merge = False
+            notes.append(
+                "GLoRA delta depends on the frozen base weight; merge/export requires roundtrip proof per base model."
+            )
+        if canonical == "glokr":
+            # GLoKr is a project-original Kronecker variant of GLoRA. It
+            # shares the W-dependent delta and adds research-grade caveats:
+            # no upstream parity (no LyCORIS implementation), Linear only in
+            # this cut, real-model gain is unproven.
+            safe_merge = False
+            warnings.append(
+                "GLoKr is project-original research: no upstream parity, Linear only, real-model quality unproven."
+            )
+            notes.append(
+                "GLoKr delta depends on the frozen base weight; merge/export requires roundtrip proof per base model."
+            )
     elif canonical in LORA_METHODS:
         backend = "lora"
         if canonical == "lora_fa":
@@ -309,6 +336,8 @@ def _aliases_for(method: str) -> Tuple[str, ...]:
         "diag-oft": ("diag_oft", "oft", "networks.oft", "lycoris_diag_oft"),
         "lokr": ("lycoris_lokr",),
         "loha": ("lycoris_loha",),
+        "glora": ("lycoris_glora", "generalized_lora"),
+        "glokr": ("lycoris_glokr", "generalized_lokr"),
         "locon": ("lycoris_locon",),
         "ia3": ("lycoris_ia3",),
         "full": ("lycoris_full",),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -69,10 +70,17 @@ def run_smoke() -> dict[str, Any]:
         training_launch_contract=_training_launch_contract(),
         product_exposure_evidence=_product_exposure_evidence(),
         product_exposure_review=_product_exposure_review(approve=True),
+        approval_preflight=_phase1_preflight_ready(_product_exposure_review(approve=True)),
     )
     assert signed["ok"] is True, signed
     assert signed["product_exposure_decision_recorded"] is True, signed
     assert signed["decision"] == READY_DECISION, signed
+    assert signed["approval_preflight_binding_ready"] is True, signed
+    assert signed["approval_preflight_digest"], signed
+    assert signed["record_signed_payload_digest"], signed
+    assert signed["approval_preflight_signed_payload_digest"] == signed["record_signed_payload_digest"], signed
+    assert signed["approval_preflight_signed_bundle_entry_digest"] == signed["record_signed_payload_digest"], signed
+    assert signed["summary"]["approval_preflight_binding_ready_count"] == 1, signed
     assert signed["blocked_reasons"] == [], signed
     _assert_default_off(signed)
 
@@ -106,31 +114,72 @@ def run_smoke() -> dict[str, Any]:
     )
     _assert_evidence_blocked(bad_boundary, "not_default_off")
 
+    unsafe_review_payload = {**_product_exposure_review(approve=True), "approve_request_submitted": True}
     unsafe_review = build_native_update_product_exposure_decision(
         training_launch_contract=_training_launch_contract(),
         product_exposure_evidence=_product_exposure_evidence(),
-        product_exposure_review={**_product_exposure_review(approve=True), "approve_request_submitted": True},
+        product_exposure_review=unsafe_review_payload,
+        approval_preflight=_phase1_preflight_ready(unsafe_review_payload),
     )
     _assert_review_blocked(unsafe_review, "approve_request_submitted")
 
+    missing_ack_payload = {
+        **_product_exposure_review(approve=True),
+        "acknowledge_no_request_adapter_or_schema_change": False,
+    }
     missing_ack = build_native_update_product_exposure_decision(
         training_launch_contract=_training_launch_contract(),
         product_exposure_evidence=_product_exposure_evidence(),
-        product_exposure_review={
-            **_product_exposure_review(approve=True),
-            "acknowledge_no_request_adapter_or_schema_change": False,
-        },
+        product_exposure_review=missing_ack_payload,
+        approval_preflight=_phase1_preflight_ready(missing_ack_payload),
     )
     _assert_review_blocked(missing_ack, "ack_missing", "request_adapter")
+
+    missing_preflight = build_native_update_product_exposure_decision(
+        training_launch_contract=_training_launch_contract(),
+        product_exposure_evidence=_product_exposure_evidence(),
+        product_exposure_review=_product_exposure_review(approve=True),
+    )
+    _assert_review_blocked(missing_preflight, "approval_execution_preflight_missing")
+
+    swapped_review = {**_product_exposure_review(approve=True), "reviewer": "swapped_product_exposure_smoke"}
+    swapped_preflight = build_native_update_product_exposure_decision(
+        training_launch_contract=_training_launch_contract(),
+        product_exposure_evidence=_product_exposure_evidence(),
+        product_exposure_review=swapped_review,
+        approval_preflight=_phase1_preflight_ready(_product_exposure_review(approve=True)),
+    )
+    _assert_review_blocked(
+        swapped_preflight,
+        "approval_execution_preflight_product_exposure_review_signed_payload_digest_mismatch",
+    )
+
+    missing_signed_check = build_native_update_product_exposure_decision(
+        training_launch_contract=_training_launch_contract(),
+        product_exposure_evidence=_product_exposure_evidence(),
+        product_exposure_review=_product_exposure_review(approve=True),
+        approval_preflight=_phase1_preflight_ready(),
+    )
+    _assert_review_blocked(
+        missing_signed_check,
+        "approval_execution_preflight_product_exposure_review_signed_check_missing",
+    )
 
     real_artifact = _write_real_artifact_case()
     return {
         "schema_version": 1,
         "probe": "turbocore_native_update_product_exposure_decision_smoke",
         "ok": True,
+        "roadmap": "devtools/docs/turbocore_optimizer_backend_design_v2.md",
         "pending_decision": pending["decision"],
         "signed_decision": signed["decision"],
         "real_artifact_checked": bool(real_artifact),
+        "ready_for_product_exposure_review": pending["ready_for_product_exposure_review"],
+        "product_exposure_review_action_required": pending["product_exposure_review_action_required"],
+        "product_exposure_decision_recorded_count": 0,
+        "missing_preflight_blocked": True,
+        "preflight_signed_payload_swap_blocked": True,
+        "preflight_signed_check_missing_blocked": True,
         "recommended_next_step": pending["recommended_next_step"],
     }
 
@@ -311,6 +360,49 @@ def _product_exposure_review(*, approve: bool) -> dict[str, Any]:
     ):
         review[field] = True
     return review
+
+
+def _phase1_preflight_ready(product_exposure_review: dict[str, Any] | None = None) -> dict[str, Any]:
+    preflight = {
+        "schema_version": 1,
+        "package": "turbocore_optimizer_v2_approval_execution_preflight_v0",
+        "gate": "optimizer_v2_approval_execution_preflight",
+        "ok": True,
+        "phase1_record_inputs_ready": True,
+        "phase2_direction_inputs_ready": False,
+        "approval_recorded": False,
+        "approval_artifact_written": False,
+        "default_behavior_changed": False,
+        "runtime_dispatch_ready": False,
+        "native_dispatch_allowed": False,
+        "training_path_enabled": False,
+        "product_native_ready": False,
+        "summary": {
+            "v2_approval_preflight_phase1_ready_count": 1,
+            "v2_approval_preflight_phase2_ready_count": 0,
+        },
+    }
+    if product_exposure_review is not None:
+        digest = _digest_payload(product_exposure_review)
+        preflight["signed_checks"] = [
+            {
+                "schema_version": 1,
+                "id": "product_exposure_review",
+                "valid": True,
+                "signed_payload_digest": digest,
+                "signed_bundle_entry_digest": digest,
+                "extracted_entry_digest_match": True,
+                "extracted_entry_digest_mismatch": False,
+                "extracted_entry_source_missing": False,
+            }
+        ]
+    return preflight
+
+
+def _digest_payload(value: dict[str, Any]) -> str:
+    payload = {str(key): item for key, item in value.items() if not str(key).startswith("_source_")}
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
 
 
 def main() -> None:

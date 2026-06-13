@@ -153,6 +153,12 @@ def _fp8_compute_supported(linear: nn.Module, x: torch.Tensor) -> bool:
     weight = getattr(linear, "weight", None)
     if weight is None or weight.dtype != _FP8_DTYPE or not x.is_cuda:
         return False
+    # The frozen base weight may have been offloaded to CPU (block residency)
+    # while the activation lives on cuda. ``_scaled_mm`` has no implicit device
+    # promotion, so a cross-device pair must fall back to the device-safe bf16
+    # dequant rather than reaching the GEMM and crashing.
+    if weight.device != x.device:
+        return False
     if weight.dim() != 2:
         return False
     out_features, in_features = weight.shape
@@ -178,10 +184,23 @@ def fp8_base_linear_forward(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     bias = getattr(linear, "bias", None)
 
     def _fallback() -> torch.Tensor:
-        b = bias.to(x.dtype) if bias is not None else None
-        return F.linear(x, weight.to(x.dtype), b)
+        # ``.to(x.dtype)`` alone preserves the weight device; if the frozen base
+        # weight was offloaded to CPU (block residency) this would mismatch the
+        # cuda activation. Move device + dtype together so the dequant fallback
+        # is always device-safe.
+        w = weight.to(device=x.device, dtype=x.dtype)
+        b = bias.to(device=x.device, dtype=x.dtype) if bias is not None else None
+        return F.linear(x, w, b)
 
     if not _fp8_compute_supported(linear, x):
+        return _fallback()
+
+    # ``torch._scaled_mm`` has no autograd backward, so under an active grad
+    # context (training) it would raise "derivative for aten::_scaled_mm is not
+    # implemented" once the graph is traversed. Route training through the bf16
+    # dequant fallback (differentiable, keeps the fp8 *storage* savings) and
+    # reserve the FP8 tensor-core GEMM for inference (torch.no_grad).
+    if torch.is_grad_enabled():
         return _fallback()
 
     scaled_mm = _resolve_scaled_mm()

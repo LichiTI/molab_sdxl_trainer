@@ -1350,19 +1350,29 @@ class _NextDiTWrapper(torch.nn.Module):
                 has_smoothcache_step_context,
                 observe_block_call as observe_smoothcache_block_call,
             )
+            from .dit_compute_reducer_seam import get_active_compute_reducer_seam
         except ImportError:  # pragma: no cover - direct-file smoke fallback.
             from core.lulynx_trainer.spectrum_probe import has_spectrum_step_context, observe_block_call
             from core.lulynx_trainer.smoothcache import (
                 has_smoothcache_step_context,
                 observe_block_call as observe_smoothcache_block_call,
             )
+            from core.lulynx_trainer.dit_compute_reducer_seam import get_active_compute_reducer_seam
+
+        use_checkpoint = bool(self._gradient_checkpointing and self.training)
+        reducer = None if use_checkpoint else get_active_compute_reducer_seam()
+        if reducer is not None and hasattr(reducer, "set_total_blocks"):
+            try:
+                reducer.set_total_blocks(len(blocks))
+            except TypeError:
+                pass
 
         for block_index, block in enumerate(blocks):
             if has_spectrum_step_context():
                 observe_block_call(block_index=block_index)
             if has_smoothcache_step_context():
                 observe_smoothcache_block_call(block_index=block_index)
-            if self._gradient_checkpointing and self.training:
+            if use_checkpoint:
                 checkpoint_kwargs = {"use_reentrant": False, "preserve_rng_state": False}
                 if str(getattr(self, "_newbie_block_checkpointing_mode", "") or "") == "selective":
                     try:
@@ -1378,6 +1388,12 @@ class _NextDiTWrapper(torch.nn.Module):
                     x,
                     t_emb,
                     **checkpoint_kwargs,
+                )
+            elif reducer is not None:
+                x = reducer.run_block(
+                    lambda tokens, blk=block: self._run_dit_block(blk, tokens, t_emb),
+                    block_index,
+                    x,
                 )
             else:
                 x = self._run_dit_block(block, x, t_emb)
@@ -2967,5 +2983,4 @@ def _run_optional_loaded_newbie_smoke(model: LoadedModel) -> None:
         notes.append(f"Newbie transformer smoke failed safely: {result.reason}")
         logger.warning("Newbie transformer smoke failed safely: %s", result.reason)
     model.newbie_native_notes = notes
-
 

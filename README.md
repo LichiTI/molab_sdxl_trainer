@@ -80,9 +80,10 @@ notebooks/molab_sdxl_lora.py
 在 notebook 中可以完成：
 
 1. 检查 Python / Torch / CUDA / GPU
-2. 可选从 Hugging Face 下载 SDXL 底模
-3. 可选从普通直链 / Civitai download URL 下载模型到 `work/models/`
-4. 上传训练集 zip 后一键解压并自动识别训练集目录
+2. 通过面板手动安装 / 更新 Blackwell、SageAttention 或基础运行时
+3. 可选从 Hugging Face 下载 SDXL 底模
+4. 可选从普通直链 / Civitai download URL 下载模型到 `work/models/`
+5. 上传训练集 zip 后一键解压并自动识别训练集目录
 5. 填写模型路径、数据集路径、输出名
 6. 设置 rank、alpha、分辨率、epoch、学习率、optimizer
 7. 设置 bucket、cache、混合精度、低显存策略
@@ -112,11 +113,19 @@ configs/sdxl_lora_minimal.json
 }
 ```
 
-然后运行：
+然后运行（在仓库根目录内）：
 
 ```bash
 python scripts/run_sdxl_train.py --config configs/sdxl_lora_minimal.json
 ```
+
+如果在仓库的父目录运行，则带上仓库目录名前缀：
+
+```bash
+python lulynx-sdxl-trainer/scripts/run_sdxl_train.py --config configs/sdxl_lora_minimal.json
+```
+
+（`--config` 的相对路径会按 `run_sdxl_train.py` 所在仓库根解析，与当前 cwd 无关。）
 
 启动脚本会自动创建：
 

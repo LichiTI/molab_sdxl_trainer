@@ -106,6 +106,12 @@ from .anima_full_finetune import (
 )
 from .anima_dit_runtime_guardrails import apply_anima_dit_runtime_guardrails
 from .newbie_dit_runtime_guardrails import apply_newbie_dit_runtime_guardrails
+from .trainer_thermal import TrainerThermalMixin
+from .trainer_optimizer_factory import TrainerOptimizerFactoryMixin
+from .trainer_artifact_io import TrainerArtifactIoMixin
+from .trainer_anima_cache_runtime import TrainerAnimaCacheRuntimeMixin
+from .trainer_logging_runtime import TrainerLoggingRuntimeMixin
+from .trainer_bubble_runtime import TrainerBubbleRuntimeMixin
 from .amd_runtime import (
     apply_amd_runtime_guard,
     build_amd_banner_lines,
@@ -219,7 +225,7 @@ class _FullFinetuneParamWrapper:
                 self._text_encoder_2.load_state_dict(te2_sd, strict=False)
 
 
-class LulynxTrainer:
+class LulynxTrainer(TrainerThermalMixin, TrainerOptimizerFactoryMixin, TrainerArtifactIoMixin, TrainerAnimaCacheRuntimeMixin, TrainerLoggingRuntimeMixin, TrainerBubbleRuntimeMixin):
     """Lulynx 原生 LoRA 训练器"""
 
     def __init__(self, config: Optional[LulynxConfig] = None):
@@ -242,6 +248,9 @@ class LulynxTrainer:
         self._compile_cache_profile: Dict[str, Any] = {}
         self._anima_block_residency_profile: Dict[str, Any] = {}
         self._anima_block_checkpoint_profile: Dict[str, Any] = {}
+        # #147: set True when the faithful native forward is active so the
+        # checkpoint-policy resolution disables the incompatible checkpointing.
+        self._anima_faithful_active: bool = False
         self._newbie_block_residency_profile: Dict[str, Any] = {}
         self._newbie_block_checkpoint_profile: Dict[str, Any] = {}
         self._auto_vram_enhancement_profile: Dict[str, Any] = {}
@@ -274,6 +283,8 @@ class LulynxTrainer:
         self._reft_interventions = []
         self._easy_control = None
         self._ip_adapter = None
+        self._easycontrol_v2_adapter = None
+        self._easycontrol_v2_patch_handle = None
         self._repa_projector = None
         self._dop_instance = None
         self._adapter_cpu_residency = None
@@ -551,17 +562,40 @@ class LulynxTrainer:
 
         return high_resolution or high_visual_tokens
 
+    def _anima_faithful_block_checkpoint_recommended(self) -> bool:
+        """Recommend native block checkpointing whenever faithful is requested.
+
+        The faithful native forward clears the generic ``gradient_checkpointing``
+        flags (inert on the native subset), so without block recompute every DiT
+        block's activations stay resident — the silent 5.x->7GB regression vs the
+        legacy checkpointed trainers. An explicitly-provided
+        ``anima_block_checkpointing`` value (True or False) wins over the auto
+        recommendation: only requests that never mention the field get auto-on.
+        """
+
+        if not bool(getattr(self.config, "anima_faithful_forward", False)):
+            return False
+        fields_set = getattr(self.config, "model_fields_set", None) or set()
+        return "anima_block_checkpointing" not in fields_set
+
     def _prepare_anima_dit_runtime_guardrails(self) -> None:
         """Apply Anima DiT checkpoint/residency knobs shared by LoRA and full FT."""
 
+        residency_recommended = self._dit_block_checkpoint_recommended(
+            "anima",
+            str(getattr(self.config, "anima_block_residency", "resident") or "resident"),
+        )
+        faithful_recommended = self._anima_faithful_block_checkpoint_recommended()
         profile = apply_anima_dit_runtime_guardrails(
             config=self.config,
             model=self.model,
             device=self.device,
             dtype=self.dtype,
-            checkpoint_auto_recommended=self._dit_block_checkpoint_recommended(
-                "anima",
-                str(getattr(self.config, "anima_block_residency", "resident") or "resident"),
+            checkpoint_auto_recommended=residency_recommended or faithful_recommended,
+            checkpoint_auto_reason=(
+                "non-resident 1024/4096-token DiT paths need activation recompute"
+                if residency_recommended
+                else "faithful native forward keeps all block activations without recompute"
             ),
             log=self._log,
         )
@@ -593,171 +627,10 @@ class LulynxTrainer:
         self._attach_memory_runtime_profiles_to_training_loop()
         self._mark_runtime_phase("newbie_block_residency_prepare", log=False)
 
-    def _resolve_logging_run_dir(self) -> Optional[Path]:
-        raw_dir = str(getattr(self.config, "logging_dir", "") or "").strip()
-        if not raw_dir:
-            return None
-        base = Path(raw_dir)
-        prefix = str(getattr(self.config, "log_prefix", "") or "").strip()
-        if prefix:
-            timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
-            return base / f"{prefix}{timestamp}"
-        return base
-
-    def _initialize_logging_runtime(self) -> None:
-        self._tb_writer = None
-        self._tb_log_dir = None
-        self._wandb_enabled = False
-
-        log_with = str(getattr(self.config, "log_with", "") or "").strip().lower()
-        if not log_with:
-            return
-
-        run_dir = self._resolve_logging_run_dir()
-        if log_with == "tensorboard":
-            if run_dir is None:
-                self._log("Logging requested with tensorboard, but logging_dir is empty; skipping tracker init.")
-                return
-            try:
-                from torch.utils.tensorboard import SummaryWriter
-
-                run_dir.mkdir(parents=True, exist_ok=True)
-                self._tb_writer = SummaryWriter(log_dir=str(run_dir))
-                self._tb_log_dir = run_dir
-                self._tb_flush_interval_steps = max(
-                    1,
-                    int(getattr(self.config, "tensorboard_flush_interval_steps", 10) or 10),
-                )
-                self._log(f"TensorBoard logging initialized: {run_dir}")
-            except Exception as exc:
-                self._tb_writer = None
-                self._tb_log_dir = None
-                self._log(f"TensorBoard logging unavailable: {exc}")
-            return
-
-        if log_with == "wandb":
-            api_key = str(getattr(self.config, "wandb_api_key", "") or "").strip()
-            run_name = str(getattr(self.config, "wandb_run_name", "") or "").strip()
-            if api_key:
-                os.environ["WANDB_API_KEY"] = api_key
-            if run_name:
-                os.environ["WANDB_NAME"] = run_name
-            self._wandb_enabled = True
-            summary = "WandB logging requested"
-            if api_key:
-                summary += " (api key set)"
-            if run_name:
-                summary += f", run_name={run_name}"
-            self._log(summary)
-            return
-
-        self._log(f"Unknown log_with={log_with}; skipping logging runtime init.")
-
-    def _write_step_log(self, step: int, loss: float, lr: float, info: Optional[Dict] = None) -> None:
-        if self._tb_writer is not None:
-            self._tb_writer.add_scalar("loss/train", float(loss), int(step))
-            self._tb_writer.add_scalar("lr", float(lr), int(step))
-            if info is not None:
-                stages = info.get("peak_vram_stages")
-                if stages:
-                    self._tb_writer.add_scalar("vram/peak_forward_mb", stages["forward_mb"], int(step))
-                    self._tb_writer.add_scalar("vram/peak_backward_mb", stages["backward_mb"], int(step))
-                    self._tb_writer.add_scalar("vram/peak_optimizer_mb", stages["optimizer_mb"], int(step))
-                diagnostics = info.get("peak_vram_diagnostics")
-                if diagnostics:
-                    if diagnostics.get("max_reserved_mb") is not None:
-                        self._tb_writer.add_scalar("vram/max_reserved_mb", diagnostics["max_reserved_mb"], int(step))
-                    if diagnostics.get("max_allocated_mb") is not None:
-                        self._tb_writer.add_scalar("vram/max_allocated_mb", diagnostics["max_allocated_mb"], int(step))
-                    if diagnostics.get("allocator_cache_gap_mb") is not None:
-                        self._tb_writer.add_scalar("vram/allocator_cache_gap_mb", diagnostics["allocator_cache_gap_mb"], int(step))
-                icu = info.get("icu_score")
-                if icu is not None:
-                    self._tb_writer.add_scalar("health/icu_score", int(icu), int(step))
-                attn_ent = info.get("attn_entropy")
-                if attn_ent is not None:
-                    self._tb_writer.add_scalar("health/attn_entropy", float(attn_ent), int(step))
-                act_drift = info.get("act_drift")
-                if act_drift:
-                    for layer_name, drifts in act_drift.items():
-                        short = layer_name.split(".")[-1] if "." in layer_name else layer_name
-                        self._tb_writer.add_scalar(f"drift/{short}/mean", drifts.get("mean_drift", 0), int(step))
-                        self._tb_writer.add_scalar(f"drift/{short}/std", drifts.get("std_drift", 0), int(step))
-                loss_mods = info.get("loss_modifiers")
-                if loss_mods:
-                    self._tb_writer.add_scalar("loss/active_modifiers", len(loss_mods), int(step))
-                grad_stats = info.get("grad_stats")
-                if grad_stats:
-                    self._tb_writer.add_scalar("grad/norm", grad_stats["norm"], int(step))
-                    self._tb_writer.add_scalar("grad/norm_ema", grad_stats["norm_ema"], int(step))
-                    self._tb_writer.add_scalar("grad/norm_var", grad_stats["norm_var"], int(step))
-                    self._tb_writer.add_scalar("grad/fisher_diag", grad_stats["fisher_diag"], int(step))
-                    if grad_stats.get("cosine_sim") is not None:
-                        self._tb_writer.add_scalar("grad/cosine_sim", grad_stats["cosine_sim"], int(step))
-                hess = info.get("hessian_trace")
-                if hess is not None:
-                    self._tb_writer.add_scalar("health/hessian_trace", float(hess), int(step))
-                forgetting = info.get("forgetting")
-                if forgetting:
-                    self._tb_writer.add_scalar("health/forgetting_score", forgetting.get("score", 100), int(step))
-                    self._tb_writer.add_scalar("health/forgetting_ratio", forgetting.get("ratio", 1.0), int(step))
-            flush_interval = max(1, int(getattr(self, "_tb_flush_interval_steps", 10) or 10))
-            if int(step) % flush_interval == 0:
-                self._tb_writer.flush()
-
-    def _write_epoch_log(self, epoch: int, avg_loss: float) -> None:
-        if self._tb_writer is not None:
-            self._tb_writer.add_scalar("loss/epoch", float(avg_loss), int(epoch) + 1)
-            self._tb_writer.flush()
-
-    def _should_emit_step_logging(self, step: int) -> bool:
-        interval = max(1, int(getattr(self, "_step_logging_interval", 1) or 1))
-        return step <= 1 or step % interval == 0
-
-    def _record_step_logging_overhead(self, step: int, overhead_seconds: float, step_wall_seconds: float) -> None:
-        if not getattr(self, "_adaptive_step_logging_enabled", True):
-            return
-        if step_wall_seconds <= 0.0 or overhead_seconds < 0.0:
-            return
-
-        self._step_logging_profile_steps += 1
-        self._step_logging_profile_total += float(step_wall_seconds)
-        self._step_logging_profile_overhead += float(overhead_seconds)
-
-        window = max(1, int(getattr(self, "_step_logging_window", 50) or 50))
-        if self._step_logging_profile_steps < window:
-            return
-
-        total = max(self._step_logging_profile_total, 1e-9)
-        ratio = self._step_logging_profile_overhead / total
-        threshold = max(0.0, float(getattr(self, "_step_logging_threshold", 0.01) or 0.01))
-        interval = max(1, int(getattr(self, "_step_logging_interval", 1) or 1))
-        max_interval = max(1, int(getattr(self, "_step_logging_max_interval", 64) or 64))
-
-        if ratio > threshold and interval < max_interval:
-            new_interval = min(interval * 2, max_interval)
-            self._step_logging_interval = new_interval
-            self._tb_flush_interval_steps = max(int(getattr(self, "_tb_flush_interval_steps", 10) or 10), new_interval)
-            self._log(
-                "[adaptive-logging] step logging overhead %.2f%% exceeded %.2f%% over %d logged step(s); "
-                "reducing step log frequency to every %d optimizer step(s)."
-                % (ratio * 100.0, threshold * 100.0, self._step_logging_profile_steps, new_interval)
-            )
-
-        self._step_logging_profile_steps = 0
-        self._step_logging_profile_total = 0.0
-        self._step_logging_profile_overhead = 0.0
-
-    def _finalize_logging_runtime(self) -> None:
-        writer = self._tb_writer
-        self._tb_writer = None
-        if writer is not None:
-            try:
-                writer.flush()
-                writer.close()
-            except Exception as exc:
-                logger.debug("TensorBoard writer close failed: %s", exc)
-        self._tb_log_dir = None
+    # ------------------------------------------------------------------
+    # Logging-runtime methods moved to trainer_logging_runtime.TrainerLoggingRuntimeMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _get_sample_prompts_list(self) -> List[str]:
         prompts = getattr(self.config, "sample_prompts", [])
@@ -1003,6 +876,110 @@ class LulynxTrainer:
         except Exception as exc:  # never block training on an experimental selector
             self._log(f"adapter_target_policy resolution failed ({exc}); using all targets.")
             return None, None
+
+    def _resolve_fg_lora_rank_plan(
+        self, model_arch: str
+    ) -> tuple[str, Optional[set], Optional[Dict[str, int]]]:
+        """Resolve the FG-LoRA per-layer rank plan for the native LoRA injector.
+
+        Returns ``(injector_policy_label, selected_module_types, rank_map)`` to
+        feed straight into ``LoRAInjector``. The label drives the injector's
+        ``_adapter_target_policy_active`` gate (must be != "all" to consume the
+        map); ``selected`` (or None = keep all) optionally prunes target types;
+        ``rank_map`` carries per-key rank, keyed by full module path OR module
+        type. ``fg_lora_rank_policy`` (default "uniform") picks the direction:
+
+          * ``uniform``  -> delegate to the legacy ``adapter_target_policy`` knob;
+            "all" yields ("all", None, None) == bitwise-parity no-op.
+          * ``coupled_prune`` -> reuse the adapter_target_policy engine (selects
+            important layers, DROPS the rest, couples rank to score; saves VRAM).
+          * ``orthogonal_redistribute`` -> keep ALL target layers, only reallocate
+            each layer's rank by a depth profile over the live model full-paths.
+
+        Any failure / unusable input degrades to a parity path so training never
+        blocks on this experimental selector.
+        """
+        policy = str(getattr(self.config, "fg_lora_rank_policy", "uniform") or "uniform").strip().lower()
+        legacy_label = str(getattr(self.config, "adapter_target_policy", "all") or "all")
+
+        if policy == "coupled_prune":
+            selected, rank_map = self._resolve_adapter_target_policy_selection(model_arch)
+            if selected is None and rank_map is None:
+                self._log(
+                    "fg_lora_rank_policy='coupled_prune' needs an adapter_target_policy "
+                    "profile (adapter_target_policy_profile_path); using all targets (parity)."
+                )
+                return "all", None, None
+            return (legacy_label if legacy_label != "all" else "fg_lora_coupled"), selected, rank_map
+
+        if policy == "orthogonal_redistribute":
+            try:
+                rank_map = self._build_fg_lora_orthogonal_rank_map(model_arch)
+            except Exception as exc:  # never block training on an experimental selector
+                self._log(f"fg_lora_rank_policy orthogonal resolution failed ({exc}); using all targets (parity).")
+                return "all", None, None
+            if not rank_map:
+                self._log("fg_lora_rank_policy='orthogonal_redistribute' matched no targets; using all at network_dim (parity).")
+                return "all", None, None
+            self._log(
+                f"fg_lora_rank_policy='orthogonal_redistribute' reallocated rank over "
+                f"{len(rank_map)} target layers (profile="
+                f"{str(getattr(self.config, 'fg_lora_rank_profile', 'center_peak'))}, "
+                f"conserve={bool(getattr(self.config, 'fg_lora_rank_conserve_budget', True))})."
+            )
+            return "fg_lora_orthogonal", None, rank_map
+
+        # uniform / unknown -> legacy adapter_target_policy path (parity-preserving).
+        selected, rank_map = self._resolve_adapter_target_policy_selection(model_arch)
+        return legacy_label, selected, rank_map
+
+    def _build_fg_lora_orthogonal_rank_map(self, model_arch: str) -> Dict[str, int]:
+        """Build a full-path rank map that keeps all target layers (orthogonal).
+
+        Enumerates the live unet's injectable ``nn.Linear`` paths and mirrors the
+        injector's target-match + exclude rules (see the inject() call site) so the
+        produced keys line up with the names the injector iterates; the injector's
+        full-path-first rank lookup then turns this into true per-layer rank.
+        Returns ``{}`` (caller degrades to parity) when the model/targets are absent.
+        """
+        import torch.nn as nn
+        from .fg_lora_rank_policy import (
+            FgLoraRankPolicyConfig,
+            build_orthogonal_rank_map,
+            select_target_full_paths,
+        )
+        from .model_family import get_model_family
+
+        model = getattr(self, "model", None)
+        unet = getattr(model, "unet", None) if model is not None else None
+        if unet is None:
+            return {}
+
+        if model_arch == "anima":
+            target_names = list(self._get_anima_target_modules() or [])
+            excludes = [] if self._anima_train_llm_adapter_enabled() else ["llm_adapter"]
+        elif model_arch == "newbie":
+            target_names = list(self._get_custom_target_modules() or [])
+            excludes = []
+        else:
+            target_names = list(get_model_family(model_arch).unet_target_modules)
+            excludes = []
+        if not target_names:
+            return {}
+
+        linear_names = [n for n, m in unet.named_modules() if isinstance(m, nn.Linear)]
+        matched = select_target_full_paths(linear_names, target_names, excludes)
+        if not matched:
+            return {}
+        base_rank = int(getattr(self.config, "network_dim", 16) or 16)
+        cfg = FgLoraRankPolicyConfig(
+            policy="orthogonal_redistribute",
+            min_rank=int(getattr(self.config, "fg_lora_rank_min", 1) or 1),
+            max_rank=int(getattr(self.config, "fg_lora_rank_max", 64) or 64),
+            profile=str(getattr(self.config, "fg_lora_rank_profile", "center_peak") or "center_peak"),
+            conserve_budget=bool(getattr(self.config, "fg_lora_rank_conserve_budget", True)),
+        )
+        return build_orthogonal_rank_map(matched, base_rank, cfg)
 
     def _resolve_lora_activation_recompute(self, model_arch: str) -> bool:
         """Resolve Warehouse LoRA branch activation recompute."""
@@ -2401,58 +2378,10 @@ class LulynxTrainer:
         mark("load_transformer_only")
         self._newbie_cache_first_profile["total_seconds"] = profile_steps[-1]["total_seconds"] if profile_steps else 0.0
 
-    def _prepare_anima_cached_executable(self, model_path: str) -> None:
-        """Install the real native DiT module for cache-first Anima training."""
-        online_cache_enabled = bool(getattr(self.config, "anima_online_cache", False))
-        if self._anima_cache_pending and not online_cache_enabled:
-            self._log("Anima cache build was deferred until model load; running now.")
-            self._build_anima_cache_now()
-        elif (
-            self._should_auto_build_anima_cache_before_training()
-            and not online_cache_enabled
-            and not self._has_anima_cached_training_data()
-        ):
-            self._log(
-                "Anima cache-first prepare: paired cache files were missing; attempting an upfront cache build."
-            )
-            self._build_anima_cache_now()
-
-        if not self._has_anima_cached_training_data() and not online_cache_enabled:
-            return
-        if getattr(self.model, "anima_native_train_ready", False):
-            return
-
-        from .anima_native_dit import load_anima_native_executable_subset
-
-        block_count = max(int(getattr(self.config, "anima_native_block_count", 28) or 28), 1)
-        block_indices = tuple(range(block_count))
-        self._log(
-            "Anima cache-first training: loading native DiT executable "
-            f"({block_count} blocks) from {model_path}"
-        )
-        native_unet, native_report = load_anima_native_executable_subset(
-            model_path,
-            block_indices=block_indices,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        for param in native_unet.parameters():
-            param.requires_grad_(False)
-
-        self.model.unet = native_unet
-        if not online_cache_enabled:
-            self.model.text_encoder_1 = None
-            self.model.text_encoder_2 = None
-            self.model.vae = None
-        self.model.noise_scheduler = None
-        self.model.anima_native_train_ready = True
-        self.model.anima_cached_training_ready = True
-        self.model.anima_native_executable_report = native_report
-        self._log(
-            "Anima native DiT executable ready: "
-            f"loaded={native_report.loaded_key_count}/{native_report.module_key_count}, "
-            f"device={native_report.device}, dtype={native_report.dtype_name or self.dtype}"
-        )
+    # ------------------------------------------------------------------
+    # R1 cache/faithful methods moved to trainer_anima_cache_runtime.TrainerAnimaCacheRuntimeMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _apply_native_runtime_profile(self) -> None:
         """Apply optional native-family runtime profiles without replacing defaults."""
@@ -2783,14 +2712,55 @@ class LulynxTrainer:
         fp8_dtype = getattr(torch, "float8_e4m3fn", None)
         if fp8_dtype is None or self.model is None:
             return 0
+        # ``self.model`` may be a LoadedModel container (anima/newbie native DiT)
+        # whose backbone lives under ``.unet``, or a bare nn.Module (SDXL). Resolve
+        # the module(s) to walk the same way apply_weight_compression does, so we do
+        # not call ``.modules()`` on the non-Module container.
+        roots = []
+        backbone = getattr(self.model, "unet", None)
+        if isinstance(backbone, torch.nn.Module):
+            roots.append(backbone)
+        elif isinstance(self.model, torch.nn.Module):
+            roots.append(self.model)
         count = 0
-        for module in self.model.modules():
-            if isinstance(module, torch.nn.Linear):
-                weight = getattr(module, "weight", None)
-                if getattr(weight, "dtype", None) == fp8_dtype:
-                    module._fp8_base_compute = True
-                    count += 1
+        for root in roots:
+            for module in root.modules():
+                if isinstance(module, torch.nn.Linear):
+                    weight = getattr(module, "weight", None)
+                    if getattr(weight, "dtype", None) == fp8_dtype:
+                        module._fp8_base_compute = True
+                        self._install_fp8_linear_dequant_shim(module, fp8_dtype)
+                        count += 1
         return count
+
+    @staticmethod
+    def _install_fp8_linear_dequant_shim(module: "torch.nn.Linear", fp8_dtype) -> None:
+        """Make a *standalone* fp8 ``nn.Linear`` forward-safe via a bf16 dequant.
+
+        After native fp8 cast, ``module.weight`` is ``float8_e4m3fn``; a plain
+        ``F.linear`` then raises (fp8 matmul unsupported). LoRA-wrapped Linears
+        are handled by ``LoRALinear._base_forward`` (which bypasses this shim),
+        but unwrapped base Linears (x/t-embedder, adaLN modulation, final layer)
+        reach their own ``forward`` and would crash. The shim transiently
+        upcasts the single weight to the activation dtype and runs a normal
+        differentiable ``F.linear`` — fp8 *storage* savings are kept, only one
+        weight is materialised in bf16 at a time, and autograd flows to any
+        downstream LoRA params. Idempotent.
+        """
+        if getattr(module, "_fp8_dequant_shimmed", False):
+            return
+        import torch.nn.functional as F
+
+        def _fp8_dequant_forward(x):
+            w = module.weight
+            b = module.bias
+            wb = w.to(device=x.device, dtype=x.dtype) if getattr(w, "dtype", None) == fp8_dtype else w
+            bb = b.to(device=x.device, dtype=x.dtype) if b is not None else None
+            return F.linear(x, wb, bb)
+
+        module.forward = _fp8_dequant_forward  # type: ignore[assignment]
+        module._fp8_dequant_shimmed = True
+
 
     def _apply_compression_companion(self) -> None:
         """Load a frozen recovery adapter and merge it into base Linear weights."""
@@ -2882,7 +2852,7 @@ class LulynxTrainer:
                     "VAE and text encoders will run live each step without writing cache files."
                 )
             elif mode == "rebuild_cache":
-                self._build_anima_cache_now()
+                self._build_anima_cache_now(force=True)
                 self.config.anima_cached_training = True
         elif model_arch == "newbie":
             if mode == "rebuild_cache":
@@ -2897,136 +2867,10 @@ class LulynxTrainer:
         if model_arch == "newbie":
             self._log_newbie_cache_parity_report("newbie cache parity")
 
-    def _build_anima_cache_now(self) -> None:
-        """Build the Anima latent + text cache before training begins.
-
-        Uses ``anima_cache_builder.build_anima_cache`` with VAE and text-encode
-        callables sourced from the loaded model.  Skipped silently if the
-        model has not been loaded yet — the caller should arrange ordering.
-        """
-        from .anima_cache_builder import AnimaCacheBuilderConfig, build_anima_cache
-        from .caption_source_mix import normalize_caption_source_mix_config
-
-        data_dir = str(getattr(self.config, "train_data_dir", "") or "").strip()
-        if not data_dir:
-            self._log("Anima rebuild_cache requested but train_data_dir is empty; skipping.")
-            return
-
-        if self.model is None:
-            self._log("Anima rebuild_cache requested but model not yet loaded; will build on first step.")
-            self._anima_cache_pending = True
-            return
-
-        self._anima_cache_pending = False
-        try:
-            encode_bundle = build_anima_cache_encode_bundle(
-                model=self.model,
-                device=self.device,
-                dtype=self.dtype,
-                config=self.config,
-            )
-        except RuntimeError as exc:
-            self._log(f"Anima cache builder: {exc}")
-            return
-
-        self._log(f"Anima cache builder inputs ready: {encode_bundle.summary}")
-
-        cfg = AnimaCacheBuilderConfig(
-            data_dir=data_dir,
-            output_dir=data_dir,
-            vae_chunk_size=int(getattr(self.config, "anima_vae_chunk_size", 0) or 0),
-            text_token_limit=int(getattr(self.config, "anima_text_token_limit", 0) or 0),
-            include_loss_mask=bool(getattr(self.config, "masked_loss", False)),
-            disk_format=str(getattr(self.config, "latent_cache_disk_format", "npz") or "npz"),
-            disk_dtype=self._resolve_cache_disk_dtype(getattr(self.config, "latent_cache_disk_dtype", "float16")),
-            text_disk_format=str(getattr(self.config, "text_encoder_outputs_cache_disk_format", "npz") or "npz"),
-            text_disk_dtype=self._resolve_cache_disk_dtype(
-                getattr(self.config, "text_encoder_outputs_cache_disk_dtype", "float16")
-            ),
-            caption_source_mix=normalize_caption_source_mix_config(
-                enabled=bool(getattr(self.config, "caption_source_mix_enabled", False)),
-                nl_ratio=getattr(self.config, "caption_source_nl_ratio", 65.0),
-                tag_ratio=getattr(self.config, "caption_source_tag_ratio", 20.0),
-                trigger_only_ratio=getattr(self.config, "caption_source_trigger_only_ratio", 10.0),
-                empty_ratio=getattr(self.config, "caption_source_empty_ratio", 5.0),
-                trigger_tokens=str(getattr(self.config, "caption_source_trigger_tokens", "") or ""),
-            ),
-        )
-
-        staged_plan = self._build_anima_staged_resolution_plan()
-        if staged_plan:
-            self._log(f"Anima staged-resolution cache builder: {stages_to_summary(staged_plan)}")
-            total_written = 0
-            total_skipped = 0
-            total_errors = 0
-            for stage in staged_plan:
-                stage_cfg = AnimaCacheBuilderConfig(
-                    data_dir=cfg.data_dir,
-                    output_dir=stage.cache_dir,
-                    vae_chunk_size=cfg.vae_chunk_size,
-                    text_token_limit=cfg.text_token_limit,
-                    include_loss_mask=cfg.include_loss_mask,
-                    disk_format=cfg.disk_format,
-                    disk_dtype=cfg.disk_dtype,
-                    text_disk_format=cfg.text_disk_format,
-                    text_disk_dtype=cfg.text_disk_dtype,
-                    target_resolution=stage.resolution,
-                    caption_source_mix=cfg.caption_source_mix,
-                )
-                self._log(
-                    "Anima staged cache builder: "
-                    f"resolution={stage.resolution}, batch={stage.batch_size or getattr(self.config, 'batch_size', 1)}, "
-                    f"output={stage.cache_dir}"
-                )
-                result = build_anima_cache(
-                    vae_encode_fn=encode_bundle.vae_encode_fn,
-                    text_encode_fn=encode_bundle.text_encode_fn,
-                    config=stage_cfg,
-                    force=False,
-                    log=self._log,
-                )
-                total_written += result.written
-                total_skipped += result.skipped
-                total_errors += len(result.errors)
-                self._anima_cache_builder_profile.setdefault("staged_cache_trust", []).append(
-                    {
-                        "resolution": int(stage.resolution),
-                        "cache_dir": str(stage.cache_dir),
-                        "written": int(result.written),
-                        "skipped": int(result.skipped),
-                        "manifest_path": str(getattr(result, "manifest_path", "") or ""),
-                        "cache_trust": dict(getattr(result, "cache_trust", {}) or {}),
-                    }
-                )
-                self._log(
-                    f"Anima staged cache stage finished: resolution={stage.resolution}, "
-                    f"written={result.written}, skipped={result.skipped}, errors={len(result.errors)}"
-                )
-            self._log(
-                f"Anima staged cache builder finished: written={total_written}, "
-                f"skipped={total_skipped}, errors={total_errors}"
-            )
-            return
-
-        self._log(f"Anima cache builder: scanning {data_dir}...")
-        result = build_anima_cache(
-            vae_encode_fn=encode_bundle.vae_encode_fn,
-            text_encode_fn=encode_bundle.text_encode_fn,
-            config=cfg,
-            force=False,
-            log=self._log,
-        )
-        self._log(
-            f"Anima cache builder finished: written={result.written}, skipped={result.skipped}, "
-            f"errors={len(result.errors)}"
-        )
-        self._anima_cache_builder_profile = {
-            "written": int(result.written),
-            "skipped": int(result.skipped),
-            "errors": len(result.errors),
-            "manifest_path": str(getattr(result, "manifest_path", "") or ""),
-            "cache_trust": dict(getattr(result, "cache_trust", {}) or {}),
-        }
+    # ------------------------------------------------------------------
+    # R2 cache-build methods moved to trainer_anima_cache_runtime.TrainerAnimaCacheRuntimeMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _apply_runtime_env_hints(self) -> None:
         """Apply generic process env hints before model loading."""
@@ -3334,303 +3178,35 @@ class LulynxTrainer:
                 self._dataset.bucket_manager.base_resolution = new_resolution
         self._log(f"Staged resolution changed from {old_resolution} to {new_resolution}")
 
-    def _create_anima_cached_dataset(self, data_dir: str | Path):
-        from .anima_cached_dataset import AnimaCachedDataset
+    # ------------------------------------------------------------------
+    # R3 cached-dataset methods moved to trainer_anima_cache_runtime.TrainerAnimaCacheRuntimeMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
-        return AnimaCachedDataset(
-            data_dir=data_dir,
-            latent_crop_size=int(getattr(self.config, "anima_cached_latent_crop_size", 0) or 0),
-            text_token_limit=int(getattr(self.config, "anima_cached_text_token_limit", 0) or 0),
-            fixed_text_tokens=int(getattr(self.config, "anima_fixed_text_tokens", 0) or 0),
-            fixed_visual_tokens=int(getattr(self.config, "anima_fixed_visual_tokens", 0) or 0),
-            caption_extension=getattr(self.config, "caption_extension", ".txt"),
-            shuffle_caption=bool(getattr(self.config, "shuffle_caption", False)),
-            shuffle_caption_tags_only=bool(getattr(self.config, "shuffle_caption_tags_only", False)),
-            keep_tokens=int(getattr(self.config, "keep_tokens", 0) or 0),
-            keep_tokens_separator=str(getattr(self.config, "keep_tokens_separator", "") or ""),
-            weighted_captions=bool(getattr(self.config, "weighted_captions", False)),
-            caption_source_mix_enabled=bool(getattr(self.config, "caption_source_mix_enabled", False)),
-            caption_source_nl_ratio=getattr(self.config, "caption_source_nl_ratio", 65.0),
-            caption_source_tag_ratio=getattr(self.config, "caption_source_tag_ratio", 20.0),
-            caption_source_trigger_only_ratio=getattr(self.config, "caption_source_trigger_only_ratio", 10.0),
-            caption_source_empty_ratio=getattr(self.config, "caption_source_empty_ratio", 5.0),
-            caption_source_trigger_tokens=str(getattr(self.config, "caption_source_trigger_tokens", "") or ""),
-            concept_geometry_enabled=bool(getattr(self.config, "concept_geometry_enabled", getattr(self.config, "h_lora_enabled", False))),
-            concept_geometry_path=str(getattr(self.config, "concept_geometry_path", getattr(self.config, "h_lora_geometry_path", "")) or ""),
-            concept_geometry_sampler_mode=str(getattr(self.config, "concept_geometry_sampler_mode", getattr(self.config, "h_lora_sampler_mode", "density_curriculum")) or "density_curriculum"),
-            concept_geometry_loss_weighting=bool(getattr(self.config, "concept_geometry_loss_weighting", getattr(self.config, "h_lora_loss_weighting", False))),
-            concept_geometry_density_power=float(getattr(self.config, "concept_geometry_density_power", getattr(self.config, "h_lora_density_power", 1.0)) or 1.0),
-            concept_geometry_seed=int(getattr(self.config, "seed", 42) or 42),
-            concept_geometry_total_epochs=int(getattr(self.config, "max_train_epochs", 1) or 1),
-            concept_geometry_total_steps=int(getattr(self.config, "max_train_steps", 0) or 0),
-            benchmark_data_wait_stall_ms=float(
-                getattr(self.config, "bubble_controller_benchmark_data_wait_stall_ms", 0.0) or 0.0
-            ),
-        )
-
-    def _create_anima_cached_dataloader(self, dataset, *, batch_size: int, drop_last: bool = False):
-        from .anima_cached_dataset import create_anima_cached_dataloader
-
-        policy = resolve_cached_dataloader_policy(
-            self.config,
-            route="anima",
-            cached=True,
-            cuda_available=str(self.device).startswith("cuda"),
-        )
-        replacement_mode = str(getattr(self.config, "lossless_cache_replacement_mode", "off") or "off").lower()
-        if replacement_mode in {"anima_lynx_manifest_probe", "lynx_manifest_probe"}:
-            from .lossless_anima_lynx_manifest_dataloader import (
-                AnimaLynxManifestDataLoaderConfig,
-                create_anima_lynx_manifest_dataloader,
-                parse_focus_sample_ids,
-            )
-            from .lossless_anima_cache_replacement_dataloader import parse_lossless_cache_codecs
-
-            sidecar_dir = str(getattr(self.config, "lossless_cache_replacement_sidecar_dir", "") or "")
-            manifest_path = str(getattr(self.config, "lossless_cache_replacement_manifest_path", "") or "")
-            self._log(
-                "[lossless-cache] experimental Anima .lynx manifest replacement DataLoader enabled "
-                "(explicit A/B probe only; default path remains raw cached DataLoader)"
-            )
-            return create_anima_lynx_manifest_dataloader(
-                dataset,
-                batch_size=max(int(batch_size or 1), 1),
-                shuffle=True,
-                drop_last=drop_last,
-                config=AnimaLynxManifestDataLoaderConfig(
-                    manifest_path=manifest_path or None,
-                    container_dir=sidecar_dir or None,
-                    shard_size=max(int(getattr(self.config, "lossless_cache_replacement_shard_size", 16) or 16), 1),
-                    codecs=parse_lossless_cache_codecs(
-                        getattr(self.config, "lossless_cache_replacement_codecs", "raw")
-                    ),
-                    min_saving=float(getattr(self.config, "lossless_cache_replacement_min_saving", 0.0) or 0.0),
-                    prepare_manifest=bool(
-                        getattr(self.config, "lossless_cache_replacement_prepare_sidecars", False)
-                    ),
-                    copy_arrays=bool(getattr(self.config, "lossless_cache_replacement_copy_arrays", True)),
-                    verify_crc32=bool(getattr(self.config, "lossless_cache_replacement_strict", True)),
-                    collate_mode=getattr(self.config, "cached_collate_mode", "auto"),
-                    seed=int(getattr(self.config, "seed", 42) or 42),
-                    focus_sample_ids=parse_focus_sample_ids(
-                        getattr(self.config, "lossless_cache_replacement_focus_sample_ids", "")
-                    ),
-                ),
-            )
-        if replacement_mode in {"anima_lxfs_probe", "flat_lxfs_probe", "lxfs_probe"}:
-            from .lossless_anima_cache_replacement_dataloader import (
-                AnimaLosslessReplacementDataLoaderConfig,
-                create_anima_lossless_cache_replacement_dataloader,
-                parse_focus_sample_ids,
-                parse_lossless_cache_codecs,
-            )
-
-            self._log(
-                "[lossless-cache] experimental Anima flat LXFS replacement DataLoader enabled "
-                "(explicit A/B probe only; default path remains raw cached DataLoader)"
-            )
-            return create_anima_lossless_cache_replacement_dataloader(
-                dataset,
-                batch_size=max(int(batch_size or 1), 1),
-                shuffle=True,
-                drop_last=drop_last,
-                config=AnimaLosslessReplacementDataLoaderConfig(
-                    prefetch_depth=max(
-                        int(getattr(self.config, "lossless_cache_replacement_prefetch_depth", 2) or 2),
-                        1,
-                    ),
-                    sidecar_dir=str(getattr(self.config, "lossless_cache_replacement_sidecar_dir", "") or "") or None,
-                    sidecar_format="lxfs",
-                    sidecar_suffix=str(
-                        getattr(self.config, "lossless_cache_replacement_sidecar_suffix", ".lxfs") or ".lxfs"
-                    ),
-                    sidecar_strict=bool(getattr(self.config, "lossless_cache_replacement_strict", False)),
-                    fallback_to_raw=bool(getattr(self.config, "lossless_cache_replacement_fallback_to_raw", True)),
-                    prepare_sidecars=bool(
-                        getattr(self.config, "lossless_cache_replacement_prepare_sidecars", False)
-                    ),
-                    min_saving=float(getattr(self.config, "lossless_cache_replacement_min_saving", 0.0) or 0.0),
-                    codecs=parse_lossless_cache_codecs(
-                        getattr(self.config, "lossless_cache_replacement_codecs", "lz4fast")
-                    ),
-                    collate_mode=getattr(self.config, "cached_collate_mode", "auto"),
-                    seed=int(getattr(self.config, "seed", 42) or 42),
-                    focus_sample_ids=parse_focus_sample_ids(
-                        getattr(self.config, "lossless_cache_replacement_focus_sample_ids", "")
-                    ),
-                ),
-            )
-        return create_anima_cached_dataloader(
-            dataset,
-            batch_size=max(int(batch_size or 1), 1),
-            shuffle=True,
-            num_workers=policy.num_workers,
-            persistent_workers=policy.persistent_workers,
-            pin_memory=policy.pin_memory,
-            prefetch_factor=policy.prefetch_factor,
-            drop_last=drop_last,
-            collate_mode=getattr(self.config, "cached_collate_mode", "auto"),
-        )
-
-    def _select_anima_staged_resolution_stage(self, epoch: int) -> tuple[int, StagedResolutionStage] | tuple[int, None]:
-        stages = self._build_anima_staged_resolution_plan()
-        if not stages:
-            return -1, None
-        selected = 0
-        for index, stage in enumerate(stages):
-            if epoch >= int(stage.start_epoch):
-                selected = index
-        return selected, stages[selected]
-
-    def _maybe_switch_anima_staged_resolution_dataset(
-        self,
-        *,
-        dataloader,
-        epoch: int,
-        drop_last: bool,
-    ):
-        index, stage = self._select_anima_staged_resolution_stage(epoch)
-        if stage is None or index == self._anima_staged_resolution_active_index:
-            return dataloader
-
-        dataset = self._create_anima_cached_dataset(stage.cache_dir)
-        batch_size = int(stage.batch_size or getattr(self.config, "batch_size", 1) or 1)
-        new_dataloader = self._create_anima_cached_dataloader(dataset, batch_size=batch_size, drop_last=drop_last)
-        self._capture_cache_reader_decode_sidecar_profile(
-            new_dataloader,
-            route="anima_cached",
-            source=f"stage_{index}",
-        )
-        self._capture_cache_reader_training_gate_profile(
-            new_dataloader,
-            route="anima_cached",
-            source=f"stage_{index}",
-        )
-
-        if self._ddp_wrapper is not None:
-            try:
-                from .distributed import wrap_dataloader_for_ddp
-
-                new_dataloader = wrap_dataloader_for_ddp(new_dataloader, dataset, shuffle=True, seed=int(getattr(self.config, "seed", 42) or 42))
-                self._ddp_wrapper._dataloader = new_dataloader
-                self._ddp_wrapper._ddp_sampler = getattr(new_dataloader, "sampler", None)
-            except Exception as exc:
-                self._log(f"Anima staged resolution DDP dataloader refresh skipped: {exc}")
-
-        self._dataset = dataset
-        self._anima_staged_resolution_active_index = index
-        self._apply_staged_resolution(stage.resolution)
-        self._log(
-            "Anima staged resolution: "
-            f"epoch={epoch + 1}, resolution={stage.resolution}, "
-            f"batch={batch_size}, samples={len(dataset)}, cache={stage.cache_dir}"
-        )
-        return new_dataloader
-
-    def _parse_saved_artifact(self, path: Path, *, state: bool) -> Optional[tuple[str, int]]:
-        output_name = str(getattr(self.config, "output_name", "") or "")
-        if not output_name:
-            return None
-
-        if state:
-            step_match = re.match(
-                rf"^{re.escape(output_name)}-step(\d+)-state{re.escape(EXT_PT)}$",
-                path.name,
-            )
-            if step_match:
-                return ("step", int(step_match.group(1)))
-
-            epoch_match = re.match(
-                rf"^{re.escape(output_name)}-(\d+)-state{re.escape(EXT_PT)}$",
-                path.name,
-            )
-            if epoch_match:
-                return ("epoch", int(epoch_match.group(1)))
-            return None
-
-        ext = re.escape(self._get_model_save_extension())
-        step_match = re.match(rf"^{re.escape(output_name)}-step(\d+){ext}$", path.name)
-        if step_match:
-            return ("step", int(step_match.group(1)))
-
-        epoch_match = re.match(rf"^{re.escape(output_name)}-(\d+){ext}$", path.name)
-        if epoch_match:
-            return ("epoch", int(epoch_match.group(1)))
-        return None
-
-    def _retention_step_window(self, *, state: bool) -> int:
-        if state:
-            override = max(int(getattr(self.config, "save_last_n_steps_state", 0) or 0), 0)
-            if override > 0:
-                return override
-        return max(int(getattr(self.config, "save_last_n_steps", 0) or 0), 0)
-
-    def _retention_epoch_count(self, *, state: bool) -> int:
-        if state:
-            override = max(int(getattr(self.config, "save_last_n_epochs_state", 0) or 0), 0)
-            if override > 0:
-                return override
-        direct = max(int(getattr(self.config, "save_last_n_epochs", 0) or 0), 0)
-        if direct > 0:
-            return direct
-        return max(int(getattr(self.config, "checkpoint_keep_last", 0) or 0), 0)
-
-    def _retention_fallback_count(self) -> int:
-        return max(int(getattr(self.config, "checkpoint_keep_last", 0) or 0), 0)
-
-    def _prune_saved_artifacts(self, *, state: bool, mode: str, current_value: int) -> None:
-        output_dir = Path(self.config.output_dir)
-        if not output_dir.is_dir():
-            return
-
-        parsed: List[tuple[Path, int]] = []
-        for path in output_dir.iterdir():
-            if not path.is_file():
-                continue
-            artifact = self._parse_saved_artifact(path, state=state)
-            if artifact is None:
-                continue
-            artifact_mode, artifact_value = artifact
-            if artifact_mode == mode:
-                parsed.append((path, artifact_value))
-
-        if not parsed:
-            return
-
-        stale: List[Path] = []
-        if mode == "step":
-            keep_window = self._retention_step_window(state=state)
-            if keep_window > 0:
-                threshold = current_value - keep_window
-                stale = [path for path, value in parsed if value <= threshold]
-            else:
-                keep_last = self._retention_fallback_count()
-                if keep_last > 0 and len(parsed) > keep_last:
-                    parsed.sort(key=lambda item: item[1])
-                    stale = [path for path, _ in parsed[:-keep_last]]
-        else:
-            keep_last = self._retention_epoch_count(state=state)
-            if keep_last > 0 and len(parsed) > keep_last:
-                parsed.sort(key=lambda item: item[1])
-                stale = [path for path, _ in parsed[:-keep_last]]
-
-        for stale_path in stale:
-            try:
-                stale_path.unlink()
-                kind = "state" if state else "checkpoint"
-                self._log(f"Pruned old {kind}: {stale_path.name}")
-            except Exception as e:
-                logger.warning(f"Failed to prune saved artifact {stale_path}: {e}")
+    # ------------------------------------------------------------------
+    # R1 retention methods moved to trainer_artifact_io.TrainerArtifactIoMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _maybe_save_final_training_state(self, epoch: int) -> None:
         if bool(getattr(self.config, "save_state", False)) or bool(getattr(self.config, "save_state_on_train_end", False)):
             self._save_state(epoch, final=True)
 
-    def _sync_turbocore_native_update_state(self, reason: str) -> None:
+    def _sync_turbocore_native_update_state(self, reason: str) -> Dict[str, Any]:
         loop = getattr(self, "training_loop", None)
         sync = getattr(loop, "_sync_turbocore_native_update_training_executor_to_pytorch", None)
         if callable(sync):
-            sync(reason)
+            return dict(sync(reason) or {})
+        return {}
+
+    def _turbocore_native_update_state_sync_failed(self, report: Dict[str, Any]) -> bool:
+        if not isinstance(report, dict) or not report:
+            return False
+        if bool(report.get("synced", True)):
+            return False
+        return bool(report.get("error")) or str(report.get("disable_reason", "") or "") == (
+            "native_update_optimizer_state_sync_error"
+        )
 
     def _close_turbocore_native_update_executor(self) -> None:
         loop = getattr(self, "training_loop", None)
@@ -3859,6 +3435,8 @@ class LulynxTrainer:
         adapter_profile = getattr(self, "_adapter_runtime_profile", None)
         if adapter_profile or self.lora_injector is not None:
             extra["adapter_runtime"] = dict(adapter_profile or self._refresh_adapter_runtime_profile())
+        if getattr(self, "_triton_ops_profile", None):
+            extra["triton_ops_runtime"] = dict(self._triton_ops_profile)
         if getattr(self, "_attention_runtime_profile", None):
             extra["attention_runtime"] = dict(self._attention_runtime_profile)
         try:
@@ -4194,432 +3772,14 @@ class LulynxTrainer:
         except Exception as exc:
             self._log(f"Resume manifest preflight failed: {type(exc).__name__}: {exc}")
 
-    @staticmethod
-    def _hidden_subprocess_kwargs() -> Dict[str, Any]:
-        kwargs: Dict[str, Any] = {}
-        if os.name == "nt":
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            if creationflags:
-                kwargs["creationflags"] = creationflags
-        return kwargs
-
-    def _read_gpu_temperature_c(self) -> Optional[int]:
-        try:
-            result = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=temperature.gpu",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                **self._hidden_subprocess_kwargs(),
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None
-        except Exception as e:
-            logger.debug("GPU temperature query failed: %s", e)
-            return None
-
-        if result.returncode != 0:
-            return None
-
-        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        if not lines:
-            return None
-
-        try:
-            return int(float(lines[0].split(",")[0].strip()))
-        except (TypeError, ValueError, IndexError):
-            return None
-
-    def _sleep_for_cooldown(self, seconds: float) -> None:
-        time.sleep(max(float(seconds), 0.0))
-
-    def _apply_gpu_power_limit_if_requested(self) -> None:
-        if getattr(self, "_gpu_power_limit_attempted", False):
-            return
-
-        self._gpu_power_limit_attempted = True
-        watts = max(int(getattr(self.config, "gpu_power_limit_w", 0) or 0), 0)
-        if watts <= 0:
-            return
-
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "-pl", str(watts)],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                **self._hidden_subprocess_kwargs(),
-            )
-        except FileNotFoundError:
-            self._log("GPU power limit requested but nvidia-smi is not available; skipping.")
-            return
-        except subprocess.TimeoutExpired:
-            self._log(f"GPU power limit request timed out for {watts}W; skipping.")
-            return
-        except Exception as e:
-            self._log(f"GPU power limit request failed: {e}")
-            return
-
-        if result.returncode == 0:
-            self._log(f"GPU power limit applied: {watts}W")
-        else:
-            stderr = (result.stderr or "").strip()
-            if stderr:
-                self._log(f"GPU power limit request failed: {stderr}")
-            else:
-                self._log(f"GPU power limit request failed with exit code {result.returncode}")
-
-    def _maybe_cooldown_after_epoch(self, epoch: int, total_epochs: int) -> None:
-        if self._should_stop or (epoch + 1) >= max(int(total_epochs), 1):
-            return
-
-        every_n = max(int(getattr(self.config, "cooldown_every_n_epochs", 0) or 0), 0)
-        if every_n <= 0 or (epoch + 1) % every_n != 0:
-            return
-
-        cooldown_minutes = max(float(getattr(self.config, "cooldown_minutes", 0) or 0), 0.0)
-        cooldown_seconds = cooldown_minutes * 60.0
-        target_temp = max(int(getattr(self.config, "cooldown_until_temp", 0) or 0), 0)
-        poll_seconds = max(int(getattr(self.config, "cooldown_poll_seconds", 30) or 30), 1)
-
-        if target_temp > 0:
-            self._log(
-                f"Cooldown after epoch {epoch + 1}: waiting for GPU temperature <= {target_temp}C "
-                f"(poll every {poll_seconds}s)"
-            )
-            while not self._should_stop:
-                current_temp = self._read_gpu_temperature_c()
-                if current_temp is None:
-                    if cooldown_seconds > 0:
-                        self._log(
-                            "GPU temperature unavailable; falling back to time-based cooldown "
-                            f"for {int(cooldown_seconds)}s"
-                        )
-                        self._sleep_for_cooldown(cooldown_seconds)
-                    else:
-                        self._log("GPU temperature unavailable; skipping temperature-based cooldown.")
-                    return
-
-                if current_temp <= target_temp:
-                    self._log(f"Cooldown complete: GPU temperature is {current_temp}C")
-                    return
-
-                self._log(
-                    f"GPU temperature {current_temp}C is above target {target_temp}C; "
-                    f"sleeping {poll_seconds}s"
-                )
-                self._sleep_for_cooldown(float(poll_seconds))
-            return
-
-        if cooldown_seconds > 0:
-            self._log(f"Cooldown after epoch {epoch + 1}: sleeping for {int(cooldown_seconds)}s")
-            self._sleep_for_cooldown(cooldown_seconds)
-
-    def _build_semantic_tuner_state_dict(self) -> Dict[str, torch.Tensor]:
-        save_dict: Dict[str, torch.Tensor] = {}
-        ctx = self.te_manager.get_semantic_context() if self.te_manager else None
-
-        if hasattr(self, "sidecar_net"):
-            for name, param in self.sidecar_net.state_dict().items():
-                save_dict[f"sidecar.{name}"] = param
-
-        if ctx and ctx.get("projector"):
-            for name, param in ctx["projector"].state_dict().items():
-                save_dict[f"projector.{name}"] = param
-
-        return save_dict
-
-    def _load_semantic_tuner_state_dict(self, state_dict: Dict[str, torch.Tensor]):
-        if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
-            state_dict = state_dict["state_dict"]
-
-        sidecar_state = {
-            key[len("sidecar."):]: value
-            for key, value in state_dict.items()
-            if key.startswith("sidecar.")
-        }
-        projector_state = {
-            key[len("projector."):]: value
-            for key, value in state_dict.items()
-            if key.startswith("projector.")
-        }
-
-        if sidecar_state and hasattr(self, "sidecar_net"):
-            self.sidecar_net.load_state_dict(sidecar_state, strict=False)
-
-        ctx = self.te_manager.get_semantic_context() if self.te_manager else None
-        projector = ctx.get("projector") if ctx else None
-        if projector_state and projector is not None:
-            projector.load_state_dict(projector_state, strict=False)
-
-    def _get_current_adapter_state_dict(self, use_ema: bool = False) -> Optional[Dict[str, torch.Tensor]]:
-        if getattr(self.config, "semantic_tuner_enabled", False):
-            return self._build_semantic_tuner_state_dict()
-
-        if use_ema and self._ema_tracker:
-            return self._ema_tracker.get_ema_state_dict()
-
-        # Textual Inversion: save the learned concept embedding only
-        if getattr(self, "_ti_trainer", None) is not None:
-            return self._ti_trainer.concept_embedding.state_dict()
-
-        state_dict: Optional[Dict[str, torch.Tensor]] = None
-        if self.lora_injector and hasattr(self.lora_injector, "get_lora_state_dict"):
-            state_dict = self.lora_injector.get_lora_state_dict()
-
-        if self._easy_control is not None:
-            if state_dict is None:
-                state_dict = {}
-            for key, value in self._easy_control.state_dict().items():
-                state_dict[f"easy_control.{key}"] = value
-
-        if self._ip_adapter is not None:
-            if state_dict is None:
-                state_dict = {}
-            for key, value in self._ip_adapter.projector.state_dict().items():
-                state_dict[f"ip_adapter.projector.{key}"] = value
-
-        if bool(getattr(self.config, "reft_enabled", False)) and self.model is not None:
-            from .reft import get_reft_state_dict
-            reft_state = get_reft_state_dict(self.model.unet)
-            if reft_state:
-                if state_dict is None:
-                    state_dict = {}
-                state_dict.update(reft_state)
-
-        if self._repa_projector is not None:
-            if state_dict is None:
-                state_dict = {}
-            for key, value in self._repa_projector.state_dict().items():
-                state_dict[f"repa_projector.{key}"] = value
-
-        # Include prefix/postfix tuning parameters (#113)
-        prefix_length = int(getattr(self.config, "prefix_tuning_length", 0) or 0)
-        postfix_length = int(getattr(self.config, "postfix_tuning_length", 0) or 0)
-        if (prefix_length > 0 or postfix_length > 0) and self.model is not None:
-            from .prefix_tuning import get_prefix_tuning_state_dict
-            sp_state = get_prefix_tuning_state_dict(self.model)
-            if sp_state:
-                if state_dict is None:
-                    state_dict = {}
-                state_dict.update(sp_state)
-
-        return state_dict
-
-    def _prepare_adapter_init_export_for_save(
-        self,
-        state_dict: Dict[str, torch.Tensor],
-        metadata: Optional[Dict[str, str]],
-    ) -> tuple[Dict[str, torch.Tensor], Optional[Dict[str, str]]]:
-        strategy = str(getattr(self.config, "adapter_init_strategy", "default") or "default").strip().lower().replace("-", "_")
-        if strategy not in {"pissa", "olora", "loftq"} or not self.lora_injector:
-            return state_dict, metadata
-
-        export_mode = str(getattr(self.config, "adapter_init_export_mode", "auto") or "auto").strip().lower().replace("-", "_")
-        if export_mode in {"", "none", "off", "native", "training"}:
-            export_mode = "raw"
-        if strategy == "pissa" and export_mode == "auto":
-            export_mode = str(getattr(self.config, "pissa_export_mode", "lora_compatible") or "lora_compatible").strip().lower().replace("-", "_")
-        elif export_mode == "auto":
-            export_mode = "lora_compatible"
-        aliases = {
-            "compatible": "lora_compatible",
-            "standard": "lora_compatible",
-            "standard_lora": "lora_compatible",
-            "lora_compatible_export": "lora_compatible",
-            "fast": "approximate",
-            "quick": "approximate",
-        }
-        export_mode = aliases.get(export_mode.replace(" ", "_"), export_mode)
-        if export_mode not in {"raw", "lora_compatible", "approximate"}:
-            export_mode = "raw"
-        if export_mode == "raw" or not hasattr(self.lora_injector, "export_adapter_init_state_dict"):
-            return state_dict, metadata
-
-        if metadata is None:
-            metadata = {}
-        metadata["ss_adapter_init_strategy"] = strategy
-        metadata["ss_adapter_init_export_mode"] = export_mode
-        state_dict = self.lora_injector.export_adapter_init_state_dict(state_dict, export_mode)
-        if export_mode == "lora_compatible":
-            base_rank = int(getattr(self.config, "network_dim", 0) or 0)
-            base_alpha = float(getattr(self.config, "network_alpha", 0.0) or 0.0)
-            if base_rank > 0:
-                metadata["ss_network_dim"] = str(base_rank * 2)
-            if base_alpha > 0:
-                doubled_alpha = base_alpha * 2
-                metadata["ss_network_alpha"] = str(int(doubled_alpha) if doubled_alpha.is_integer() else doubled_alpha)
-        return state_dict, metadata
-
-    def _prepare_anima_lokr_export_for_save(
-        self,
-        state_dict: Dict[str, torch.Tensor],
-        metadata: Optional[Dict[str, str]],
-    ) -> tuple[Dict[str, torch.Tensor], Optional[Dict[str, str]]]:
-        """Delegate LoKr export shaping to the Warehouse compatibility rules."""
-        model_arch = getattr(getattr(self.config, "model_type", ""), "value", getattr(self.config, "model_type", ""))
-        if str(model_arch).lower() != "anima":
-            return state_dict, metadata
-
-        network_module = getattr(getattr(self.config, "network_module", ""), "value", getattr(self.config, "network_module", ""))
-        lycoris_algo = getattr(getattr(self.config, "lycoris_algo", ""), "value", getattr(self.config, "lycoris_algo", ""))
-        if str(network_module) != "lycoris.locon" or str(lycoris_algo).lower() != "lokr":
-            return state_dict, metadata
-
-        export_mode = str(getattr(self.config, "lokr_export_mode", "native") or "native").strip().lower()
-        state_dict, metadata = export_lokr_state_dict(state_dict, metadata, export_mode=export_mode)
-        if getattr(self, "lora_injector", None) is not None and bool(getattr(self.config, "lokr_train_norm", False) or getattr(self.config, "lycoris_train_norm", False)):
-            state_dict, metadata = export_anima_train_norm_state_dict(
-                state_dict,
-                metadata,
-                injector=self.lora_injector,
-            )
-        return state_dict, metadata
-
-    def _prepare_thin_svd_export_for_save(
-        self,
-        state_dict: Dict[str, torch.Tensor],
-        metadata: Optional[Dict[str, str]],
-    ) -> tuple[Dict[str, torch.Tensor], Optional[Dict[str, str]]]:
-        """Apply Thin-SVD compression to LoRA weights before saving.
-
-        Thin-SVD reduces inference memory/compute by compressing LoRA ranks while
-        preserving the learned delta. This is applied at export time only and does
-        not affect training.
-        """
-        if not getattr(self.config, "thin_svd_export_enabled", False):
-            return state_dict, metadata
-
-        target_rank = int(getattr(self.config, "thin_svd_export_rank", 0))
-        if target_rank <= 0:
-            self._log("thin_svd_export_enabled=True but thin_svd_export_rank <= 0, skipping Thin-SVD export")
-            return state_dict, metadata
-
-        original_rank = int(getattr(self.config, "network_dim", 0))
-        if target_rank >= original_rank:
-            self._log(f"Thin-SVD target rank {target_rank} >= original rank {original_rank}, skipping compression")
-            return state_dict, metadata
-
-        self._log(f"Applying Thin-SVD export compression: {original_rank} -> {target_rank}")
-
-        compressed_state = {}
-        compression_count = 0
-
-        # Group LoRA pairs by base key
-        lora_pairs = {}
-        for key in state_dict.keys():
-            if ".lora_down." in key:
-                base_key = key.replace(".lora_down.", ".")
-                if base_key not in lora_pairs:
-                    lora_pairs[base_key] = {}
-                lora_pairs[base_key]["down"] = key
-            elif ".lora_up." in key:
-                base_key = key.replace(".lora_up.", ".")
-                if base_key not in lora_pairs:
-                    lora_pairs[base_key] = {}
-                lora_pairs[base_key]["up"] = key
-
-        # Process each LoRA pair
-        for base_key, pair in lora_pairs.items():
-            if "down" in pair and "up" in pair:
-                down_key = pair["down"]
-                up_key = pair["up"]
-
-                lora_down = state_dict[down_key]
-                lora_up = state_dict[up_key]
-
-                # Reconstruct full delta: W = B @ A (where B=lora_up, A=lora_down)
-                reconstructed = lora_up @ lora_down
-
-                # SVD decomposition
-                try:
-                    U, S, Vh = torch.linalg.svd(reconstructed, full_matrices=False)
-                except Exception as e:
-                    self._log(f"Thin-SVD failed for {base_key}: {e}, keeping original")
-                    compressed_state[down_key] = lora_down
-                    compressed_state[up_key] = lora_up
-                    continue
-
-                # Truncate to target rank
-                U_thin = U[:, :target_rank]
-                S_thin = S[:target_rank]
-                Vh_thin = Vh[:target_rank, :]
-
-                # Distribute singular values via sqrt (balanced factorization)
-                S_sqrt = torch.diag(S_thin.sqrt())
-                compressed_down = (S_sqrt @ Vh_thin).contiguous()
-                compressed_up = (U_thin @ S_sqrt).contiguous()
-
-                compressed_state[down_key] = compressed_down
-                compressed_state[up_key] = compressed_up
-                compression_count += 1
-
-        # Copy non-LoRA weights
-        for key, value in state_dict.items():
-            if key not in compressed_state:
-                compressed_state[key] = value
-
-        # Update metadata
-        if metadata is None:
-            metadata = {}
-        metadata = metadata.copy()
-        metadata["ss_thin_svd_export"] = "true"
-        metadata["ss_thin_svd_rank"] = str(target_rank)
-        metadata["ss_thin_svd_original_rank"] = str(original_rank)
-        metadata["ss_thin_svd_compressed_layers"] = str(compression_count)
-
-        self._log(f"Thin-SVD compression applied to {compression_count} LoRA layer pairs")
-        return compressed_state, metadata
-
-    def _save_state_dict_to_path(
-        self,
-        state_dict: Dict[str, torch.Tensor],
-        save_path: Path,
-        metadata: Optional[Dict[str, str]] = None,
-    ):
-        mem_efficient = bool(getattr(self.config, "mem_efficient_save", False))
-        payload = {}
-        for key, value in state_dict.items():
-            if isinstance(value, torch.Tensor):
-                t = value.detach()
-                if mem_efficient:
-                    # Move to CPU one at a time to avoid peak VRAM spike
-                    t = t.cpu()
-                payload[key] = t
-            else:
-                payload[key] = value
-
-        if mem_efficient:
-            # Free GPU memory before disk I/O
-            self._maybe_release_tool_cuda_cache("mem_efficient_state_dict_save")
-
-        if save_path.suffix.lower() == EXT_SAFETENSORS:
-            try:
-                from safetensors.torch import save_file
-                save_file(payload, str(save_path), metadata=metadata)
-                return
-            except ImportError:
-                self._log("safetensors not available, falling back to torch.save")
-
-        torch.save({"state_dict": payload, "metadata": metadata or {}}, save_path)
-
-    def _load_state_dict_from_path(self, path: Path) -> Dict[str, torch.Tensor]:
-        if path.suffix.lower() == EXT_SAFETENSORS:
-            from .safetensors_loader import load_safetensors
-
-            disable_mmap = bool(getattr(self.config, "disable_mmap_load_safetensors", False))
-            return load_safetensors(str(path), device="cpu", disable_mmap=disable_mmap)
-
-        loaded = safe_torch_load(str(path), map_location="cpu")
-        if isinstance(loaded, dict) and isinstance(loaded.get("state_dict"), dict):
-            return loaded["state_dict"]
-        if isinstance(loaded, dict):
-            return loaded
-        raise TypeError(f"Unsupported state-dict payload in {path}")
+    # GPU thermal / power-limit / epoch-cooldown helpers live in
+    # TrainerThermalMixin (trainer_thermal.py); they remain bound methods of the
+    # trainer via inheritance with identical behaviour and call sites.
+
+    # ------------------------------------------------------------------
+    # R2 state-dict methods moved to trainer_artifact_io.TrainerArtifactIoMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _initialize_ema_tracker(self):
         self._ema_tracker = None
@@ -5335,12 +4495,21 @@ class LulynxTrainer:
         self._checkpoint_policy_profile = checkpoint_decision.as_dict()
         self.config.gradient_checkpointing = bool(checkpoint_decision.gradient_checkpointing)
         self.config.cpu_offload_checkpointing = bool(checkpoint_decision.cpu_offload_checkpointing)
+        # #147/#166: faithful native forward (3D RoPE) is now compatible with native
+        # block checkpointing (rope_emb threads through _checkpoint_block). Faithful is
+        # the explicit opt-in, so we still force the generic HF gradient/cpu-offload
+        # checkpointing off (inert for the native subset), but we no longer disable the
+        # native block-checkpointing lever — selective policy below applies to it too.
+        anima_faithful_active = bool(getattr(self, "_anima_faithful_active", False))
+        if anima_faithful_active:
+            self.config.gradient_checkpointing = False
+            self.config.cpu_offload_checkpointing = False
         self._log(
             "Checkpoint policy: "
             f"requested={checkpoint_decision.requested_policy}, "
             f"effective={checkpoint_decision.effective_policy}, "
-            f"gradient_checkpointing={'on' if checkpoint_decision.gradient_checkpointing else 'off'}, "
-            f"cpu_offload={'on' if checkpoint_decision.cpu_offload_checkpointing else 'off'}"
+            f"gradient_checkpointing={'on' if self.config.gradient_checkpointing else 'off'}, "
+            f"cpu_offload={'on' if self.config.cpu_offload_checkpointing else 'off'}"
             + (f", fallback={checkpoint_decision.fallback_reason}" if checkpoint_decision.fallback_reason else "")
         )
         for warning in checkpoint_decision.warnings:
@@ -5350,7 +4519,7 @@ class LulynxTrainer:
                 if model_arch == "anima":
                     self.config.anima_block_checkpointing = True
                     self.config.anima_block_checkpointing_mode = "selective"
-                elif model_arch == "newbie":
+                elif model_arch == "newbie" and not anima_faithful_active:
                     self.config.newbie_block_checkpointing = True
                     self.config.newbie_block_checkpointing_mode = "selective"
             except Exception:
@@ -5934,7 +5103,7 @@ class LulynxTrainer:
             norm_info = " +norm" if lycoris_train_norm else ""
             self._log(f"Using LyCORIS ({lycoris_type.value}{norm_info})")
         elif self.config.use_dora:
-            adapter_target_selected, adapter_target_rank_map = self._resolve_adapter_target_policy_selection(model_arch)
+            adapter_target_policy_label, adapter_target_selected, adapter_target_rank_map = self._resolve_fg_lora_rank_plan(model_arch)
             self.lora_injector = LoRAInjector(
                 rank=self.config.network_dim,
                 alpha=self.config.network_alpha,
@@ -5967,7 +5136,7 @@ class LulynxTrainer:
                 flexrank_rank_range_min=int(getattr(self.config, "flexrank_lora_rank_range_min", 1) or 1),
                 activation_recompute=lora_activation_recompute,
                 rs_lora_enabled=bool(getattr(self.config, "rs_lora_enabled", False)),
-                adapter_target_policy=str(getattr(self.config, "adapter_target_policy", "all") or "all"),
+                adapter_target_policy=adapter_target_policy_label,
                 adapter_target_selected=adapter_target_selected,
                 adapter_target_rank_map=adapter_target_rank_map,
             )
@@ -5989,7 +5158,7 @@ class LulynxTrainer:
             # Compute total_steps for T-LoRA schedule
             tlora_total_steps = max(int(getattr(self.config, "max_train_steps", 0) or 0), 1000)
 
-            adapter_target_selected, adapter_target_rank_map = self._resolve_adapter_target_policy_selection(model_arch)
+            adapter_target_policy_label, adapter_target_selected, adapter_target_rank_map = self._resolve_fg_lora_rank_plan(model_arch)
             self.lora_injector = LoRAInjector(
                 rank=self.config.network_dim,
                 alpha=self.config.network_alpha,
@@ -6027,7 +5196,7 @@ class LulynxTrainer:
                 flexrank_rank_range_min=int(getattr(self.config, "flexrank_lora_rank_range_min", 1) or 1),
                 activation_recompute=lora_activation_recompute,
                 rs_lora_enabled=bool(getattr(self.config, "rs_lora_enabled", False)),
-                adapter_target_policy=str(getattr(self.config, "adapter_target_policy", "all") or "all"),
+                adapter_target_policy=adapter_target_policy_label,
                 adapter_target_selected=adapter_target_selected,
                 adapter_target_rank_map=adapter_target_rank_map,
             )
@@ -6070,8 +5239,17 @@ class LulynxTrainer:
 
         # Allow native-family configs to override target modules.
         custom_target_modules = None
+        unet_exclude_substrings = None
         if model_arch == "anima":
             custom_target_modules = self._get_anima_target_modules()
+            # The frozen native llm_adapter (faithful cross-attn context) shares
+            # self_attn/cross_attn.{q,k,v}_proj suffixes with the DiT blocks, so the
+            # injector's substring match leaks LoRA into it even though the target
+            # contract excludes the llm_adapter dotted targets. When the adapter is
+            # not trained, exclude its subtree by name so it gets no dead (zero-grad)
+            # adapters. When training the adapter is requested, leave it injectable.
+            if not self._anima_train_llm_adapter_enabled():
+                unet_exclude_substrings = ["llm_adapter"]
         elif model_arch == "newbie":
             custom_target_modules = self._get_custom_target_modules()
             if custom_target_modules:
@@ -6083,6 +5261,7 @@ class LulynxTrainer:
                     self.model.unet,
                     custom_target_modules or _family.unet_target_modules,
                     prefix="unet",
+                    exclude_name_substrings=unet_exclude_substrings,
                 )
             elif custom_target_modules:
                 # Native-family explicit unet targets opt into the adapter target
@@ -6091,7 +5270,8 @@ class LulynxTrainer:
                 # network_dim); only an active gradient/profiled/cka selection
                 # actually restricts the injected subset and per-type rank.
                 self.lora_injector.inject(
-                    self.model.unet, custom_target_modules, prefix="unet", apply_policy=True
+                    self.model.unet, custom_target_modules, prefix="unet",
+                    apply_policy=True, exclude_name_substrings=unet_exclude_substrings,
                 )
             else:
                 self.lora_injector.inject_unet(self.model.unet)
@@ -6163,11 +5343,25 @@ class LulynxTrainer:
         # into one kernel via the patched-attention _fused_qkv hook. Ineligible
         # layers (DoRA/dropout/Vortex/non-bf16) are skipped and any kernel error
         # self-falls-back to the eager path at call time.
+        self._triton_ops_profile = {
+            "report": "triton_ops_runtime_profile_v0",
+            "enabled": bool(getattr(self.config, "triton_ops_enabled", False)),
+            "requested": bool(getattr(self.config, "triton_ops_enabled", False)),
+            "available": False,
+            "dtype": str(self.dtype).replace("torch.", ""),
+            "patched_lora_layers": 0,
+            "patched_qkv_blocks": 0,
+            "patched_adaln_blocks": 0,
+            "fp32_backward": bool(getattr(self.config, "triton_ops_fp32_backward", False)),
+            "status": "disabled",
+        }
         if getattr(self.config, "triton_ops_enabled", False):
             try:
                 from .triton_ops import triton_inject
                 from .triton_ops.config import can_run_fused_bf16, describe_gpu, detect_gpu
 
+                gpu_info = detect_gpu()
+                self._triton_ops_profile["gpu"] = describe_gpu(gpu_info)
                 if self.dtype == torch.bfloat16 and can_run_fused_bf16():
                     fp32_bwd = getattr(self.config, "triton_ops_fp32_backward", False)
                     unet = getattr(self.model, "unet", None)
@@ -6185,21 +5379,42 @@ class LulynxTrainer:
                     n_adaln = 0
                     if getattr(self.config, "triton_ops_inject_adaln", True):
                         n_adaln = triton_inject.apply_adaln(unet)
+                    self._triton_ops_profile.update(
+                        {
+                            "available": True,
+                            "status": "patched",
+                            "patched_lora_layers": int(n_patched),
+                            "patched_qkv_blocks": int(n_qkv),
+                            "patched_adaln_blocks": int(n_adaln),
+                            "inject_lora": bool(getattr(self.config, "triton_ops_inject_lora", True)),
+                            "inject_qkv": bool(getattr(self.config, "triton_ops_inject_qkv", True)),
+                            "inject_adaln": bool(getattr(self.config, "triton_ops_inject_adaln", True)),
+                        }
+                    )
                     self._log(
                         f"Triton fused LoRA enabled: {n_patched} layers patched, "
                         f"{n_qkv} self-attn q/k/v fused, {n_adaln} adaln blocks fused "
-                        f"[{describe_gpu(detect_gpu())}]"
+                        f"[{describe_gpu(gpu_info)}]"
                     )
-                    if not detect_gpu().is_ada_or_newer:
+                    if not gpu_info.is_ada_or_newer:
                         self._log(
                             "Triton ops tuned for Ada (SM 8.9+); this GPU may see smaller gains."
                         )
                 else:
+                    self._triton_ops_profile.update(
+                        {
+                            "status": "unavailable",
+                            "reason": f"dtype={self.dtype}, bf16_capable={can_run_fused_bf16()}",
+                        }
+                    )
                     self._log(
                         f"Triton ops requested but unavailable "
                         f"(dtype={self.dtype}, bf16_capable={can_run_fused_bf16()}); using eager LoRA."
                     )
             except Exception as e:  # never let acceleration setup break training
+                self._triton_ops_profile.update(
+                    {"status": "init_failed", "reason": f"{type(e).__name__}: {e}"}
+                )
                 self._log(f"Triton ops init failed ({e}); using eager LoRA.")
 
         adapter_profile = self._refresh_adapter_runtime_profile(model_arch)
@@ -6303,6 +5518,45 @@ class LulynxTrainer:
             ).to(device=self.device, dtype=self.dtype)
             trainable_params.extend(self._ip_adapter.get_trainable_params())
             self._log(f"Anima IP-Adapter projector enabled: extra params={sum(p.numel() for p in self._ip_adapter.get_trainable_params()):,}")
+
+        if model_arch == "anima" and bool(getattr(self.config, "easycontrol_v2_enabled", False)):
+            # EasyControl v2 two-stream consumption: install the executable-subset
+            # patch so the target stream attends to the condition stream, add the
+            # adapter to the optimizer, and feed condition per step (handler).
+            # The two-stream patch only supports the *faithful* executable subset
+            # (real q/k/v/output + adaLN + 3D RoPE); on any other unet shape we
+            # log a skip rather than installing on an incompatible module.
+            unet = self.model.unet
+            if not bool(getattr(unet, "is_anima_executable_subset", False)):
+                self._log("EasyControl v2 enabled but unet is not a faithful executable subset; two-stream patch skipped.")
+            else:
+                from .easycontrol_v2_adapter import EasyControlV2Adapter, EasyControlV2AdapterConfig
+                from .easycontrol_v2_anima_patch import install_easycontrol_v2_anima_executable_subset_patch
+                blocks = list(getattr(getattr(unet, "net", None), "blocks", []) or [])
+                hidden = int(blocks[0].self_attn.q_proj.weight.shape[0])
+                num_blocks = len(blocks)
+                self._easycontrol_v2_adapter = EasyControlV2Adapter(
+                    EasyControlV2AdapterConfig(
+                        hidden_size=hidden,
+                        cond_channels=int(getattr(self.config, "easycontrol_v2_cond_channels", 16) or 16),
+                        cond_lora_rank=int(getattr(self.config, "easycontrol_v2_cond_lora_rank", 8) or 8),
+                        num_blocks=num_blocks,
+                        # Gentle-but-active start: exp(-4) condition mass. Disabled-path
+                        # parity is guaranteed by *not installing*; once opted in this is
+                        # a trainable adapter the optimizer opens further.
+                        b_cond_init=-4.0,
+                        init_zero_out=True,
+                    )
+                ).to(device=self.device, dtype=self.dtype)
+                self._easycontrol_v2_patch_handle = install_easycontrol_v2_anima_executable_subset_patch(
+                    unet, self._easycontrol_v2_adapter
+                )
+                trainable_params.extend(self._easycontrol_v2_adapter.get_trainable_params())
+                self._log(
+                    "EasyControl v2 two-stream enabled: "
+                    f"patched blocks={self._easycontrol_v2_patch_handle.block_count}, hidden={hidden}, "
+                    f"extra params={sum(p.numel() for p in self._easycontrol_v2_adapter.get_trainable_params()):,}"
+                )
 
         if bool(getattr(self.config, "reft_enabled", False)):
             raw_targets = str(getattr(self.config, "reft_target_modules", "") or "").strip()
@@ -6724,1775 +5978,11 @@ class LulynxTrainer:
         self._attach_anima_full_finetune_experiments_to_training_loop()
         return profile
 
-    def _parse_custom_args(self, raw: Any) -> Dict[str, Any]:
-        """Parse UI custom arg strings without eval or code execution."""
-        if not raw:
-            return {}
-        if isinstance(raw, dict):
-            return dict(raw)
-        text = str(raw).strip()
-        if not text:
-            return {}
+    # --- Optimizer/scheduler factory ---------------------------------------
+    # _parse_custom_args .. _create_scheduler now live in
+    # trainer_optimizer_factory.py (TrainerOptimizerFactoryMixin); they stay
+    # bound methods of LulynxTrainer via its class bases (MRO).
 
-        if text.startswith("{"):
-            try:
-                import json
-                parsed = json.loads(text)
-                return dict(parsed) if isinstance(parsed, dict) else {}
-            except Exception:
-                pass
-
-        def split_chunks(value: str) -> List[str]:
-            chunks: List[str] = []
-            current: List[str] = []
-            depth = 0
-            quote = ""
-            index = 0
-            while index < len(value):
-                char = value[index]
-                if quote:
-                    current.append(char)
-                    if char == quote:
-                        quote = ""
-                    index += 1
-                    continue
-                if char in "'\"":
-                    quote = char
-                    current.append(char)
-                    index += 1
-                    continue
-                if char in "([{":
-                    depth += 1
-                elif char in ")]}" and depth > 0:
-                    depth -= 1
-                is_space_separator = False
-                if char.isspace() and depth == 0:
-                    rest = value[index + 1 :]
-                    is_space_separator = bool(re.match(r"\s*[A-Za-z_][\w.-]*\s*=", rest))
-                if (char in "\n,;" or is_space_separator) and depth == 0:
-                    chunk = "".join(current).strip()
-                    if chunk:
-                        chunks.append(chunk)
-                    current = []
-                else:
-                    current.append(char)
-                index += 1
-            chunk = "".join(current).strip()
-            if chunk:
-                chunks.append(chunk)
-            return chunks
-
-        result: Dict[str, Any] = {}
-        for chunk in split_chunks(text):
-            if not chunk.strip() or "=" not in chunk:
-                continue
-            key, value = chunk.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            if not key:
-                continue
-            try:
-                result[key] = ast.literal_eval(value)
-            except Exception:
-                lowered = value.lower()
-                if lowered in {"true", "yes", "on"}:
-                    result[key] = True
-                elif lowered in {"false", "no", "off"}:
-                    result[key] = False
-                else:
-                    result[key] = value
-        return result
-
-    def _filtered_custom_args(self, raw: Any, allowed: set[str], label: str) -> Dict[str, Any]:
-        parsed = self._parse_custom_args(raw)
-        filtered: Dict[str, Any] = {}
-        for key, value in parsed.items():
-            if key in allowed:
-                filtered[key] = value
-            else:
-                self._log(f"Ignoring unsupported {label} key: {key}")
-        return filtered
-
-    def _optimizer_allowed_args(self) -> set[str]:
-        opt = self.config.optimizer
-        if opt in {
-            OptimizerType.ADAMW,
-            OptimizerType.ADAMW_8BIT,
-            OptimizerType.PAGED_ADAMW,
-            OptimizerType.PAGED_ADAMW_32BIT,
-            OptimizerType.PAGED_ADAMW_8BIT,
-            OptimizerType.KAHAN_ADAMW_8BIT,
-        }:
-            return {"betas", "eps", "amsgrad", "foreach", "maximize", "capturable", "fused"}
-        if opt == OptimizerType.ANIMA_FACTORED_ADAMW:
-            return {"betas", "eps", "min_dim", "min_numel", "factored_eps"}
-        if opt == OptimizerType.PRODIGY:
-            return {
-                "betas", "beta3", "eps", "decouple", "use_bias_correction",
-                "safeguard_warmup", "growth_rate", "d0", "d_coef",
-            }
-        if opt == OptimizerType.PRODIGY_PLUS_SCHEDULE_FREE:
-            return {
-                "betas", "beta3", "eps", "d0", "d_coef", "weight_decay_by_lr",
-                "d_limiter", "prodigy_steps", "schedulefree_c", "split_groups",
-                "split_groups_mean", "factored", "factored_fp32",
-                "use_bias_correction", "use_stableadamw", "use_schedulefree",
-                "use_speed", "stochastic_rounding", "fused_back_pass",
-                "use_cautious", "use_grams", "use_adopt", "use_orthograd",
-                "use_focus",
-            }
-        if opt == OptimizerType.AUTOMAGIC_PLUS_PLUS:
-            return {
-                "min_lr", "max_lr", "lr_bump", "lr_up", "lr_down", "lr_adapt_mode",
-                "eps", "clip_threshold", "beta2", "beta1", "weight_decay_mode",
-                "max_update_rms_ratio", "sign_eps", "lr_granularity",
-                "agreement_threshold", "do_parameter_swapping",
-                "parameter_swapping_factor", "swap_interval",
-            }
-        if opt == OptimizerType.AUTO_PRODIGY:
-            return {
-                "betas", "beta3", "eps", "d0", "d_coef", "growth_rate",
-                "safeguard_warmup", "max_update_rms_ratio", "damping",
-            }
-        if opt == OptimizerType.ADAFACTOR:
-            return {"eps", "clip_threshold", "decay_rate", "beta1", "weight_decay", "scale_parameter", "relative_step", "warmup_init"}
-        if opt in {OptimizerType.LION, OptimizerType.LION_8BIT, OptimizerType.PAGED_LION_8BIT}:
-            return {"betas", "use_triton", "decoupled_weight_decay"}
-        if opt in {OptimizerType.SGD_NESTEROV, OptimizerType.SGD_NESTEROV_8BIT}:
-            return {"momentum", "dampening", "nesterov", "maximize", "foreach"}
-        if opt in {
-            OptimizerType.DADAPTATION,
-            OptimizerType.DADAPT_ADAM_PREPRINT,
-            OptimizerType.DADAPT_ADAGRAD,
-            OptimizerType.DADAPT_ADAM,
-            OptimizerType.DADAPT_ADAN,
-            OptimizerType.DADAPT_ADAN_IP,
-            OptimizerType.DADAPT_LION,
-            OptimizerType.DADAPT_SGD,
-        }:
-            return {"betas", "eps", "momentum", "growth_rate", "log_every", "decouple", "d0"}
-        if opt in {
-            OptimizerType.ADAMW_SCHEDULE_FREE,
-            OptimizerType.RADAM_SCHEDULE_FREE,
-            OptimizerType.SGD_SCHEDULE_FREE,
-            OptimizerType.PRODIGY_PLUS_SCHEDULE_FREE,
-        }:
-            return {"betas", "eps", "momentum", "warmup_steps", "r", "weight_lr_power", "foreach"}
-        if opt == OptimizerType.PYTORCH_OPTIMIZER:
-            return {
-                "name", "optimizer_name", "optimizer", "betas", "eps", "momentum",
-                "weight_decay", "decouple", "fixed_decay", "rectify", "n_sma_threshold",
-                "degenerated_to_sgd", "amsgrad", "foreach", "maximize", "centralize_gradients",
-                "normalize_gradients", "adam_debias", "stable_weight_decay",
-            }
-        if opt == OptimizerType.GENERIC:
-            return {
-                "name", "betas", "eps", "momentum", "weight_decay",
-                "amsgrad", "foreach", "maximize", "nesterov", "dampening",
-                "growth_rate", "d0", "d_coef", "decouple", "warmup_steps",
-                "r", "weight_lr_power", "capturable", "fused",
-            }
-        return set()
-
-    def _is_schedule_free_optimizer(self) -> bool:
-        return self.config.optimizer in {
-            OptimizerType.ADAMW_SCHEDULE_FREE,
-            OptimizerType.RADAM_SCHEDULE_FREE,
-            OptimizerType.SGD_SCHEDULE_FREE,
-            OptimizerType.PRODIGY_PLUS_SCHEDULE_FREE,
-        }
-
-    @staticmethod
-    def _normalize_optimizer_backend(raw: Any) -> str:
-        value = str(raw or "auto").strip().lower().replace("-", "_")
-        aliases = {
-            "": "auto",
-            "default": "auto",
-            "torch": "torch_adamw",
-            "adamw": "torch_adamw",
-            "foreach": "foreach_adamw",
-            "multi_tensor": "foreach_adamw",
-            "fused": "torch_fused",
-            "torchfused": "torch_fused",
-            "bnb": "bnb_8bit",
-            "bitsandbytes": "bnb_8bit",
-            "bitsandbytes_8bit": "bnb_8bit",
-            "lulynx": "lulynx_fused",
-            "lulynx_fused_adamw": "lulynx_fused",
-        }
-        value = aliases.get(value.replace(" ", ""), value)
-        if value not in {"auto", "torch_adamw", "foreach_adamw", "torch_fused", "bnb_8bit", "apex", "lulynx_fused"}:
-            return "auto"
-        return value
-
-    def _set_optimizer_backend_profile(
-        self,
-        requested: str,
-        resolved: str,
-        *,
-        optimizer_type: str,
-        optimizer_class: str = "",
-        fallback_reason: str = "",
-        notes: Optional[List[str]] = None,
-    ) -> None:
-        self._optimizer_backend_profile = {
-            "requested": requested,
-            "resolved": resolved,
-            "optimizer_type": optimizer_type,
-            "optimizer_class": optimizer_class,
-            "fallback_reason": fallback_reason,
-            "notes": list(notes or []),
-        }
-        self._attach_optimizer_profiles_to_training_loop()
-
-    def _create_torch_adamw_optimizer(
-        self,
-        trainable_params,
-        optimizer_args: Dict[str, Any],
-        *,
-        requested: str,
-        resolved: str = "torch_adamw",
-        fallback_reason: str = "",
-        notes: Optional[List[str]] = None,
-    ):
-        kwargs = dict(optimizer_args)
-        try:
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **kwargs,
-            )
-        except TypeError as exc:
-            if "fused" not in kwargs:
-                raise
-            kwargs.pop("fused", None)
-            fallback_reason = fallback_reason or f"torch AdamW rejected fused=True: {exc}"
-            resolved = "torch_adamw"
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **kwargs,
-            )
-        self._set_optimizer_backend_profile(
-            requested,
-            resolved,
-            optimizer_type=str(getattr(self.config.optimizer, "value", self.config.optimizer)),
-            optimizer_class=type(optimizer).__name__,
-            fallback_reason=fallback_reason,
-            notes=notes,
-        )
-        return optimizer
-
-    def _create_bnb_adamw8bit_optimizer(
-        self,
-        trainable_params,
-        optimizer_args: Dict[str, Any],
-        *,
-        requested: str,
-    ):
-        try:
-            import bitsandbytes as bnb
-            optimizer = bnb.optim.AdamW8bit(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **optimizer_args,
-            )
-            self._set_optimizer_backend_profile(
-                requested,
-                "bnb_8bit",
-                optimizer_type=str(getattr(self.config.optimizer, "value", self.config.optimizer)),
-                optimizer_class=type(optimizer).__name__,
-            )
-            return optimizer
-        except ImportError:
-            self._log("bitsandbytes not available, falling back to AdamW")
-            return self._create_torch_adamw_optimizer(
-                trainable_params,
-                optimizer_args,
-                requested=requested,
-                resolved="torch_adamw",
-                fallback_reason="bitsandbytes is not available",
-            )
-
-    def _create_apex_adamw_optimizer(
-        self,
-        trainable_params,
-        optimizer_args: Dict[str, Any],
-        *,
-        requested: str,
-    ):
-        try:
-            from apex.optimizers import FusedAdam
-        except Exception as exc:
-            return self._create_torch_adamw_optimizer(
-                trainable_params,
-                optimizer_args,
-                requested=requested,
-                resolved="torch_adamw",
-                fallback_reason=f"apex FusedAdam unavailable: {type(exc).__name__}: {exc}",
-            )
-        kwargs = dict(optimizer_args)
-        for unsupported in ("amsgrad", "foreach", "fused"):
-            kwargs.pop(unsupported, None)
-        optimizer = FusedAdam(
-            trainable_params,
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            adam_w_mode=True,
-            **kwargs,
-        )
-        self._set_optimizer_backend_profile(
-            requested,
-            "apex",
-            optimizer_type=str(getattr(self.config.optimizer, "value", self.config.optimizer)),
-            optimizer_class=type(optimizer).__name__,
-            notes=["Unsupported AdamW-only args are dropped for apex FusedAdam."],
-        )
-        return optimizer
-
-    def _create_adamw_backend_optimizer(self, trainable_params, optimizer_args: Dict[str, Any]):
-        requested = self._normalize_optimizer_backend(getattr(self.config, "optimizer_backend", "auto"))
-        opt = self.config.optimizer
-        notes: List[str] = []
-
-        if requested == "auto":
-            if opt == OptimizerType.ADAMW_8BIT:
-                return self._create_bnb_adamw8bit_optimizer(trainable_params, optimizer_args, requested=requested)
-            return self._create_torch_adamw_optimizer(
-                trainable_params,
-                optimizer_args,
-                requested=requested,
-                resolved="torch_adamw",
-            )
-
-        if requested == "bnb_8bit":
-            return self._create_bnb_adamw8bit_optimizer(trainable_params, optimizer_args, requested=requested)
-
-        if requested == "foreach_adamw":
-            kwargs = dict(optimizer_args)
-            if "foreach" in kwargs and kwargs["foreach"] is not True:
-                notes.append("optimizer_args.foreach overrides optimizer_backend=foreach_adamw.")
-                return self._create_torch_adamw_optimizer(
-                    trainable_params,
-                    kwargs,
-                    requested=requested,
-                    resolved="torch_adamw",
-                    fallback_reason="foreach was explicitly disabled in optimizer_args",
-                    notes=notes,
-                )
-            kwargs.setdefault("foreach", True)
-            return self._create_torch_adamw_optimizer(
-                trainable_params,
-                kwargs,
-                requested=requested,
-                resolved="foreach_adamw",
-                notes=notes,
-            )
-
-        if requested == "torch_fused":
-            kwargs = dict(optimizer_args)
-            if "fused" in kwargs and kwargs["fused"] is not True:
-                notes.append("optimizer_args.fused overrides optimizer_backend=torch_fused.")
-                return self._create_torch_adamw_optimizer(
-                    trainable_params,
-                    kwargs,
-                    requested=requested,
-                    resolved="torch_adamw",
-                    fallback_reason="fused was explicitly disabled in optimizer_args",
-                    notes=notes,
-                )
-            if not torch.cuda.is_available():
-                return self._create_torch_adamw_optimizer(
-                    trainable_params,
-                    kwargs,
-                    requested=requested,
-                    resolved="torch_adamw",
-                    fallback_reason="torch fused AdamW requires CUDA",
-                )
-            kwargs.setdefault("fused", True)
-            return self._create_torch_adamw_optimizer(
-                trainable_params,
-                kwargs,
-                requested=requested,
-                resolved="torch_fused",
-                notes=notes,
-            )
-
-        if requested == "apex":
-            return self._create_apex_adamw_optimizer(trainable_params, optimizer_args, requested=requested)
-
-        if requested == "lulynx_fused":
-            from .fused_adamw import FusedAdamW
-            kwargs = dict(optimizer_args)
-            dropped = []
-            for unsupported in ("foreach", "fused"):
-                if unsupported in kwargs:
-                    kwargs.pop(unsupported, None)
-                    dropped.append(unsupported)
-            optimizer = FusedAdamW(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **kwargs,
-            )
-            notes = ["Lulynx fused AdamW is a pure PyTorch compatibility backend, not a custom CUDA fused kernel."]
-            if dropped:
-                notes.append(f"Ignored PyTorch AdamW-only args for lulynx_fused: {', '.join(dropped)}.")
-            self._set_optimizer_backend_profile(
-                requested,
-                "lulynx_fused",
-                optimizer_type=str(getattr(self.config.optimizer, "value", self.config.optimizer)),
-                optimizer_class=type(optimizer).__name__,
-                notes=notes,
-            )
-            return optimizer
-
-        return self._create_torch_adamw_optimizer(
-            trainable_params,
-            optimizer_args,
-            requested=requested,
-            resolved="torch_adamw",
-        )
-
-    def _resolve_prodigy_d_args(self, optimizer_args: Dict[str, Any]) -> tuple[Dict[str, Any], float, float]:
-        resolved_args = dict(optimizer_args)
-        raw_d0 = resolved_args.pop("d0", getattr(self.config, "opt_prodigy_d0", 1e-6))
-        raw_d_coef = resolved_args.pop("d_coef", getattr(self.config, "opt_prodigy_d_coef", 1.0))
-        try:
-            d0 = float(1e-6 if raw_d0 in {None, ""} else raw_d0)
-        except (TypeError, ValueError):
-            d0 = 1e-6
-        try:
-            d_coef = float(1.0 if raw_d_coef in {None, ""} else raw_d_coef)
-        except (TypeError, ValueError):
-            d_coef = 1.0
-        return resolved_args, d0, d_coef
-
-    def _create_bitsandbytes_optimizer(self, trainable_params, optimizer_args: Dict[str, Any]):
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            self._log("bitsandbytes not available, falling back to AdamW")
-            return torch.optim.AdamW(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-            )
-
-        opt = self.config.optimizer
-        class_name_by_type = {
-            OptimizerType.PAGED_ADAMW: "PagedAdamW",
-            OptimizerType.PAGED_ADAMW_32BIT: "PagedAdamW32bit",
-            OptimizerType.PAGED_ADAMW_8BIT: "PagedAdamW8bit",
-            OptimizerType.PAGED_LION_8BIT: "PagedLion8bit",
-            OptimizerType.SGD_NESTEROV_8BIT: "SGD8bit",
-        }
-        class_name = class_name_by_type[opt]
-        optimizer_class = getattr(bnb.optim, class_name, None)
-        if optimizer_class is None:
-            self._log(f"bitsandbytes optimizer {class_name} is unavailable, falling back to AdamW")
-            return torch.optim.AdamW(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-            )
-        kwargs = dict(optimizer_args)
-        if opt == OptimizerType.SGD_NESTEROV_8BIT:
-            kwargs.setdefault("momentum", 0.9)
-            kwargs["nesterov"] = True
-        return optimizer_class(
-            trainable_params,
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            **kwargs,
-        )
-
-    def _create_dadapt_optimizer(self, trainable_params, optimizer_args: Dict[str, Any]):
-        opt = self.config.optimizer
-        try:
-            import dadaptation
-            import dadaptation.experimental as dadapt_experimental
-        except ImportError:
-            plugin_name_by_type = {
-                OptimizerType.DADAPTATION: "DAdaptAdam",
-                OptimizerType.DADAPT_ADAM_PREPRINT: "DAdaptAdam",
-                OptimizerType.DADAPT_ADAGRAD: "DAdaptAdaGrad",
-                OptimizerType.DADAPT_ADAM: "DAdaptAdam",
-                OptimizerType.DADAPT_ADAN: "DAdaptAdan",
-                OptimizerType.DADAPT_ADAN_IP: "DAdaptAdan",
-                OptimizerType.DADAPT_LION: "DAdaptLion",
-                OptimizerType.DADAPT_SGD: "DAdaptSGD",
-            }
-            plugin_name = plugin_name_by_type.get(opt, "DAdaptAdam")
-            plugin_args = dict(optimizer_args)
-            if opt == OptimizerType.DADAPT_ADAGRAD:
-                plugin_args.setdefault("eps", 1e-6)
-            plugin_args.setdefault("name", plugin_name)
-            try:
-                from .optimizer_plugin_bridge import create_pytorch_optimizer
-
-                self._log(f"dadaptation not available, using pytorch_optimizer {plugin_name} route")
-                return create_pytorch_optimizer(
-                    trainable_params,
-                    optimizer_name=plugin_name,
-                    lr=1.0,
-                    weight_decay=self.config.weight_decay,
-                    optimizer_args=plugin_args,
-                )
-            except Exception as exc:
-                self._log(f"pytorch_optimizer {plugin_name} route unavailable, falling back to AdamW: {exc}")
-                return torch.optim.AdamW(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-
-        if opt in {OptimizerType.DADAPTATION, OptimizerType.DADAPT_ADAM_PREPRINT}:
-            optimizer_class = dadapt_experimental.DAdaptAdamPreprint
-        elif opt == OptimizerType.DADAPT_ADAGRAD:
-            optimizer_args = dict(optimizer_args)
-            optimizer_args.setdefault("eps", 1e-6)
-            optimizer_class = dadaptation.DAdaptAdaGrad
-        elif opt == OptimizerType.DADAPT_ADAM:
-            optimizer_class = dadaptation.DAdaptAdam
-        elif opt == OptimizerType.DADAPT_ADAN:
-            optimizer_class = dadaptation.DAdaptAdan
-        elif opt == OptimizerType.DADAPT_ADAN_IP:
-            optimizer_class = dadapt_experimental.DAdaptAdanIP
-        elif opt == OptimizerType.DADAPT_LION:
-            optimizer_class = dadaptation.DAdaptLion
-        else:
-            optimizer_class = dadaptation.DAdaptSGD
-        return optimizer_class(
-            trainable_params,
-            lr=1.0,
-            weight_decay=self.config.weight_decay,
-            **optimizer_args,
-        )
-
-    def _create_schedulefree_optimizer(self, trainable_params, optimizer_args: Dict[str, Any]):
-        try:
-            import schedulefree
-        except ImportError:
-            self._log("schedulefree not available, falling back to AdamW")
-            return torch.optim.AdamW(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-            )
-
-        if self.config.optimizer == OptimizerType.RADAM_SCHEDULE_FREE:
-            optimizer_class = schedulefree.RAdamScheduleFree
-        elif self.config.optimizer == OptimizerType.SGD_SCHEDULE_FREE:
-            optimizer_class = schedulefree.SGDScheduleFree
-            optimizer_args = dict(optimizer_args)
-            optimizer_args.setdefault("momentum", 0.9)
-        else:
-            optimizer_class = schedulefree.AdamWScheduleFree
-        optimizer = optimizer_class(
-            trainable_params,
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            **optimizer_args,
-        )
-        if hasattr(optimizer, "train"):
-            optimizer.train()
-        return optimizer
-
-    def _create_prodigy_plus_schedule_free_optimizer(self, trainable_params, optimizer_args: Dict[str, Any]):
-        try:
-            from prodigyplus import ProdigyPlusScheduleFree
-        except ImportError:
-            self._log("prodigyplus not available, falling back to AdamW")
-            return torch.optim.AdamW(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-            )
-
-        resolved_args, d0, d_coef = self._resolve_prodigy_d_args(optimizer_args)
-        optimizer = ProdigyPlusScheduleFree(
-            trainable_params,
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            d0=d0,
-            d_coef=d_coef,
-            **resolved_args,
-        )
-        if hasattr(optimizer, "train"):
-            optimizer.train()
-        return optimizer
-
-    def _dora_param_groups(self, trainable_params) -> list:
-        """Separate DoRA magnitude parameters into their own param group with weight_decay=0.
-
-        DoRA's magnitude vector (``m``) should not be decayed — it represents a
-        norm that should be free to grow/shrink without L2 penalty pushing it
-        toward zero.  When DoRA is active, we split the parameter list into two
-        groups: magnitude params with weight_decay=0 and everything else with
-        the configured weight_decay.
-        """
-        if not bool(getattr(self.config, "use_dora", False)) and not any(
-            getattr(self.config, k, False) for k in ("dora", "enable_dora")
-        ):
-            return trainable_params
-
-        # If trainable_params is already a list of dicts (param groups),
-        # iterate through and add magnitude-specific groups.
-        if isinstance(trainable_params, list) and trainable_params and isinstance(trainable_params[0], dict):
-            magnitude_params = []
-            other_params = []
-            for group in trainable_params:
-                params = group.get("params", [])
-                lr = group.get("lr", self.config.learning_rate)
-                wd = group.get("weight_decay", self.config.weight_decay)
-                for p in params:
-                    if getattr(p, "_dora_magnitude", False):
-                        magnitude_params.append(p)
-                    else:
-                        other_params.append(p)
-            if not magnitude_params:
-                return trainable_params
-            return [
-                {"params": other_params, "lr": lr, "weight_decay": wd},
-                {"params": magnitude_params, "lr": lr, "weight_decay": float(getattr(self.config, "dora_magnitude_weight_decay", 0.0))},
-            ]
-
-        # If trainable_params is a flat list of parameters
-        if isinstance(trainable_params, (list, tuple)):
-            magnitude_params = []
-            other_params = []
-            for p in trainable_params:
-                if getattr(p, "_dora_magnitude", False):
-                    magnitude_params.append(p)
-                else:
-                    other_params.append(p)
-            if not magnitude_params:
-                return trainable_params
-            dora_mag_wd = float(getattr(self.config, "dora_magnitude_weight_decay", 0.0))
-            return [
-                {"params": other_params, "weight_decay": self.config.weight_decay},
-                {"params": magnitude_params, "weight_decay": dora_mag_wd},
-            ]
-
-        return trainable_params
-
-    def _lora_plus_param_groups(self, trainable_params) -> list:
-        if not bool(getattr(self.config, "lora_plus_enabled", False)):
-            return trainable_params
-        if isinstance(trainable_params, list) and trainable_params and isinstance(trainable_params[0], dict):
-            self._mark_lora_plus_runtime_outcome(
-                applied=False,
-                fallback_reason="LoRA+ param-group split conflicts with pre-grouped optimizer params; keeping existing groups.",
-                note="LoRA+ stayed profile-only because grouped optimizer params were already active.",
-            )
-            self._log("LoRA+ requested, but existing grouped LR/Block Weight param groups are active; keeping existing groups.")
-            return trainable_params
-
-        injected = getattr(self.lora_injector, "injected_layers", {}) if self.lora_injector is not None else {}
-        from .lora_plus_param_groups import build_lora_plus_param_groups
-
-        plan = build_lora_plus_param_groups(
-            injected_layers=injected,
-            trainable_params=trainable_params,
-            base_lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            b_lr_ratio=float(getattr(self.config, "lora_plus_lr_ratio", 16.0) or 16.0),
-        )
-        self._lora_plus_runtime_details = {
-            **plan.as_dict(),
-            "b_lr_ratio": float(getattr(self.config, "lora_plus_lr_ratio", 16.0) or 16.0),
-            "param_group_count": len(plan.param_groups),
-        }
-        if plan.applied:
-            self._mark_lora_plus_runtime_outcome(applied=True, note=plan.note)
-            self._log(
-                "LoRA+ param groups enabled: "
-                f"A={plan.lora_a_count}, B={plan.lora_b_count}, other={plan.other_count}, "
-                f"B_lr_ratio={float(getattr(self.config, 'lora_plus_lr_ratio', 16.0) or 16.0)}"
-            )
-            return plan.param_groups
-        self._mark_lora_plus_runtime_outcome(
-            applied=False,
-            fallback_reason=plan.fallback_reason,
-            note=plan.note,
-        )
-        return trainable_params
-
-    def _muon_param_groups(self, trainable_params) -> list:
-        """Regroup params for the Muon optimizer: 2D matrices use Muon, the
-        rest (bias/norm/magnitude/scalars) fall back to AdamW with no decay.
-
-        No-op unless ``OptimizerType.MUON`` is selected.  Re-flattens whatever
-        grouping arrived (DoRA / LoRA+ / prefix) and re-splits purely by rank,
-        because Muon's A/B handling is the orthogonalization itself, not an
-        lr-ratio split.
-        """
-        if self.config.optimizer != OptimizerType.MUON:
-            return trainable_params
-
-        seen: set[int] = set()
-        flat: list = []
-
-        def _collect(obj) -> None:
-            if isinstance(obj, dict):
-                for p in obj.get("params", []):
-                    if isinstance(p, torch.nn.Parameter) and p.requires_grad and id(p) not in seen:
-                        seen.add(id(p))
-                        flat.append(p)
-            elif isinstance(obj, torch.nn.Parameter):
-                if obj.requires_grad and id(obj) not in seen:
-                    seen.add(id(obj))
-                    flat.append(obj)
-
-        for item in list(trainable_params or []):
-            _collect(item)
-
-        muon_params = [p for p in flat if p.dim() == 2]
-        other_params = [p for p in flat if p.dim() != 2]
-        if not muon_params and not other_params:
-            return trainable_params
-
-        base_lr = float(self.config.learning_rate)
-        wd = float(self.config.weight_decay)
-        ratio = float(getattr(self.config, "muon_lr_ratio", 1.0) or 1.0)
-        groups: list[dict[str, Any]] = []
-        if muon_params:
-            groups.append({"params": muon_params, "use_muon": True, "lr": base_lr, "weight_decay": wd})
-        if other_params:
-            groups.append({"params": other_params, "use_muon": False, "lr": base_lr * ratio, "weight_decay": 0.0})
-        self._log(
-            f"Muon param groups: {len(muon_params)} 2D matrices (Muon), "
-            f"{len(other_params)} non-2D params (AdamW fallback, no decay)"
-        )
-        return groups
-
-    def _mark_lora_plus_runtime_outcome(
-        self,
-        *,
-        applied: bool,
-        fallback_reason: str = "",
-        note: str = "",
-    ) -> None:
-        profile = getattr(self, "_advanced_optimizer_strategy_profile", None)
-        if not profile:
-            return
-        if str(profile.get("resolved") or "") != "lora_plus":
-            return
-
-        from .advanced_optimizer_strategy import apply_lora_plus_runtime_outcome
-
-        self._advanced_optimizer_strategy_profile = apply_lora_plus_runtime_outcome(
-            profile,
-            applied=applied,
-            fallback_reason=fallback_reason,
-            note=note,
-            runtime_details=getattr(self, "_lora_plus_runtime_details", None),
-        )
-        self._attach_optimizer_profiles_to_training_loop()
-    def _mark_galore_runtime_outcome(
-        self,
-        *,
-        applied: bool,
-        fallback_reason: str = "",
-        note: str = "",
-    ) -> None:
-        profile = getattr(self, "_advanced_optimizer_strategy_profile", None)
-        if not profile:
-            return
-        if str(profile.get("resolved") or "") != "galore":
-            return
-
-        from .advanced_optimizer_strategy import apply_galore_runtime_outcome
-
-        self._advanced_optimizer_strategy_profile = apply_galore_runtime_outcome(
-            profile,
-            applied=applied,
-            fallback_reason=fallback_reason,
-            note=note,
-        )
-        self._attach_optimizer_profiles_to_training_loop()
-
-    @staticmethod
-    def _scheduler_allowed_args() -> set[str]:
-        return {
-            "eta_min", "t_0", "t_mult", "start_factor", "end_factor",
-            "total_iters", "power", "max_lr", "pct_start", "anneal_strategy",
-            "div_factor", "final_div_factor", "three_phase",
-            "min_lr_ratio", "min_lr_rate", "num_cycles", "rules", "schedule",
-            "ema_alpha", "min_delta", "relative_delta", "patience", "cooldown",
-            "max_hold_steps", "late_loss_gamma", "lock_weight_threshold",
-            "min_advance_ratio", "hold_on_improvement",
-        }
-
-    def _filter_optimizer_trainable_params(self, params: Any) -> Any:
-        """Drop frozen/duplicate parameters before constructing the optimizer."""
-        seen: set[int] = set()
-
-        def keep_param(param: Any) -> bool:
-            if not isinstance(param, torch.nn.Parameter):
-                return False
-            if not bool(getattr(param, "requires_grad", False)):
-                return False
-            ident = id(param)
-            if ident in seen:
-                return False
-            seen.add(ident)
-            return True
-
-        if isinstance(params, list) and params and isinstance(params[0], dict):
-            filtered_groups = []
-            dropped = 0
-            for group in params:
-                original_params = list(group.get("params", []))
-                group_params = [p for p in original_params if keep_param(p)]
-                dropped += len(original_params) - len(group_params)
-                if not group_params:
-                    continue
-                next_group = dict(group)
-                next_group["params"] = group_params
-                filtered_groups.append(next_group)
-            if dropped:
-                self._log(f"[runtime-opt] optimizer filtered {dropped} frozen/duplicate params from param groups")
-            return filtered_groups
-
-        flat_params = list(params or [])
-        filtered = [p for p in flat_params if keep_param(p)]
-        dropped = len(flat_params) - len(filtered)
-        if dropped:
-            self._log(f"[runtime-opt] optimizer filtered {dropped} frozen/duplicate params")
-        return filtered
-
-    def _optimizer_param_names(self) -> Dict[int, str]:
-        names: Dict[int, str] = {}
-
-        def add_named_parameters(prefix: str, module: Any) -> None:
-            if module is None or not hasattr(module, "named_parameters"):
-                return
-            try:
-                named_parameters = module.named_parameters()
-            except Exception:
-                return
-            for name, param in named_parameters:
-                full_name = f"{prefix}.{name}" if prefix else name
-                names.setdefault(id(param), full_name)
-
-        if self.model is not None:
-            add_named_parameters("", self.model)
-            seen_components: set[int] = set()
-            component_names = (
-                "unet",
-                "dit",
-                "transformer",
-                "denoiser",
-                "text_encoder",
-                "text_encoder_1",
-                "text_encoder_2",
-                "text_encoder_3",
-                "vae",
-            )
-            for component_name in component_names:
-                component = getattr(self.model, component_name, None)
-                if component is None:
-                    continue
-                component_id = id(component)
-                if component_id in seen_components:
-                    continue
-                seen_components.add(component_id)
-                add_named_parameters(component_name, component)
-            try:
-                model_components = vars(self.model)
-            except TypeError:
-                model_components = {}
-            for component_name, component in model_components.items():
-                if component_name in component_names:
-                    continue
-                component_id = id(component)
-                if component_id in seen_components:
-                    continue
-                seen_components.add(component_id)
-                add_named_parameters(component_name, component)
-        injected = getattr(self.lora_injector, "injected_layers", {}) if self.lora_injector is not None else {}
-        if isinstance(injected, dict):
-            for prefix, layer in injected.items():
-                if not hasattr(layer, "named_parameters"):
-                    continue
-                for name, param in layer.named_parameters():
-                    names.setdefault(id(param), f"{prefix}.{name}")
-        return names
-
-    def _mn_lora_plus_plus_config(self) -> Dict[str, Any]:
-        profile = str(getattr(self.config, "mn_lora_plus_plus_profile", "balanced") or "balanced").strip().lower()
-        profiles: Dict[str, Dict[str, float]] = {
-            "safe": {
-                "lr_up": 1.01,
-                "lr_down": 0.95,
-                "min_mult": 0.25,
-                "max_mult": 2.0,
-                "lora_up_max_mult": 1.25,
-                "protected_max_mult": 1.0,
-                "update_rms_cap": 0.01,
-            },
-            "balanced": {
-                "lr_up": 1.03,
-                "lr_down": 0.90,
-                "min_mult": 0.25,
-                "max_mult": 2.5,
-                "lora_up_max_mult": 1.5,
-                "protected_max_mult": 1.0,
-                "update_rms_cap": 0.02,
-            },
-            "aggressive": {
-                "lr_up": 1.05,
-                "lr_down": 0.85,
-                "min_mult": 0.20,
-                "max_mult": 3.0,
-                "lora_up_max_mult": 2.0,
-                "protected_max_mult": 1.0,
-                "update_rms_cap": 0.03,
-            },
-        }
-        if profile not in {*profiles, "custom"}:
-            self._log(f"Unknown MN-LoRA++ profile {profile!r}, using balanced.")
-            profile = "balanced"
-        values = dict(profiles.get(profile, {}))
-        if profile == "custom":
-            values = {
-                "lr_up": float(getattr(self.config, "mn_lora_plus_plus_lr_up", 1.01)),
-                "lr_down": float(getattr(self.config, "mn_lora_plus_plus_lr_down", 0.95)),
-                "min_mult": float(getattr(self.config, "mn_lora_plus_plus_min_mult", 0.25)),
-                "max_mult": float(getattr(self.config, "mn_lora_plus_plus_max_mult", 2.0)),
-                "lora_up_max_mult": float(getattr(self.config, "mn_lora_plus_plus_lora_up_max_mult", 1.25)),
-                "protected_max_mult": float(getattr(self.config, "mn_lora_plus_plus_protected_max_mult", 1.0)),
-                "update_rms_cap": float(getattr(self.config, "mn_lora_plus_plus_update_rms_cap", 0.01)),
-            }
-        values.update({
-            "enabled": bool(getattr(self.config, "mn_lora_plus_plus_enabled", False)),
-            "rank_adapt": bool(getattr(self.config, "mn_lora_plus_plus_rank_adapt", True)),
-            "module_adapt": bool(getattr(self.config, "mn_lora_plus_plus_module_adapt", True)),
-        })
-        return values
-
-    def _mn_lora_trust_region_config(self) -> Dict[str, Any]:
-        return {
-            "enabled": bool(getattr(self.config, "mn_lora_trust_region_enabled", True)),
-            "max_update_rms_ratio": float(getattr(self.config, "mn_lora_trust_region_max_update_rms_ratio", 0.01)),
-            "max_update_norm_ratio": float(getattr(self.config, "mn_lora_trust_region_max_update_norm_ratio", 0.10)),
-            "hotspot_only": bool(getattr(self.config, "mn_lora_trust_region_hotspot_only", False)),
-        }
-
-    def _mn_lora_kfac_lite_config(self) -> Dict[str, Any]:
-        return {
-            "enabled": bool(getattr(self.config, "mn_lora_kfac_lite_enabled", False)),
-            "ema_decay": float(getattr(self.config, "mn_lora_kfac_lite_ema_decay", 0.95)),
-            "damping": float(getattr(self.config, "mn_lora_kfac_lite_damping", 1e-3)),
-            "update_interval": int(getattr(self.config, "mn_lora_kfac_lite_update_interval", 1)),
-            "precondition_interval": int(getattr(self.config, "mn_lora_kfac_lite_precondition_interval", 1)),
-            "max_samples": int(getattr(self.config, "mn_lora_kfac_lite_max_samples", 2048)),
-            "grad_clip": float(getattr(self.config, "mn_lora_kfac_lite_grad_clip", 3.0)),
-            "stacked_grad_clip": float(getattr(self.config, "mn_lora_kfac_lite_stacked_grad_clip", 2.0)),
-            "active_ratio": float(getattr(self.config, "mn_lora_kfac_lite_active_ratio", 0.40)),
-            "warmup_steps": int(getattr(self.config, "mn_lora_kfac_lite_warmup_steps", 10)),
-            "refresh_interval": int(getattr(self.config, "mn_lora_kfac_lite_refresh_interval", 10)),
-            "min_active_modules": int(getattr(self.config, "mn_lora_kfac_lite_min_active_modules", 16)),
-        }
-
-    def _mn_lora_effective_delta_config(self) -> Dict[str, Any]:
-        return {
-            "enabled": bool(getattr(self.config, "mn_lora_effective_delta_enabled", True)),
-            "clip_enabled": bool(getattr(self.config, "mn_lora_effective_delta_clip_enabled", True)),
-            "max_norm_ratio": float(getattr(self.config, "mn_lora_effective_delta_max_norm_ratio", 0.25)),
-            "max_rms_ratio": float(getattr(self.config, "mn_lora_effective_delta_max_rms_ratio", 0.05)),
-            "fisher_weighted": bool(getattr(self.config, "mn_lora_effective_delta_fisher_weighted", True)),
-            "fisher_beta": float(getattr(self.config, "mn_lora_effective_delta_fisher_beta", 0.95)),
-            "fisher_strength": float(getattr(self.config, "mn_lora_effective_delta_fisher_strength", 1.0)),
-            "fisher_max_weight": float(getattr(self.config, "mn_lora_effective_delta_fisher_max_weight", 4.0)),
-        }
-
-    def _mn_lora_fisher_ewc_config(self) -> Dict[str, Any]:
-        return {
-            "enabled": bool(getattr(self.config, "mn_lora_fisher_ewc_enabled", True)),
-            "lambda_ewc": float(getattr(self.config, "mn_lora_fisher_ewc_lambda", 1e-4)),
-            "fisher_beta": float(getattr(self.config, "mn_lora_fisher_ewc_beta", 0.95)),
-            "start_step": int(getattr(self.config, "mn_lora_fisher_ewc_start_step", 1)),
-            "update_interval": int(getattr(self.config, "mn_lora_fisher_ewc_update_interval", 5)),
-            "max_penalty_norm_ratio": float(getattr(self.config, "mn_lora_fisher_ewc_max_penalty_norm_ratio", 0.25)),
-        }
-
-    def _mn_lora_gradient_conflict_config(self) -> Dict[str, Any]:
-        return {
-            "enabled": bool(getattr(self.config, "mn_lora_gradient_conflict_enabled", False)),
-            "conflict_threshold": float(getattr(self.config, "mn_lora_gradient_conflict_threshold", 0.0)),
-            "protect_main_gradient": bool(getattr(self.config, "mn_lora_gradient_conflict_protect_main", True)),
-            "reduction": "sum",
-        }
-
-    def _auto_prodigy_config(self) -> Dict[str, Any]:
-        profile = str(getattr(self.config, "auto_prodigy_profile", "balanced") or "balanced").strip().lower()
-        profiles: Dict[str, Dict[str, Any]] = {
-            "safe": {
-                "d0": 5e-7,
-                "d_coef": 0.75,
-                "growth_rate": 1.01,
-                "max_update_rms_ratio": 0.005,
-                "damping": 1.5,
-                "beta3": 0.995,
-                "safeguard_warmup": True,
-            },
-            "balanced": {
-                "d0": 1e-6,
-                "d_coef": 1.0,
-                "growth_rate": 1.02,
-                "max_update_rms_ratio": 0.01,
-                "damping": 1.0,
-                "beta3": 0.99,
-                "safeguard_warmup": True,
-            },
-            "aggressive": {
-                "d0": 3e-6,
-                "d_coef": 1.5,
-                "growth_rate": 1.08,
-                "max_update_rms_ratio": 0.03,
-                "damping": 0.75,
-                "beta3": 0.98,
-                "safeguard_warmup": True,
-            },
-        }
-        if profile not in {*profiles, "custom"}:
-            self._log(f"Unknown AutoProdigy profile {profile!r}, using balanced.")
-            profile = "balanced"
-        if profile == "custom":
-            return {
-                "d0": float(getattr(self.config, "auto_prodigy_d0", 1e-6)),
-                "d_coef": float(getattr(self.config, "auto_prodigy_d_coef", 1.0)),
-                "growth_rate": float(getattr(self.config, "auto_prodigy_growth_rate", 1.02)),
-                "max_update_rms_ratio": float(getattr(self.config, "auto_prodigy_max_update_rms_ratio", 0.01)),
-                "damping": float(getattr(self.config, "auto_prodigy_damping", 1.0)),
-                "beta3": float(getattr(self.config, "auto_prodigy_beta3", 0.99)),
-                "safeguard_warmup": bool(getattr(self.config, "auto_prodigy_safeguard_warmup", True)),
-            }
-        return dict(profiles[profile])
-
-    def _make_lr_finder_step_fn(self, unet, optimizer, dataloader):
-        """Build a step callable for LRFinder: one forward+backward+step cycle."""
-        import torch
-        _dl_iter = iter(dataloader)
-
-        def _step():
-            nonlocal _dl_iter
-            try:
-                batch = next(_dl_iter)
-            except StopIteration:
-                _dl_iter = iter(dataloader)
-                batch = next(_dl_iter)
-            images = batch.get("images") or batch.get("pixel_values")
-            if images is None:
-                return 0.0
-            images = images.to(self.device, dtype=self.dtype)
-            latents = self._encode_latents_with_vae(images)
-            noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, 1000, (latents.shape[0],), device=self.device).long()
-            noisy = self.model.noise_scheduler.add_noise(latents, noise, timesteps)
-            captions = batch.get("captions", [""] * latents.shape[0])
-            prompt_embeds = self._encode_prompt(captions)
-            enc_hs = prompt_embeds if not isinstance(prompt_embeds, dict) else prompt_embeds.get("encoder_hidden_states", prompt_embeds)
-            with torch.autocast(device_type="cuda", dtype=self.dtype):
-                pred = unet(sample=noisy, timestep=timesteps, encoder_hidden_states=enc_hs).sample
-            loss = torch.nn.functional.mse_loss(pred.float(), noise.float())
-            loss.backward()
-            optimizer.step()
-            return float(loss.detach())
-
-        return _step
-
-    def _create_optimizer(self):
-        """创建优化器"""
-        from .advanced_optimizer_strategy import resolve_advanced_optimizer_strategy
-
-        self._advanced_optimizer_strategy_profile = resolve_advanced_optimizer_strategy(self.config).as_dict()
-        raw_optimizer_args = getattr(self.config, "optimizer_args", "")
-        if self.config.optimizer in {OptimizerType.PYTORCH_OPTIMIZER, OptimizerType.GENERIC}:
-            optimizer_args = self._parse_custom_args(raw_optimizer_args)
-        else:
-            optimizer_args = self._filtered_custom_args(
-                raw_optimizer_args,
-                self._optimizer_allowed_args(),
-                "optimizer_args",
-            )
-        if self.config.semantic_tuner_enabled:
-            trainable_params = self.trainable_params
-        else:
-            # Check for Anima grouped LR first
-            anima_groups = self._build_anima_grouped_param_groups()
-            if anima_groups is not None:
-                trainable_params = anima_groups
-            elif self._block_weight_manager and hasattr(self.lora_injector, "get_param_groups"):
-                trainable_params = self.lora_injector.get_param_groups(
-                    base_lr=self.config.learning_rate,
-                    weight_decay=self.config.weight_decay,
-                )
-                if not trainable_params:
-                    raise ValueError("No optimizer parameter groups available after Block Weight filtering.")
-            else:
-                trainable_params = self.lora_injector.get_trainable_params()
-
-        extra_param_sets = []
-        easy_control = getattr(self, "_easy_control", None)
-        if easy_control is not None:
-            extra_param_sets.append(easy_control.get_trainable_params())
-        ip_adapter = getattr(self, "_ip_adapter", None)
-        if ip_adapter is not None:
-            extra_param_sets.append(ip_adapter.get_trainable_params())
-        repa_projector = getattr(self, "_repa_projector", None)
-        if repa_projector is not None:
-            extra_param_sets.append(list(repa_projector.parameters()))
-        if bool(getattr(self.config, "reft_enabled", False)) and self.model is not None:
-            from .reft import get_reft_params
-            extra_param_sets.append(get_reft_params(self.model.unet))
-        for extra_params in extra_param_sets:
-            if not extra_params:
-                continue
-            if isinstance(trainable_params, list) and trainable_params and isinstance(trainable_params[0], dict):
-                trainable_params.append({
-                    "params": extra_params,
-                    "lr": self.config.learning_rate,
-                    "weight_decay": self.config.weight_decay,
-                })
-            else:
-                trainable_params.extend(extra_params)
-
-        # DoRA: separate magnitude params with weight_decay=0
-        trainable_params = self._dora_param_groups(trainable_params)
-        trainable_params = self._lora_plus_param_groups(trainable_params)
-
-        # Prefix/Postfix tuning: add soft-prompt params to the optimizer (#113)
-        prefix_length = int(getattr(self.config, "prefix_tuning_length", 0) or 0)
-        postfix_length = int(getattr(self.config, "postfix_tuning_length", 0) or 0)
-        if (prefix_length > 0 or postfix_length > 0) and self.model is not None:
-            from .prefix_tuning import get_prefix_tuning_params
-            sp_params = get_prefix_tuning_params(self.model)
-            if sp_params:
-                # Soft-prompt params use a separate param group with no weight decay
-                if isinstance(trainable_params, list) and len(trainable_params) > 0 and isinstance(trainable_params[0], dict):
-                    # Already a list of param groups — add a dedicated group
-                    trainable_params.append({
-                        "params": sp_params,
-                        "lr": self.config.learning_rate,
-                        "weight_decay": 0.0,  # no weight decay on soft prompts
-                    })
-                else:
-                    # Flat param list — just extend
-                    trainable_params.extend(sp_params)
-
-        # Muon: regroup into 2D (Muon) vs non-2D (AdamW fallback). Runs last so
-        # it re-flattens DoRA/LoRA+/prefix groups and re-classifies by rank.
-        trainable_params = self._muon_param_groups(trainable_params)
-
-        trainable_params = self._filter_optimizer_trainable_params(trainable_params)
-        if not trainable_params:
-            raise ValueError("No trainable parameters available for optimizer after filtering frozen params.")
-
-        optimizer = None
-        if self.config.optimizer == OptimizerType.ADAMW:
-            optimizer = self._create_adamw_backend_optimizer(trainable_params, optimizer_args)
-        elif self.config.optimizer == OptimizerType.ADAMW_8BIT:
-            optimizer = self._create_adamw_backend_optimizer(trainable_params, optimizer_args)
-        elif self.config.optimizer == OptimizerType.KAHAN_ADAMW_8BIT:
-            from .kahan_adamw8bit import KahanAdamW8bit
-            optimizer = KahanAdamW8bit(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **optimizer_args,
-            )
-            self._log(f"Using KahanAdamW8bit (8-bit moments + Kahan compensated summation)")
-        elif self.config.optimizer in {
-            OptimizerType.PAGED_ADAMW,
-            OptimizerType.PAGED_ADAMW_32BIT,
-            OptimizerType.PAGED_ADAMW_8BIT,
-            OptimizerType.PAGED_LION_8BIT,
-            OptimizerType.SGD_NESTEROV_8BIT,
-        }:
-            optimizer = self._create_bitsandbytes_optimizer(trainable_params, optimizer_args)
-        elif self.config.optimizer == OptimizerType.PRODIGY:
-            try:
-                from prodigyopt import Prodigy
-                prodigy_args, d0, d_coef = self._resolve_prodigy_d_args(optimizer_args)
-                optimizer = Prodigy(
-                    trainable_params,
-                    lr=1.0,  # Prodigy 自动调整
-                    weight_decay=self.config.weight_decay,
-                    d0=d0,
-                    d_coef=d_coef,
-                    **prodigy_args,
-                )
-            except ImportError:
-                self._log("prodigyopt not available, falling back to AdamW")
-                optimizer = torch.optim.AdamW(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    **optimizer_args,
-                )
-        elif self.config.optimizer in {
-            OptimizerType.DADAPTATION,
-            OptimizerType.DADAPT_ADAM_PREPRINT,
-            OptimizerType.DADAPT_ADAGRAD,
-            OptimizerType.DADAPT_ADAM,
-            OptimizerType.DADAPT_ADAN,
-            OptimizerType.DADAPT_ADAN_IP,
-            OptimizerType.DADAPT_LION,
-            OptimizerType.DADAPT_SGD,
-        }:
-            optimizer = self._create_dadapt_optimizer(trainable_params, optimizer_args)
-        elif self.config.optimizer in {
-            OptimizerType.ADAMW_SCHEDULE_FREE,
-            OptimizerType.RADAM_SCHEDULE_FREE,
-            OptimizerType.SGD_SCHEDULE_FREE,
-        }:
-            optimizer = self._create_schedulefree_optimizer(trainable_params, optimizer_args)
-        elif self.config.optimizer == OptimizerType.PRODIGY_PLUS_SCHEDULE_FREE:
-            optimizer = self._create_prodigy_plus_schedule_free_optimizer(trainable_params, optimizer_args)
-        elif self.config.optimizer == OptimizerType.PYTORCH_OPTIMIZER:
-            from .optimizer_plugin_bridge import create_pytorch_optimizer
-            optimizer = create_pytorch_optimizer(
-                trainable_params,
-                optimizer_name=str(
-                    optimizer_args.get("name")
-                    or optimizer_args.get("optimizer_name")
-                    or optimizer_args.get("optimizer")
-                    or ""
-                ),
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                optimizer_args=optimizer_args,
-            )
-            if hasattr(optimizer, "train"):
-                optimizer.train()
-        elif self.config.optimizer == OptimizerType.GENERIC:
-            from .optimizer_plugin_bridge import create_generic_optimizer
-            optimizer_name = str(
-                optimizer_args.get("name")
-                or optimizer_args.get("optimizer_name")
-                or optimizer_args.get("optimizer")
-                or ""
-            ).strip()
-            if not optimizer_name:
-                raise ValueError("GenericOptimizer requires optimizer_args name=<class>")
-            self._log(f"GenericOptimizer: resolving '{optimizer_name}'")
-            optimizer = create_generic_optimizer(
-                trainable_params,
-                optimizer_name=optimizer_name,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                optimizer_args=optimizer_args,
-            )
-            if hasattr(optimizer, "train"):
-                optimizer.train()
-        elif self.config.optimizer == OptimizerType.AUTOMAGIC_PLUS_PLUS:
-            from .automagic_plus_plus_optimizer import AutomagicPlusPlus
-            self._log(
-                "Automagic++ optimizer activated: Warehouse stable mode "
-                "(tri-state sign, multiplicative local LR, FP32 second moment, relative update cap)."
-            )
-            optimizer = AutomagicPlusPlus(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **optimizer_args,
-            )
-        elif self.config.optimizer == OptimizerType.AUTO_PRODIGY:
-            from .auto_prodigy_optimizer import AutoProdigy
-            auto_prodigy_args = self._auto_prodigy_config()
-            auto_prodigy_args.update(optimizer_args)
-            self._log(
-                "AutoProdigy optimizer activated: Warehouse global distance estimate "
-                f"with schedule-free averaging and {getattr(self.config, 'auto_prodigy_profile', 'balanced')} profile."
-            )
-            optimizer = AutoProdigy(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **auto_prodigy_args,
-            )
-        elif self.config.optimizer == OptimizerType.ADAFACTOR:
-            try:
-                from transformers.optimization import Adafactor
-                optimizer = Adafactor(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    scale_parameter=False,
-                    relative_step=False,
-                    warmup_init=False,
-                    **optimizer_args,
-                )
-            except ImportError:
-                self._log("transformers.optimization.Adafactor not available, falling back to AdamW")
-                optimizer = torch.optim.AdamW(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    **optimizer_args,
-                )
-        elif self.config.optimizer == OptimizerType.ANIMA_FACTORED_ADAMW:
-            from .anima_factored_optimizer import AnimaFactoredAdamW
-
-            optimizer = AnimaFactoredAdamW(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **optimizer_args,
-            )
-            self._set_optimizer_backend_profile(
-                "anima_factored_adamw",
-                "anima_factored_adamw",
-                optimizer_type=str(getattr(self.config.optimizer, "value", self.config.optimizer)),
-                optimizer_class=type(optimizer).__name__,
-                notes=[
-                    "Experimental full-finetune optimizer: factored second moments for large 2D DiT weights.",
-                ],
-            )
-        elif self.config.optimizer == OptimizerType.MUON:
-            from .muon_optimizer import Muon
-
-            muon_args = {
-                "momentum": float(getattr(self.config, "muon_momentum", 0.95)),
-                "ns_steps": int(getattr(self.config, "muon_ns_steps", 5)),
-            }
-            muon_args.update(optimizer_args)
-            optimizer = Muon(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **muon_args,
-            )
-            self._log(
-                "Muon optimizer activated: Newton-Schulz orthogonalized momentum "
-                "on 2D LoRA factors; AdamW fallback on 1D/scalar params."
-            )
-        if optimizer is not None:
-            if bool(getattr(self.config, "mn_lora_enabled", False)):
-                from core.training_components.mn_lora.hijacker import wrap_optimizer
-                from core.training_components.mn_lora.mn_presets import (
-                    select_mnlora_preset,
-                    split_mnlora_preset,
-                )
-                model_type_name = str(getattr(self.config.model_type, "value", self.config.model_type))
-                mn_preset_name = str(getattr(self.config, "mn_lora_preset", "") or "")
-                preset_configs = split_mnlora_preset(select_mnlora_preset(model_type_name, mn_preset_name))
-                gsp_config = dict(preset_configs["gsp_config"])
-                gsp_config.update({
-                    "k_ratio": float(getattr(self.config, "mn_lora_k_ratio", gsp_config.get("k_ratio", 0.5))),
-                    "update_interval": int(getattr(self.config, "mn_lora_update_interval", gsp_config.get("update_interval", 20))),
-                    "adaptive_k": bool(getattr(self.config, "mn_lora_adaptive_k", True)),
-                    "lazy_update": bool(getattr(self.config, "mn_lora_lazy_update", gsp_config.get("lazy_update", True))),
-                    "residual_threshold": float(getattr(self.config, "mn_lora_residual_threshold", gsp_config.get("residual_threshold", 0.3))),
-                    "min_k_ratio": float(getattr(self.config, "mn_lora_min_k_ratio", 0.2)),
-                    "max_k_ratio": float(getattr(self.config, "mn_lora_max_k_ratio", 0.8)),
-                    "lazy_threshold": float(getattr(self.config, "mn_lora_lazy_threshold", gsp_config.get("lazy_threshold", 0.5))),
-                    "precondition_mode": str(getattr(self.config, "mn_lora_precondition_mode", "grad_ema") or "grad_ema"),
-                    "svd_precond_beta": float(getattr(self.config, "mn_lora_svd_precond_beta", 0.5)),
-                    "precond_min_scale": float(getattr(self.config, "mn_lora_precond_min_scale", 0.25)),
-                    "precond_max_scale": float(getattr(self.config, "mn_lora_precond_max_scale", 4.0)),
-                    "coord_curv_beta": float(getattr(self.config, "mn_lora_coord_curv_beta", 0.95)),
-                    "precond_clip": float(getattr(self.config, "mn_lora_precond_clip", 3.0)),
-                    "precond_eps": float(getattr(self.config, "mn_lora_precond_eps", 1e-6)),
-                    "adaptive_sparse_enabled": bool(getattr(self.config, "mn_lora_adaptive_sparse_enabled", True)),
-                    "adaptive_sparse_warmup_steps": int(getattr(self.config, "mn_lora_adaptive_sparse_warmup_steps", 10)),
-                    "adaptive_sparse_refresh_interval": int(getattr(self.config, "mn_lora_adaptive_sparse_refresh_interval", 20)),
-                    "adaptive_sparse_hot_ratio": float(getattr(self.config, "mn_lora_adaptive_sparse_hot_ratio", 0.20)),
-                    "adaptive_sparse_warm_ratio": float(getattr(self.config, "mn_lora_adaptive_sparse_warm_ratio", 0.0)),
-                    "adaptive_sparse_warm_interval": int(getattr(self.config, "mn_lora_adaptive_sparse_warm_interval", 4)),
-                    "adaptive_sparse_cold_interval": int(getattr(self.config, "mn_lora_adaptive_sparse_cold_interval", 16)),
-                    "adaptive_sparse_min_hot_layers": int(getattr(self.config, "mn_lora_adaptive_sparse_min_hot_layers", 16)),
-                    "adaptive_sparse_zero_cold_after": int(getattr(self.config, "mn_lora_adaptive_sparse_zero_cold_after", 3)),
-                })
-                tgwd_config = dict(preset_configs["tgwd_config"])
-                tgwd_config.update({
-                    "alpha": float(getattr(self.config, "mn_lora_tgwd_alpha", 1.0)),
-                    "n_probes": int(getattr(self.config, "mn_lora_tgwd_n_probes", 1)),
-                    "probe_interval": int(getattr(self.config, "mn_lora_tgwd_probe_interval", tgwd_config.get("probe_interval", 50))),
-                    "finite_diff_eps": float(getattr(self.config, "mn_lora_tgwd_finite_diff_eps", 1e-3)),
-                })
-                pilot_config = dict(preset_configs["pilot_config"])
-                pilot_config.update({
-                    "strategy": str(getattr(self.config, "mn_lora_pilot_strategy", pilot_config.get("strategy", "population"))),
-                })
-                optimizer = wrap_optimizer(
-                    optimizer,
-                    enable_gsp=bool(getattr(self.config, "mn_lora_gsp_enabled", True)),
-                    enable_tgwd=bool(getattr(self.config, "mn_lora_tgwd_enabled", True)),
-                    enable_pilot=True,
-                    gsp_config=gsp_config,
-                    tgwd_config=tgwd_config,
-                    pilot_config=pilot_config,
-                    plus_plus_config=self._mn_lora_plus_plus_config(),
-                    kfac_lite_config=self._mn_lora_kfac_lite_config(),
-                    trust_region_config=self._mn_lora_trust_region_config(),
-                    effective_delta_config=self._mn_lora_effective_delta_config(),
-                    fisher_ewc_config=self._mn_lora_fisher_ewc_config(),
-                    gradient_conflict_config=self._mn_lora_gradient_conflict_config(),
-                    lora_modules=getattr(self.lora_injector, "injected_layers", {}) if self.lora_injector is not None else {},
-                    param_names=self._optimizer_param_names(),
-                )
-            return optimizer
-
-        elif self.config.optimizer == OptimizerType.LION:
-            try:
-                from lion_pytorch import Lion
-                return Lion(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-            except ImportError:
-                self._log("lion_pytorch not available, falling back to AdamW")
-                return torch.optim.AdamW(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-        elif self.config.optimizer == OptimizerType.LION_8BIT:
-            try:
-                import bitsandbytes as bnb
-                lion8 = getattr(bnb.optim, "Lion8bit", None)
-                if lion8 is not None:
-                    return lion8(
-                        trainable_params,
-                        lr=self.config.learning_rate,
-                        weight_decay=self.config.weight_decay,
-                        **optimizer_args,
-                    )
-            except ImportError:
-                pass
-
-            try:
-                from lion_pytorch import Lion
-                self._log("Lion8bit unavailable; falling back to lion_pytorch.Lion")
-                return Lion(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-            except ImportError:
-                self._log("Lion optimizer not available, falling back to AdamW8bit/AdamW")
-                try:
-                    import bitsandbytes as bnb
-                    return bnb.optim.AdamW8bit(trainable_params, lr=self.config.learning_rate, weight_decay=self.config.weight_decay, **optimizer_args)
-                except ImportError:
-                    return torch.optim.AdamW(trainable_params, lr=self.config.learning_rate, weight_decay=self.config.weight_decay, **optimizer_args)
-        elif self.config.optimizer == OptimizerType.SGD_NESTEROV:
-            sgd_args = {"momentum": 0.9, "nesterov": True}
-            sgd_args.update(optimizer_args)
-            return torch.optim.SGD(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                **sgd_args,
-            )
-        elif self.config.optimizer == OptimizerType.DADAPT_ADAM:
-            try:
-                from dadaptation import DAdaptAdam
-                return DAdaptAdam(
-                    trainable_params,
-                    lr=1.0,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-            except ImportError:
-                self._log("dadaptation not available, falling back to AdamW")
-                return torch.optim.AdamW(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-        elif self.config.optimizer == OptimizerType.DADAPT_ADAN:
-            try:
-                from dadaptation import DAdaptAdan
-                return DAdaptAdan(
-                    trainable_params,
-                    lr=1.0,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-            except ImportError:
-                self._log("dadaptation not available, falling back to AdamW")
-                return torch.optim.AdamW(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-        elif self.config.optimizer == OptimizerType.DADAPT_SGD:
-            try:
-                from dadaptation import DAdaptSGD
-                return DAdaptSGD(
-                    trainable_params,
-                    lr=1.0,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-            except ImportError:
-                self._log("dadaptation not available, falling back to AdamW")
-                return torch.optim.AdamW(
-                    trainable_params,
-                    lr=self.config.learning_rate,
-                    weight_decay=self.config.weight_decay,
-                    **optimizer_args,
-                )
-        else:
-            return torch.optim.AdamW(
-                trainable_params,
-                lr=self.config.learning_rate,
-                **optimizer_args,
-            )
-
-    def _create_scheduler(self, optimizer, total_steps: int):
-        """创建学习率调度器"""
-        total_steps = max(int(total_steps), 1)
-        warmup_steps = int(total_steps * self.config.warmup_ratio)
-        warmup_steps = max(min(warmup_steps, total_steps - 1), 0)
-        num_cycles = getattr(self.config, "lr_scheduler_num_cycles", 1)
-        scheduler_args = self._filtered_custom_args(
-            getattr(self.config, "lr_scheduler_args", ""),
-            self._scheduler_allowed_args(),
-            "lr_scheduler_args",
-        )
-        loss_cosine_cycles = float(
-            scheduler_args.get("num_cycles", max(float(num_cycles), 1.0) / 2.0)
-        )
-        loss_scheduler_kwargs = {
-            "eta_min": float(scheduler_args.get("eta_min", 0.0)),
-            "num_cycles": loss_cosine_cycles,
-            "ema_alpha": float(
-                scheduler_args.get(
-                    "ema_alpha",
-                    getattr(self.config, "loss_scheduler_ema_alpha", 0.1),
-                )
-            ),
-            "min_delta": float(
-                scheduler_args.get(
-                    "min_delta",
-                    getattr(self.config, "loss_scheduler_min_delta", 5e-4),
-                )
-            ),
-            "relative_delta": float(
-                scheduler_args.get(
-                    "relative_delta",
-                    getattr(self.config, "loss_scheduler_relative_delta", 1e-3),
-                )
-            ),
-            "patience": int(
-                scheduler_args.get(
-                    "patience",
-                    getattr(self.config, "loss_scheduler_patience", 8),
-                )
-            ),
-            "cooldown": int(
-                scheduler_args.get(
-                    "cooldown",
-                    getattr(self.config, "loss_scheduler_cooldown", 0),
-                )
-            ),
-            "max_hold_steps": int(
-                scheduler_args.get(
-                    "max_hold_steps",
-                    getattr(self.config, "loss_scheduler_max_hold_steps", 0),
-                )
-            ),
-            "late_loss_gamma": float(
-                scheduler_args.get(
-                    "late_loss_gamma",
-                    getattr(self.config, "loss_scheduler_late_gamma", 2.0),
-                )
-            ),
-            "lock_weight_threshold": float(
-                scheduler_args.get(
-                    "lock_weight_threshold",
-                    getattr(self.config, "loss_scheduler_lock_weight_threshold", 0.7),
-                )
-            ),
-            "min_advance_ratio": float(
-                scheduler_args.get(
-                    "min_advance_ratio",
-                    getattr(self.config, "loss_scheduler_min_advance_ratio", 0.25),
-                )
-            ),
-            "hold_on_improvement": bool(scheduler_args.get("hold_on_improvement", True)),
-        }
-
-        if self.config.optimizer in {OptimizerType.AUTOMAGIC_PLUS_PLUS, OptimizerType.AUTO_PRODIGY} or self._is_schedule_free_optimizer():
-            from torch.optim.lr_scheduler import ConstantLR
-            return ConstantLR(optimizer, factor=1.0)
-        if self.config.optimizer == OptimizerType.PYTORCH_OPTIMIZER:
-            from .optimizer_plugin_bridge import is_schedulefree_like
-            if is_schedulefree_like(optimizer):
-                from torch.optim.lr_scheduler import ConstantLR
-                return ConstantLR(optimizer, factor=1.0)
-        if self.config.optimizer == OptimizerType.GENERIC:
-            from .optimizer_plugin_bridge import is_schedulefree_like
-            if is_schedulefree_like(optimizer):
-                from torch.optim.lr_scheduler import ConstantLR
-                return ConstantLR(optimizer, factor=1.0)
-
-        if self.config.scheduler == SchedulerType.COSINE:
-            from torch.optim.lr_scheduler import CosineAnnealingLR
-            return CosineAnnealingLR(
-                optimizer,
-                T_max=max(total_steps - warmup_steps, 1),
-                eta_min=float(scheduler_args.get("eta_min", 0.0)),
-            )
-        elif self.config.scheduler == SchedulerType.LOSS_GATED_COSINE:
-            from .loss_aware_scheduler import LossAwareCosineScheduler
-            return LossAwareCosineScheduler.gated(
-                optimizer,
-                total_steps=total_steps,
-                warmup_steps=warmup_steps,
-                **loss_scheduler_kwargs,
-            )
-        elif self.config.scheduler == SchedulerType.LOSS_WEIGHTED_ANNEALED_COSINE:
-            from .loss_aware_scheduler import LossAwareCosineScheduler
-            return LossAwareCosineScheduler.weighted(
-                optimizer,
-                total_steps=total_steps,
-                warmup_steps=warmup_steps,
-                **loss_scheduler_kwargs,
-            )
-        elif self.config.scheduler == SchedulerType.COSINE_RESTARTS:
-            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-            t_0 = int(scheduler_args.get("t_0", max(int(total_steps / max(num_cycles, 1)), 1)))
-            return CosineAnnealingWarmRestarts(
-                optimizer,
-                T_0=max(t_0, 1),
-                T_mult=max(int(scheduler_args.get("t_mult", 1)), 1),
-                eta_min=float(scheduler_args.get("eta_min", 0.0)),
-            )
-        elif self.config.scheduler == SchedulerType.COSINE_WITH_MIN_LR:
-            from torch.optim.lr_scheduler import LambdaLR
-            import math
-            min_lr_ratio = float(scheduler_args.get("min_lr_ratio", scheduler_args.get("min_lr_rate", 0.0)))
-            cycles = float(scheduler_args.get("num_cycles", max(float(num_cycles), 1.0))) / 2.0
-            active_steps = max(total_steps - warmup_steps, 1)
-
-            def _cosine_with_min_lr(step):
-                if warmup_steps > 0 and step < warmup_steps:
-                    return max(float(step + 1) / float(warmup_steps), min_lr_ratio)
-                progress = min(max(float(step - warmup_steps) / float(active_steps), 0.0), 1.0)
-                cosine = 0.5 * (1.0 + math.cos(math.pi * 2.0 * cycles * progress))
-                return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-            return LambdaLR(optimizer, lr_lambda=_cosine_with_min_lr)
-        elif self.config.scheduler == SchedulerType.LINEAR:
-            from torch.optim.lr_scheduler import LinearLR
-            return LinearLR(
-                optimizer,
-                start_factor=float(scheduler_args.get("start_factor", 1.0)),
-                end_factor=float(scheduler_args.get("end_factor", 0.0)),
-                total_iters=max(int(scheduler_args.get("total_iters", total_steps)), 1),
-            )
-        elif self.config.scheduler == SchedulerType.CONSTANT:
-            from torch.optim.lr_scheduler import ConstantLR
-            return ConstantLR(optimizer, factor=1.0)
-        elif self.config.scheduler == SchedulerType.CONSTANT_WARMUP:
-            from torch.optim.lr_scheduler import ConstantLR, LinearLR, SequentialLR
-            if warmup_steps > 0:
-                warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-                constant_sched = ConstantLR(optimizer, factor=1.0)
-                return SequentialLR(optimizer, schedulers=[warmup_sched, constant_sched], milestones=[warmup_steps])
-            return ConstantLR(optimizer, factor=1.0)
-        elif self.config.scheduler == SchedulerType.POLYNOMIAL:
-            from torch.optim.lr_scheduler import PolynomialLR
-            return PolynomialLR(
-                optimizer,
-                total_iters=max(int(scheduler_args.get("total_iters", total_steps)), 1),
-                power=float(scheduler_args.get("power", 1.0)),
-            )
-        elif self.config.scheduler == SchedulerType.PIECEWISE_CONSTANT:
-            from torch.optim.lr_scheduler import LambdaLR
-            raw_rules = str(scheduler_args.get("rules", scheduler_args.get("schedule", "")) or "").strip()
-            boundaries: list[tuple[int, float]] = []
-            for chunk in raw_rules.replace(";", ",").split(","):
-                if not chunk.strip() or ":" not in chunk:
-                    continue
-                left, right = chunk.split(":", 1)
-                try:
-                    boundaries.append((max(int(left.strip()), 0), float(right.strip())))
-                except ValueError:
-                    continue
-            boundaries.sort(key=lambda item: item[0])
-
-            def _piecewise(step):
-                factor = 1.0
-                for boundary, value in boundaries:
-                    if step >= boundary:
-                        factor = value
-                    else:
-                        break
-                return factor
-
-            return LambdaLR(optimizer, lr_lambda=_piecewise)
-        elif self.config.scheduler == SchedulerType.TSD:
-            # Warmup Stable Decay: warmup -> constant plateau -> cosine decay
-            from torch.optim.lr_scheduler import SequentialLR, ConstantLR, CosineAnnealingLR
-            stable_steps = max(int(total_steps * 0.6), 1)
-            decay_steps = max(total_steps - warmup_steps - stable_steps, 1)
-            schedulers = [
-                ConstantLR(optimizer, factor=1.0, total_iters=warmup_steps),
-                CosineAnnealingLR(optimizer, T_max=stable_steps),
-                CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=0),
-            ]
-            milestones = [warmup_steps, warmup_steps + stable_steps]
-            return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
-        elif self.config.scheduler == SchedulerType.ONE_CYCLE:
-            from torch.optim.lr_scheduler import OneCycleLR
-            return OneCycleLR(
-                optimizer,
-                max_lr=float(scheduler_args.get("max_lr", self.config.learning_rate)),
-                total_steps=total_steps,
-                pct_start=float(scheduler_args.get("pct_start", 0.3)),
-                anneal_strategy=scheduler_args.get("anneal_strategy", "cos"),
-                div_factor=float(scheduler_args.get("div_factor", 25.0)),
-                final_div_factor=float(scheduler_args.get("final_div_factor", 1e4)),
-                three_phase=bool(scheduler_args.get("three_phase", False)),
-            )
-        elif self.config.scheduler == SchedulerType.INVERSE_SQRT:
-            from torch.optim.lr_scheduler import LambdaLR
-            import math
-            warmup_steps_inv = max(warmup_steps, 1)
-            def _inverse_sqrt(step):
-                if step < warmup_steps_inv:
-                    return (step + 1) / warmup_steps_inv
-                return math.sqrt(warmup_steps_inv) / math.sqrt(step + 1)
-            return LambdaLR(optimizer, lr_lambda=_inverse_sqrt)
-        elif self.config.scheduler == SchedulerType.ADAFACTOR:
-            # Adafactor uses its own internal LR schedule; wrap in constant so the
-            # trainer loop can still call .step() without error.
-            from torch.optim.lr_scheduler import ConstantLR
-            return ConstantLR(optimizer, factor=1.0)
-        elif self.config.scheduler == SchedulerType.RESTART_LINEAR:
-            from torch.optim.lr_scheduler import SequentialLR, LinearLR, ConstantLR
-            if warmup_steps > 0:
-                warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-            else:
-                warmup_sched = ConstantLR(optimizer, factor=1.0, total_iters=1)
-            t_0 = int(scheduler_args.get("t_0", max(int(total_steps / max(num_cycles, 1)), 1)))
-            decay_sched = LinearLR(
-                optimizer,
-                start_factor=1.0,
-                end_factor=float(scheduler_args.get("eta_min", 0.0)),
-                total_iters=max(t_0, 1),
-            )
-            return SequentialLR(optimizer, schedulers=[warmup_sched, decay_sched], milestones=[warmup_steps])
-        else:
-            # 默认 Cosine
-            from torch.optim.lr_scheduler import CosineAnnealingLR
-            return CosineAnnealingLR(optimizer, T_max=max(total_steps, 1))
 
     def start(self):
         """开始训练"""
@@ -8508,6 +5998,7 @@ class LulynxTrainer:
 
         self._apply_seed()
         self._apply_gpu_power_limit_if_requested()
+        self._apply_gpu_clock_lock_if_requested()
 
         # Initialize DDP if multi_gpu is enabled
         self._setup_ddp()
@@ -8527,6 +6018,7 @@ class LulynxTrainer:
             success = False
         finally:
             self.is_running = False
+            self._reset_gpu_clock_lock_if_applied()
             self._finalize_logging_runtime()
             self._cleanup_ddp()
             if self.on_complete:
@@ -9335,6 +6827,24 @@ class LulynxTrainer:
             })
             self._log(f"Adaptive loss weighting enabled (lr={_alw_lr})")
 
+        # Create EDM2-style flow uncertainty weighter if enabled (anima flow route only)
+        _flow_uncertainty_weighter = None
+        if (
+            getattr(self.config, "flow_uncertainty_weighting_enabled", False)
+            and self._model_arch_value() == "anima"
+        ):
+            from .flow_uncertainty_weighting import FlowUncertaintyWeighter
+            _flow_uncertainty_weighter = FlowUncertaintyWeighter(
+                num_channels=int(getattr(self.config, "flow_uncertainty_weighting_channels", 128) or 128),
+            ).to(self.device)
+            _fuw_lr = float(getattr(self.config, "flow_uncertainty_weighting_lr", 1e-2) or 1e-2)
+            optimizer.add_param_group({
+                "params": list(_flow_uncertainty_weighter.parameters()),
+                "lr": _fuw_lr,
+                "weight_decay": 0.0,
+            })
+            self._log(f"Flow uncertainty weighting (EDM2) enabled (lr={_fuw_lr})")
+
         # Create FasterDiT SNR weighter if enabled
         _faster_dit_snr_weighter = None
         if getattr(self.config, "faster_dit_snr_enabled", False):
@@ -9419,6 +6929,7 @@ class LulynxTrainer:
             dtype=self.dtype,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             gradient_accumulation_mode=getattr(self.config, "gradient_accumulation_mode", "fast"),
+            thermal_throttler=self._create_thermal_throttler(),
             max_grad_norm=self.config.max_grad_norm,
             noise_offset=self.config.noise_offset,
             snr_gamma=self.config.min_snr_gamma if self.config.min_snr_gamma > 0 else None,
@@ -9536,6 +7047,13 @@ class LulynxTrainer:
             anima_weighting_scheme=str(getattr(self.config, "anima_weighting_scheme", getattr(self.config, "weighting_scheme", "none")) or "none"),
             anima_model_prediction_type=str(getattr(self.config, "anima_model_prediction_type", "velocity") or "velocity"),
             anima_mode_scale=float(getattr(self.config, "anima_mode_scale", 1.0) or 1.0),
+            anima_faithful_forward=bool(getattr(self.config, "anima_faithful_forward", False)),
+            # JLT EMA feature self-distillation alignment (default-off reserve)
+            anima_ema_feat_align_enabled=bool(getattr(self.config, "anima_ema_feat_align_enabled", False)),
+            anima_ema_feat_align_weight=float(getattr(self.config, "anima_ema_feat_align_weight", 0.0) or 0.0),
+            anima_ema_feat_align_teacher_layers=str(getattr(self.config, "anima_ema_feat_align_teacher_layers", "") or ""),
+            anima_ema_feat_align_student_layers=str(getattr(self.config, "anima_ema_feat_align_student_layers", "") or ""),
+            anima_ema_feat_align_decay=float(getattr(self.config, "anima_ema_feat_align_decay", 0.9999) or 0.9999),
             # SDXL Flow Matching
             flow_model=str(getattr(self.config, "flow_model", "") or ""),
             sdxl_timestep_sampling=str(getattr(self.config, "timestep_sampling", "uniform") or "uniform"),
@@ -9569,6 +7087,7 @@ class LulynxTrainer:
             enable_fixed_token_padding=self._should_enable_fixed_token_padding(),
             easy_control=self._easy_control,
             ip_adapter=self._ip_adapter,
+            easycontrol_v2_adapter=self._easycontrol_v2_adapter,
             repa_enabled=bool(getattr(self.config, "repa_enabled", False)),
             repa_target_modules=str(getattr(self.config, "repa_target_modules", "") or ""),
             repa_loss_type=str(getattr(self.config, "repa_loss_type", "cosine") or "cosine"),
@@ -9627,6 +7146,9 @@ class LulynxTrainer:
             activation_compression_enabled=bool(getattr(self.config, "activation_compression_enabled", False)),
             activation_compression_dtype=str(getattr(self.config, "activation_compression_dtype", "fp16") or "fp16"),
             activation_compression_min_tensor_mb=max(float(getattr(self.config, "activation_compression_min_tensor_mb", 1.0)), 0.0),
+            activation_cpu_offload_enabled=bool(getattr(self.config, "activation_cpu_offload_enabled", False)),
+            activation_cpu_offload_min_tensor_mb=max(float(getattr(self.config, "activation_cpu_offload_min_tensor_mb", 1.0)), 0.0),
+            activation_cpu_offload_pool_gb=max(float(getattr(self.config, "activation_cpu_offload_pool_gb", 1.0)), 0.0),
             resolution_aware_batch_enabled=bool(getattr(self.config, "resolution_aware_batch_enabled", False)),
             resolution_aware_batch_base_resolution=int(getattr(self.config, "resolution_aware_batch_base_resolution", 1024) or 1024),
             resolution_aware_batch_max_factor=float(getattr(self.config, "resolution_aware_batch_max_factor", 4.0) or 4.0),
@@ -9641,6 +7163,7 @@ class LulynxTrainer:
             spectral_noise_sigma=float(getattr(self.config, "spectral_noise_sigma", 4.0) or 4.0),
             huber_auto_percentile=float(getattr(self.config, "huber_auto_percentile", 0.9) or 0.9),
             adaptive_loss_weighter=_adaptive_loss_weighter,
+            flow_uncertainty_weighter=_flow_uncertainty_weighter,
             faster_dit_snr_weighter=_faster_dit_snr_weighter,
             sageattn_drift_check_interval=int(getattr(self.config, "sageattn_drift_check_interval", 0) or 0),
             sageattn_drift_threshold=float(getattr(self.config, "sageattn_drift_threshold", 0.01) or 0.01),
@@ -9692,6 +7215,31 @@ class LulynxTrainer:
             vram_smart_sensing_window_steps=int(getattr(self.config, "vram_smart_sensing_window_steps", 5) or 5),
         )
         self._mark_runtime_phase("training_loop_create")
+        self.training_loop.newbie_backward_op_profile_enabled = bool(
+            getattr(self.config, "newbie_backward_op_profile_enabled", False)
+        )
+        self.training_loop.newbie_backward_op_profile_top_k = max(
+            int(getattr(self.config, "newbie_backward_op_profile_top_k", 12) or 12),
+            1,
+        )
+        self.training_loop.newbie_backward_op_profile_max_samples = max(
+            int(getattr(self.config, "newbie_backward_op_profile_max_samples", 1) or 1),
+            1,
+        )
+        self.training_loop.newbie_backward_op_profile_record_shapes = bool(
+            getattr(self.config, "newbie_backward_op_profile_record_shapes", False)
+        )
+        self.training_loop.newbie_module_timing_profile_enabled = bool(
+            getattr(self.config, "newbie_module_timing_profile_enabled", False)
+        )
+        self.training_loop.newbie_module_timing_profile_top_k = max(
+            int(getattr(self.config, "newbie_module_timing_profile_top_k", 12) or 12),
+            1,
+        )
+        self.training_loop.newbie_module_timing_profile_max_samples = max(
+            int(getattr(self.config, "newbie_module_timing_profile_max_samples", 1) or 1),
+            1,
+        )
         # Pass prior preservation config to training loop
         if self._reg_dataloader:
             self.training_loop.prior_loss_weight = getattr(self.config, "prior_loss_weight", 1.0)
@@ -10190,6 +7738,19 @@ class LulynxTrainer:
             )
             self._log(f"Epoch {epoch + 1} completed, avg loss: {result['avg_loss']:.4f}")
 
+            # Stop the epoch loop the moment the step budget (max_train_steps) is
+            # reached. train_epoch() already set completed_by_step_limit and broke
+            # out with 0 further steps; without this break the loop would keep
+            # spinning empty epochs up to max_train_epochs (each saving a
+            # checkpoint), which can exhaust the disk. The post-loop final save
+            # below already handles completed_by_step_limit, so the trained
+            # adapter is still persisted.
+            if getattr(self.training_loop, "completed_by_step_limit", False):
+                self._log(
+                    f"Reached max_train_steps; stopping epoch loop after epoch {epoch + 1}"
+                )
+                break
+
             # Validation
             validation_every = int(getattr(self.config, "eval_every_n_epochs", 0) or 0)
             step_validation_every = int(getattr(self.config, "eval_every_n_steps", 0) or 0)
@@ -10255,344 +7816,10 @@ class LulynxTrainer:
             except Exception as e:
                 self._log(f"Newbie auto_swap_release: cleanup failed — {e}")
 
-    def _record_bubble_closed_loop_step_sample(self, step: int, loss: float, info: Dict[str, Any]) -> None:
-        if not bool(getattr(self.config, "bubble_controller_enabled", False)):
-            return
-        wall_seconds = float(info.get("step_wall_seconds", 0.0) or 0.0)
-        if wall_seconds <= 0.0:
-            return
-        batch = max(int(getattr(self.config, "train_batch_size", 1) or 1), 1)
-        sample = {
-            "step": int(step),
-            "step_wall_seconds": wall_seconds,
-            "samples_per_second": batch / max(wall_seconds, 1e-9),
-            "loss": float(loss),
-        }
-        self._bubble_closed_loop_step_window.append(sample)
-        tune_interval = max(int(getattr(self.config, "bubble_controller_tune_interval_steps", 32) or 32), 1)
-        max_window = max(tune_interval * 4, 64)
-        if len(self._bubble_closed_loop_step_window) > max_window:
-            self._bubble_closed_loop_step_window = self._bubble_closed_loop_step_window[-max_window:]
-
-    def _bubble_closed_loop_window_profile(self) -> Dict[str, Any]:
-        samples = list(getattr(self, "_bubble_closed_loop_step_window", []) or [])
-        if not samples:
-            return {}
-        tune_interval = max(int(getattr(self.config, "bubble_controller_tune_interval_steps", 32) or 32), 1)
-        window = samples[-tune_interval:]
-        mean_wall = sum(float(item.get("step_wall_seconds", 0.0) or 0.0) for item in window) / max(len(window), 1)
-        mean_sps = sum(float(item.get("samples_per_second", 0.0) or 0.0) for item in window) / max(len(window), 1)
-        return {
-            "schema_version": 1,
-            "profile": "bubble_closed_loop_step_window_v0",
-            "step_count": len(window),
-            "first_step": int(window[0].get("step", 0) or 0),
-            "last_step": int(window[-1].get("step", 0) or 0),
-            "mean_step_ms": round(mean_wall * 1000.0, 4),
-            "steady_samples_per_second": round(mean_sps, 6),
-            "throughput_estimated": False,
-            "final_loss": round(float(window[-1].get("loss", 0.0) or 0.0), 6),
-        }
-
-    def _apply_bubble_runtime_mutations(self, mutations: List[Dict[str, Any]], *, reason: str) -> Dict[str, Any]:
-        applied: Dict[str, Any] = {}
-        loop = getattr(self, "training_loop", None)
-        for mutation in mutations:
-            path = str(mutation.get("path") or "")
-            value = mutation.get("recommended")
-            if not path:
-                continue
-            setattr(self.config, path, value)
-            if path == "tensorboard_flush_interval_steps":
-                self._tb_flush_interval_steps = max(int(value or 1), 1)
-            elif path == "adaptive_step_logging_enabled":
-                self._adaptive_step_logging_enabled = bool(value)
-            elif path == "layer_monitor_interval" and loop is not None:
-                loop._layer_monitor_interval = max(int(value or 1), 1)
-            elif path == "eval_every_n_steps" and loop is not None:
-                loop.eval_every_n_steps = max(int(value or 0), 0)
-            elif path == "data_transfer_non_blocking" and loop is not None:
-                loop.data_transfer_non_blocking = bool(value)
-            elif path == "data_transfer_profile_mode" and loop is not None:
-                loop.data_transfer_profile_mode = TrainingLoop._normalize_data_transfer_profile_mode(str(value or "event"))
-            elif path == "step_phase_profile_enabled" and loop is not None:
-                profiler = getattr(loop, "_step_phase_profiler", None)
-                if profiler is not None:
-                    profiler.enabled = bool(value)
-            applied[path] = value
-        if applied:
-            self._log(f"[BubbleController] {reason}: applied runtime overlay {applied}")
-        return applied
-
-    def _maybe_run_bubble_closed_loop(self, step: int, loss: float, info: Dict[str, Any]) -> None:
-        if not bool(getattr(self.config, "bubble_controller_enabled", False)):
-            return
-        if str(getattr(self.config, "bubble_controller_mode", "report_only") or "report_only").strip().lower() != "auto_apply":
-            return
-        tune_interval = max(int(getattr(self.config, "bubble_controller_tune_interval_steps", 32) or 32), 1)
-        warmup = max(int(getattr(self.config, "bubble_controller_warmup_steps", 8) or 8), 0)
-        state = getattr(self, "_bubble_closed_loop_state", {}) or {}
-        active = state.get("active_action") if isinstance(state, dict) else None
-        if not active and (int(step) < warmup or int(step) % tune_interval != 0):
-            return
-        if active:
-            cooldown_until = int(active.get("cooldown_until_step", int(step)) or int(step))
-            if int(step) < cooldown_until and int(step) % tune_interval != 0:
-                return
-        try:
-            features = build_lulynx_trainer_runtime_features(self)
-            report = build_bubble_controller_report(
-                self.config,
-                runtime_features=features,
-                closed_loop_state=state,
-                current_step=int(step),
-            )
-            self._bubble_closed_loop_last_report = dict(report)
-            closed_loop = report.get("closed_loop", {}) if isinstance(report, dict) else {}
-            executor = closed_loop.get("executor", {}) if isinstance(closed_loop, dict) else {}
-            status = str(executor.get("status") or "")
-            if status == "ready_to_apply":
-                runtime_apply = executor.get("runtime_apply", {}) if isinstance(executor, dict) else {}
-                mutations = [
-                    dict(item)
-                    for item in runtime_apply.get("mutations", [])
-                    if isinstance(item, dict)
-                ]
-                applied = self._apply_bubble_runtime_mutations(mutations, reason="auto-apply low-risk action")
-                self._bubble_closed_loop_state = mark_closed_loop_action_applied(
-                    executor,
-                    current_step=int(step),
-                    applied_overlay=applied,
-                )
-            elif status in {
-                "dataloader_rebuild_epoch_boundary_ready",
-                "dataloader_rebuild_rollback_epoch_boundary_ready",
-            }:
-                self._bubble_dataloader_epoch_pending = dict(executor)
-                self._log(
-                    "[BubbleController] DataLoader rebuild queued for epoch boundary: "
-                    f"{status}"
-                )
-            elif status == "rollback_recommended":
-                rollback = executor.get("rollback", {}) if isinstance(executor, dict) else {}
-                mutations = [
-                    dict(item)
-                    for item in rollback.get("mutations", [])
-                    if isinstance(item, dict)
-                ]
-                applied = self._apply_bubble_runtime_mutations(mutations, reason="rollback low-risk action")
-                self._bubble_closed_loop_state = mark_closed_loop_action_closed(
-                    executor,
-                    status="rolled_back" if applied else "rollback_failed",
-                    current_step=int(step),
-                    applied_overlay=applied,
-                )
-            elif status in {"keep_recommended", "keep_observed", "needs_more_evidence"}:
-                closed_status = "kept" if status != "needs_more_evidence" else "needs_more_evidence"
-                self._bubble_closed_loop_state = mark_closed_loop_action_closed(
-                    executor,
-                    status=closed_status,
-                    current_step=int(step),
-                )
-        except Exception as exc:
-            logger.debug("Bubble closed-loop step skipped: %s", exc)
-
-    def _maybe_apply_bubble_epoch_boundary_dataloader_rebuild(self, dataloader: Any, *, epoch: int) -> Any:
-        if not bool(getattr(self.config, "bubble_controller_enabled", False)):
-            return dataloader
-        mode = str(getattr(self.config, "bubble_controller_mode", "report_only") or "report_only").strip().lower()
-        if mode.replace("-", "_") != "auto_apply":
-            return dataloader
-        if getattr(self, "training_loop", None) is None:
-            return dataloader
-        step = int(getattr(self.training_loop, "global_step", 0) or 0)
-        try:
-            self._refresh_dataloader_rebuild_readiness(dataloader, epoch=epoch, boundary="epoch_start")
-            executor = dict(getattr(self, "_bubble_dataloader_epoch_pending", {}) or {})
-            if not executor:
-                state = getattr(self, "_bubble_closed_loop_state", {}) or {}
-                active = state.get("active_action") if isinstance(state, dict) else None
-                tune_interval = max(int(getattr(self.config, "bubble_controller_tune_interval_steps", 32) or 32), 1)
-                warmup = max(int(getattr(self.config, "bubble_controller_warmup_steps", 8) or 8), 0)
-                if not active and (step < warmup or step % tune_interval != 0):
-                    return dataloader
-                features = build_lulynx_trainer_runtime_features(self)
-                report = build_bubble_controller_report(
-                    self.config,
-                    runtime_features=features,
-                    closed_loop_state=state,
-                    current_step=step,
-                )
-                self._bubble_closed_loop_last_report = dict(report)
-                closed_loop = report.get("closed_loop", {}) if isinstance(report, dict) else {}
-                executor = dict(closed_loop.get("executor", {}) if isinstance(closed_loop, dict) else {})
-            status = str(executor.get("status") or "")
-            if status == "dataloader_rebuild_epoch_boundary_ready":
-                return self._apply_bubble_dataloader_rebuild_action(
-                    dataloader,
-                    executor=executor,
-                    epoch=epoch,
-                    step=step,
-                    target="next",
-                )
-            if status == "dataloader_rebuild_rollback_epoch_boundary_ready":
-                return self._apply_bubble_dataloader_rebuild_action(
-                    dataloader,
-                    executor=executor,
-                    epoch=epoch,
-                    step=step,
-                    target="rollback",
-                )
-        except Exception as exc:
-            logger.debug("Bubble DataLoader epoch-boundary action skipped: %s", exc)
-        return dataloader
-
-    def _apply_bubble_dataloader_rebuild_action(
-        self,
-        dataloader: Any,
-        *,
-        executor: Dict[str, Any],
-        epoch: int,
-        step: int,
-        target: str,
-    ) -> Any:
-        is_rollback = target == "rollback"
-        runtime_apply = executor.get("runtime_apply", {}) if isinstance(executor, dict) else {}
-        rollback = executor.get("rollback", {}) if isinstance(executor, dict) else {}
-        rebuild_info = rollback.get("dataloader_rebuild") if is_rollback else runtime_apply.get("dataloader_rebuild")
-        if not isinstance(rebuild_info, dict) or not rebuild_info:
-            rebuild_info = executor.get("dataloader_rebuild", {}) if isinstance(executor, dict) else {}
-        plan = rebuild_info.get("runtime_rebuild_plan") if isinstance(rebuild_info, dict) else None
-        if not isinstance(plan, dict) or not plan:
-            return dataloader
-
-        result = rebuild_dataloader_from_plan(dataloader, plan, target=target)
-        if not result.get("ok"):
-            self._mark_bubble_dataloader_rebuild_failed(executor, step=step, result=result, target=target)
-            self._bubble_dataloader_epoch_pending = {}
-            self._log(
-                "[BubbleController] DataLoader "
-                f"{'rollback' if is_rollback else 'rebuild'} failed at epoch {epoch + 1}: "
-                f"{result.get('reason')}"
-            )
-            return dataloader
-
-        rebuilt = self._replace_runtime_dataloader(result.get("dataloader"), epoch=epoch)
-        overlay = rollback.get("restore") if is_rollback else runtime_apply.get("applied_overlay")
-        applied = self._apply_bubble_config_overlay(
-            overlay if isinstance(overlay, dict) else {},
-            reason="rollback DataLoader rebuild" if is_rollback else "auto-apply DataLoader rebuild",
-        )
-        self._refresh_dataloader_rebuild_readiness(rebuilt, epoch=epoch, boundary="epoch_start")
-        if is_rollback:
-            self._bubble_closed_loop_state = mark_closed_loop_action_closed(
-                executor,
-                status="rolled_back",
-                current_step=step,
-                applied_overlay=applied,
-            )
-        else:
-            self._bubble_closed_loop_state = mark_closed_loop_action_applied(
-                executor,
-                current_step=step,
-                applied_overlay=applied,
-            )
-        self._log(
-            "[BubbleController] DataLoader "
-            f"{'rollback' if is_rollback else 'rebuild'} applied at epoch {epoch + 1}: "
-            f"{result.get('rebuilt_descriptor', {})}"
-        )
-        self._bubble_dataloader_epoch_pending = {}
-        return rebuilt
-
-    def _apply_bubble_config_overlay(self, overlay: Dict[str, Any], *, reason: str) -> Dict[str, Any]:
-        applied: Dict[str, Any] = {}
-        for path, value in overlay.items():
-            path_text = str(path or "")
-            if not path_text:
-                continue
-            setattr(self.config, path_text, value)
-            applied[path_text] = value
-        if applied:
-            self._log(f"[BubbleController] {reason}: applied config overlay {applied}")
-        return applied
-
-    def _replace_runtime_dataloader(self, dataloader: Any, *, epoch: int) -> Any:
-        if dataloader is None:
-            return dataloader
-        wrapper = getattr(self, "_ddp_wrapper", None)
-        if wrapper is not None and getattr(self, "_dataset", None) is not None:
-            try:
-                from .distributed import wrap_dataloader_for_ddp
-
-                dataloader = wrap_dataloader_for_ddp(
-                    dataloader,
-                    self._dataset,
-                    shuffle=True,
-                    seed=int(getattr(self.config, "seed", 42) or 42),
-                )
-            except Exception as exc:
-                self._log(f"[BubbleController] DDP dataloader rewrap skipped: {exc}")
-        if wrapper is not None:
-            try:
-                wrapper._dataloader = dataloader
-                wrapper._ddp_sampler = getattr(dataloader, "sampler", None)
-                wrapper.set_epoch(epoch)
-            except Exception as exc:
-                self._log(f"[BubbleController] DDP dataloader pointer refresh skipped: {exc}")
-        self._dataloader = dataloader
-        return dataloader
-
-    def _mark_bubble_dataloader_rebuild_failed(
-        self,
-        executor: Dict[str, Any],
-        *,
-        step: int,
-        result: Dict[str, Any],
-        target: str,
-    ) -> None:
-        if target == "rollback":
-            self._bubble_closed_loop_state = mark_closed_loop_action_closed(
-                executor,
-                status="rollback_failed",
-                current_step=step,
-                applied_overlay={"dataloader_rebuild_error": result.get("reason")},
-            )
-            return
-        pending = mark_closed_loop_action_applied(executor, current_step=step, applied_overlay={})
-        failed_executor = {
-            **executor,
-            "active_action": pending.get("active_action", {}),
-            "action_history": pending.get("action_history", []),
-            "evaluation": {
-                "apply_error": {
-                    "target": target,
-                    "reason": result.get("reason"),
-                    "error": result.get("error"),
-                }
-            },
-        }
-        self._bubble_closed_loop_state = mark_closed_loop_action_closed(
-            failed_executor,
-            status="apply_failed",
-            current_step=step,
-            applied_overlay={"dataloader_rebuild_error": result.get("reason")},
-        )
-
-    def _refresh_dataloader_rebuild_readiness(self, dataloader: Any, *, epoch: int, boundary: str) -> None:
-        try:
-            self._dataloader_rebuild_readiness_profile = build_dataloader_rebuild_readiness_profile(
-                self,
-                dataloader=dataloader,
-                safe_boundary=boundary,
-                current_epoch=epoch,
-            )
-        except Exception as exc:
-            self._dataloader_rebuild_readiness_profile = {
-                "profile": "dataloader_rebuild_readiness_v0",
-                "current_run_rebuild_ready": False,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+    # ------------------------------------------------------------------
+    # Bubble closed-loop methods moved to trainer_bubble_runtime.TrainerBubbleRuntimeMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
+    # ------------------------------------------------------------------
 
     def _check_hot_swap(self, step: int):
         """检查是否有 Pit Stop 策略更新 (Hot Swap)"""
@@ -10950,6 +8177,7 @@ class LulynxTrainer:
         save_every_n_steps = max(int(getattr(self.config, "save_every_n_steps", 0) or 0), 0)
         if save_every_n_steps > 0 and step > 0 and step % save_every_n_steps == 0:
             try:
+                self._sync_turbocore_native_update_state("before_step_save")
                 self._save_model(epoch=epoch + 1, step=step)
             except Exception as e:
                 logger.warning(f"Step checkpoint save failed at step {step}: {e}")
@@ -11078,313 +8306,10 @@ class LulynxTrainer:
         except Exception as e:
             logger.warning(f"Coreset report write failed: {e}")
 
-    def _save_model(self, epoch: int, final: bool = False, step: Optional[int] = None):
-        """保存模型 — only saves on rank 0 when DDP is active."""
-        from .distributed import is_main_process
-        if not is_main_process():
-            return
-        # Support save_to: alternate save directory
-        save_dir = str(getattr(self.config, "save_to", "") or "").strip()
-        output_dir = Path(save_dir) if save_dir else Path(self.config.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        model_ext = self._get_model_save_extension()
-
-        if final:
-            filename = f"{self.config.output_name}{model_ext}"
-        elif step is not None:
-            filename = f"{self.config.output_name}-step{step:06d}{model_ext}"
-        else:
-            filename = f"{FILENAME_MODEL_TEMPLATE.format(output_name=self.config.output_name, epoch=epoch)}{model_ext}"
-
-        save_path = output_dir / filename
-
-        if getattr(self, "_ti_trainer", None) is not None:
-            # Textual Inversion needs token metadata alongside the tensor.
-            # The dedicated TI trainer writes {placeholder_token, num_vectors, embeddings}.
-            ti_path = save_path.with_suffix(EXT_PT)
-            self._ti_trainer.save(str(ti_path))
-            self._log(f"Textual Inversion embedding saved: {ti_path}")
-            if not final and bool(getattr(self.config, "save_state", False)):
-                self._save_state(epoch, step=step)
-            if not final:
-                self._prune_saved_artifacts(
-                    state=False,
-                    mode="step" if step is not None else "epoch",
-                    current_value=int(step if step is not None else epoch),
-                )
-            return
-
-        metadata = None
-        if not bool(getattr(self.config, "no_metadata", False)):
-            comment = str(getattr(self.config, "training_comment", "") or "").strip()
-            metadata = {
-                "ss_base_model_version": str(getattr(self.config.model_arch, "value", self.config.model_arch)),
-                "ss_output_name": str(self.config.output_name),
-                "ss_network_dim": str(self.config.network_dim),
-                "ss_network_alpha": str(self.config.network_alpha),
-                "ss_learning_rate": str(self.config.learning_rate),
-                "ss_training_comment": comment or "Trained with Lulynx Native Trainer",
-            }
-            if step is not None:
-                metadata["ss_training_step"] = str(step)
-            if bool(getattr(self.config, "rs_lora_enabled", False)):
-                metadata["ss_rs_lora"] = "true"
-                metadata["ss_scaling_strategy"] = "alpha_over_sqrt_rank"
-
-        optimizer_for_save = getattr(getattr(self, "training_loop", None), "optimizer", None)
-        optimizer_eval_swapped = False
-        if optimizer_for_save is not None and hasattr(optimizer_for_save, "eval") and hasattr(optimizer_for_save, "train"):
-            try:
-                optimizer_for_save.eval()
-                optimizer_eval_swapped = True
-            except Exception:
-                optimizer_eval_swapped = False
-        try:
-            if getattr(self.config, "semantic_tuner_enabled", False):
-                # Prepare metadata for V3.1 Loader
-                ctx = self.te_manager.get_semantic_context()
-                mode = ctx.get("mode", "hybrid") if ctx else "hybrid"
-                if metadata is not None:
-                    metadata["architecture_mode"] = mode
-                    metadata["neuro_link_version"] = "v3.1.0"
-                self._save_state_dict_to_path(self._build_semantic_tuner_state_dict(), save_path, metadata)
-            else:
-                adapter_state = self._get_current_adapter_state_dict(use_ema=bool(self._ema_tracker))
-                if not adapter_state:
-                    raise RuntimeError("No adapter state available to save.")
-                adapter_state, metadata = self._prepare_adapter_init_export_for_save(adapter_state, metadata)
-                adapter_state, metadata = self._prepare_anima_lokr_export_for_save(adapter_state, metadata)
-                adapter_state, metadata = self._prepare_thin_svd_export_for_save(adapter_state, metadata)
-                self._save_state_dict_to_path(adapter_state, save_path, metadata)
-        finally:
-            if optimizer_eval_swapped:
-                try:
-                    optimizer_for_save.train()
-                except Exception:
-                    pass
-
-        self._log(f"Model saved: {save_path}")
-        if final:
-            try:
-                mn = self._run_manifest_extra().get("mn_lora", {})
-                gsp = mn.get("gsp", {}) if isinstance(mn, dict) else {}
-                if gsp:
-                    self._log(
-                        "MN-LoRA telemetry: "
-                        f"mode={gsp.get('mode', '')}, "
-                        f"layers={gsp.get('layer_stats_count', 0)}, "
-                        f"avg_residual={float(gsp.get('avg_residual_ratio', 0.0) or 0.0):.4f}, "
-                        f"precond_ratio={float(gsp.get('precondition_norm_ratio_avg', 1.0) or 1.0):.4f}, "
-                        f"clip_rate={float(gsp.get('precondition_clip_rate', 0.0) or 0.0):.4f}"
-                    )
-            except Exception:
-                pass
-        self._emit_runtime_event(
-            {
-                "event_type": "checkpoint",
-                "step": int(step or 0),
-                "epoch": int(epoch or 0),
-                "severity": "info",
-                "summary": f"saved: {save_path}",
-                "data": {"path": str(save_path), "final": bool(final)},
-            }
-        )
-        self._write_run_manifest(
-            "checkpoint_saved" if not final else "final_checkpoint_saved",
-            epoch=int(epoch or 0),
-            checkpoint_path=str(save_path),
-        )
-        if not final:
-            self._prune_saved_artifacts(
-                state=False,
-                mode="step" if step is not None else "epoch",
-                current_value=int(step if step is not None else epoch),
-            )
-
-        if getattr(self.config, "save_state_to_huggingface", False):
-            self._log("save_state_to_huggingface is requested but not implemented in the native trainer yet; skipping upload.")
-
-        # ── Merged Checkpoint Export (#121) ──
-        # When anima_merge_export or merge_export is enabled, produce a full
-        # merged checkpoint (base + adapter weights baked in) alongside the
-        # normal adapter-only save above.
-        if bool(getattr(self.config, "anima_merge_export", False) or getattr(self.config, "merge_export", False)):
-            self._export_merged_checkpoint(save_dir=output_dir, epoch=epoch, step=step, final=final)
-
-        # Save State (Optimizer/Scheduler)
-        if not final and bool(getattr(self.config, "save_state", False)):
-            self._save_state(epoch, step=step)
-
     # ------------------------------------------------------------------
-    # Merged Checkpoint Export (#121)
+    # R3 save/load methods moved to trainer_artifact_io.TrainerArtifactIoMixin
+    # (verbatim; resolved via MRO — same self, same call sites)
     # ------------------------------------------------------------------
-
-    def _export_merged_checkpoint(
-        self,
-        save_dir: Path,
-        epoch: int,
-        step: Optional[int] = None,
-        final: bool = False,
-    ):
-        """Export a full merged checkpoint (base weights + adapter deltas).
-
-        Uses a deep-copy so the training model is not mutated.
-        """
-        from .distributed import is_main_process
-        if not is_main_process():
-            return
-
-        from .merge_export import export_merged_model
-
-        self._log("Exporting merged checkpoint (base + adapter) …")
-
-        # Determine which sub-model to merge into.
-        # For most archs the unet/transformer is the primary target.
-        target = getattr(self.model, "unet", self.model) if self.model is not None else None
-        if target is None:
-            self._log("merge_export: no target model available, skipping")
-            return
-
-        # Build output path
-        model_ext = self._get_model_save_extension()
-        if final:
-            merged_filename = f"{self.config.output_name}-merged{model_ext}"
-        elif step is not None:
-            merged_filename = f"{self.config.output_name}-merged-step{step:06d}{model_ext}"
-        else:
-            merged_filename = f"{FILENAME_MODEL_TEMPLATE.format(output_name=self.config.output_name, epoch=epoch)}-merged{model_ext}"
-
-        merged_path = save_dir / merged_filename
-
-        # Determine which injector to use
-        lora_injector = None
-        lycoris_injector = None
-        from .lycoris_layers import LyCORISInjector
-        if isinstance(self.lora_injector, LyCORISInjector):
-            lycoris_injector = self.lora_injector
-        elif self.lora_injector is not None and hasattr(self.lora_injector, "injected_layers"):
-            lora_injector = self.lora_injector
-
-        save_precision = str(getattr(self.config, "save_precision", "bf16"))
-
-        try:
-            result_path = export_merged_model(
-                model=target,
-                output_path=str(merged_path),
-                save_precision=save_precision,
-                lora_injector=lora_injector,
-                lycoris_injector=lycoris_injector,
-            )
-            self._log(f"Merged checkpoint exported: {result_path}")
-        except Exception as e:
-            self._log(f"Merged checkpoint export failed: {e}")
-
-    def _save_state(self, epoch: int, step: Optional[int] = None, final: bool = False):
-        """保存训练状态 (Optimizer, Scheduler, RNG) — only saves on rank 0 when DDP is active."""
-        from .distributed import is_main_process
-        if not is_main_process():
-            return
-        output_dir = Path(self.config.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        if final:
-            state_filename = f"{self.config.output_name}-last-state{EXT_PT}"
-        elif step is not None:
-            state_filename = f"{self.config.output_name}-step{int(step):06d}-state{EXT_PT}"
-        else:
-            # Naming convention: output_name-000001-state.pt
-            state_filename = f"{FILENAME_STATE_TEMPLATE.format(output_name=self.config.output_name, epoch=epoch)}{EXT_PT}"
-        state_path = output_dir / state_filename
-
-        state = {
-            "epoch": epoch,
-            "global_step": self.training_loop.global_step if self.training_loop else 0,
-            "optimizer_state_dict": self.training_loop.optimizer.state_dict() if self.training_loop and self.training_loop.optimizer else {},
-            "scheduler_state_dict": self.training_loop.lr_scheduler.state_dict() if self.training_loop and self.training_loop.lr_scheduler else {},
-            "rng_state": torch.get_rng_state(),
-            "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-            "python_rng_state": random.getstate(),
-            "numpy_rng_state": np.random.get_state(),
-            "ema_state_dict": self._ema_tracker.state_dict() if self._ema_tracker else None,
-            "turbocore_update_state": self.training_loop.get_turbocore_update_checkpoint_state()
-            if self.training_loop and hasattr(self.training_loop, "get_turbocore_update_checkpoint_state")
-            else None,
-            "resource_manager_state": {
-                "current_batch_size": self._resource_manager.current_batch_size,
-                "current_accumulation": self._resource_manager.current_accumulation,
-            } if self._resource_manager else None,
-        }
-
-        try:
-            torch.save(state, state_path)
-            self._log(f"State saved: {state_path}")
-            self._write_run_manifest(
-                "state_saved" if not final else "final_state_saved",
-                epoch=int(epoch or 0),
-                state_path=str(state_path),
-            )
-            if not final:
-                self._prune_saved_artifacts(
-                    state=True,
-                    mode="step" if step is not None else "epoch",
-                    current_value=int(step if step is not None else epoch),
-                )
-        except Exception as e:
-            self._log(f"Failed to save state: {e}")
-
-    def _load_state(self, resume_path: str) -> Optional[Dict]:
-        """加载训练状态"""
-        path = Path(resume_path)
-        state_path = None
-
-        if path.is_file():
-            # Heuristic to find state file
-            stem = path.stem # e.g. "my_lora-000001"
-            parent = path.parent
-
-            candidates = []
-
-            # Pattern 0: final "last state" artifact
-            candidates.append(parent / f"{self.config.output_name}-last-state.pt")
-
-            # Pattern 1: append "-state.pt" (Matches new convention: my_lora-000001-state.pt)
-            candidates.append(parent / (stem + "-state.pt"))
-
-            # Pattern 1b: step save companion (my_lora-step000123.safetensors -> my_lora-step000123-state.pt)
-            candidates.append(parent / (stem + "-state.pt"))
-
-            # Pattern 2: Legacy _state_epochXX (Backward compatibility)
-            if "_epoch" in stem:
-                 candidates.append(parent / (stem.replace("_epoch", "_state_epoch") + ".pt"))
-
-            # Pattern 3: direct match, but only for explicit state files
-            if path.suffix == ".pt" and "state" in stem:
-                 candidates.append(path)
-
-            for c in candidates:
-                if c.exists():
-                    state_path = c
-                    break
-
-        if not state_path or not state_path.exists():
-            self._log(f"No state file found for resume path: {resume_path}. Resuming weights only.")
-            return None
-
-        self._log(f"Loading state from {state_path}...")
-        try:
-            state = safe_torch_load(state_path, map_location=self.device)
-            if "rng_state" in state:
-                torch.set_rng_state(state["rng_state"])
-            if "cuda_rng_state" in state and torch.cuda.is_available():
-                torch.cuda.set_rng_state(state["cuda_rng_state"])
-            if "python_rng_state" in state:
-                random.setstate(state["python_rng_state"])
-            if "numpy_rng_state" in state:
-                np.random.set_state(state["numpy_rng_state"])
-            return state
-        except Exception as e:
-            self._log(f"Failed to load state: {e}")
-            return None
 
     def stop(self):
         """停止训练"""
@@ -11436,5 +8361,3 @@ class LulynxTrainer:
             self._initialize_ema_tracker()
 
         self._log(f"Optimizer rebuilt with {len(trainable_params)} parameter groups.")
-
-

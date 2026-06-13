@@ -61,6 +61,7 @@ def run_lulynx_noise_timestep_stage_handler(
     anima_discrete_flow_shift: float,
     anima_weighting_scheme: str,
     anima_model_prediction_type: str,
+    anima_faithful_forward: bool = False,
     sdxl_timestep_sampling: str,
     sdxl_sigmoid_scale: float,
     sdxl_flow_shift: float,
@@ -148,6 +149,7 @@ def run_lulynx_noise_timestep_stage_handler(
         anima_discrete_flow_shift=anima_discrete_flow_shift,
         anima_weighting_scheme=anima_weighting_scheme,
         anima_model_prediction_type=anima_model_prediction_type,
+        anima_faithful_forward=anima_faithful_forward,
         sdxl_timestep_sampling=sdxl_timestep_sampling,
         sdxl_sigmoid_scale=sdxl_sigmoid_scale,
         sdxl_flow_shift=sdxl_flow_shift,
@@ -262,7 +264,12 @@ def _build_noisy_inputs(**kwargs: Any) -> tuple[Any, Any, Any, Any, str]:
 
 
 def _build_anima_noisy_inputs(**kwargs: Any) -> tuple[Any, Any, Any]:
-    from .anima_flow import AnimaFlowConfig, build_anima_flow_inputs, sample_anima_sigmas
+    from .anima_flow import (
+        ANIMA_DEFAULT_PATCH_SIZE,
+        AnimaFlowConfig,
+        build_anima_flow_inputs,
+        sample_anima_sigmas,
+    )
 
     latents = kwargs["latents"]
     noise = kwargs["noise"]
@@ -274,13 +281,29 @@ def _build_anima_noisy_inputs(**kwargs: Any) -> tuple[Any, Any, Any]:
         logit_mean=kwargs["flow_logit_mean"],
         logit_std=kwargs["flow_logit_std"],
     )
-    sigmas = sample_anima_sigmas(kwargs["batch_size"], device=kwargs["device"], dtype=latents.dtype, config=cfg)
+    # flux_shift derives the shift from this batch's visual patch-token count
+    # (resolution-dependent, Flux/SD3.5-style); other modes ignore it.
+    image_seq_len = (int(latents.shape[-2]) // ANIMA_DEFAULT_PATCH_SIZE) * (
+        int(latents.shape[-1]) // ANIMA_DEFAULT_PATCH_SIZE
+    )
+    sigmas = sample_anima_sigmas(
+        kwargs["batch_size"],
+        device=kwargs["device"],
+        dtype=latents.dtype,
+        config=cfg,
+        image_seq_len=image_seq_len,
+    )
     noise = _maybe_assign_noise(latents, noise, **_noise_assignment_options(kwargs))
+    # #147 fix ①: the faithful native DiT t_embedder consumes t=sigma in [0,1]
+    # (rectified flow), not sigma*1000. num_train_timesteps only scales the
+    # returned timesteps (noisy/target are sigma-only, L117/L120-125), so 1 vs
+    # 1000 is a pure timestep-scale switch — default keeps the legacy x1000.
+    num_train_timesteps = 1 if kwargs.get("anima_faithful_forward") else 1000
     return build_anima_flow_inputs(
         latents,
         noise,
         sigmas,
-        num_train_timesteps=1000,
+        num_train_timesteps=num_train_timesteps,
         model_prediction_type=kwargs["anima_model_prediction_type"] or "velocity",
     )
 

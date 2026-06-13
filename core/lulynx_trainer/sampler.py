@@ -24,6 +24,21 @@ class PreviewState(enum.Enum):
     REAL_PREVIEW = "real_preview"
 
 
+def _resolve_anima_reload_paths(trainer) -> Optional[Dict[str, str]]:
+    """VAE + Qwen3 single-file paths for native-Anima preview reload, or None.
+
+    Cache-first anima training releases the VAE/text encoders after building the
+    latent cache; these config paths let the preview re-materialise them while
+    the live LoRA-injected DiT stays resident as ``model.unet``.
+    """
+    cfg = getattr(trainer, "config", None)
+    vae_path = str(getattr(cfg, "vae_path", "") or "").strip()
+    qwen3_path = str(getattr(cfg, "anima_qwen3_path", "") or "").strip()
+    if vae_path and qwen3_path:
+        return {"vae_path": vae_path, "qwen3_path": qwen3_path}
+    return None
+
+
 def get_preview_state(trainer) -> PreviewState:
     """Determine the current preview capability for a trainer."""
     if not trainer.model:
@@ -49,6 +64,16 @@ def get_preview_state(trainer) -> PreviewState:
     tok = getattr(trainer.model, "tokenizer_1", None)
 
     if unet is not None and vae is not None and te is not None and tok is not None:
+        return PreviewState.REAL_PREVIEW
+
+    # Native-Anima (Qwen3 + qwen-image VAE) renders without CLIP. Cache-first
+    # releases vae/te, but the live LoRA-injected DiT stays as unet and vae+qwen3
+    # can be reloaded from disk — so this is a real preview, not adapter-inspect.
+    if (
+        unet is not None
+        and str(model_arch or "").strip().lower() == "anima"
+        and _resolve_anima_reload_paths(trainer) is not None
+    ):
         return PreviewState.REAL_PREVIEW
 
     if unet is not None:
@@ -101,10 +126,10 @@ def get_adapter_metadata(trainer) -> Optional[Dict[str, Any]]:
 class TrainingSampler:
     """
     训练中采样器
-    
+
     在训练过程中临时应用 LoRA 权重生成样本图像
     """
-    
+
     def __init__(
         self,
         unet,
@@ -130,12 +155,14 @@ class TrainingSampler:
         dit_block_residency_min_params: int = 0,
         dit_block_prefetch_enabled: bool = False,
         dit_block_prefetch_depth: int = 1,
+        dit_block_prefetch_mode: str = "original",
         sample_smc_cfg: bool = False,
         sample_smc_cfg_lambda: float = 5.0,
         sample_smc_cfg_alpha: float = 0.2,
         sample_tgate_probe: bool = False,
         sample_tgate_start_step: int = 0,
         sample_tgate_min_block: int = 0,
+        sample_tgate_skip: bool = False,
         sample_spectrum_probe: bool = False,
         sample_spectrum_window_size: float = 2.0,
         sample_spectrum_flex_window: float = 0.25,
@@ -152,6 +179,7 @@ class TrainingSampler:
         sample_cns_gamma_path: str = "",
         sample_cns_strength: float = 1.0,
         sample_cns_eta: float = 1.0,
+        native_anima_reload: Optional[Dict[str, Any]] = None,
     ):
         self.unet = unet
         self.text_encoder_1 = text_encoder_1
@@ -175,12 +203,14 @@ class TrainingSampler:
         self.dit_block_residency_min_params = max(int(dit_block_residency_min_params or 0), 0)
         self.dit_block_prefetch_enabled = bool(dit_block_prefetch_enabled)
         self.dit_block_prefetch_depth = max(int(dit_block_prefetch_depth or 0), 0)
+        self.dit_block_prefetch_mode = str(dit_block_prefetch_mode or "original").strip().lower()
         self.sample_smc_cfg = bool(sample_smc_cfg)
         self.sample_smc_cfg_lambda = float(5.0 if sample_smc_cfg_lambda is None else sample_smc_cfg_lambda)
         self.sample_smc_cfg_alpha = float(0.2 if sample_smc_cfg_alpha is None else sample_smc_cfg_alpha)
         self.sample_tgate_probe = bool(sample_tgate_probe)
         self.sample_tgate_start_step = max(int(sample_tgate_start_step or 0), 0)
         self.sample_tgate_min_block = max(int(sample_tgate_min_block or 0), 0)
+        self.sample_tgate_skip = bool(sample_tgate_skip)
         self.sample_spectrum_probe = bool(sample_spectrum_probe)
         self.sample_spectrum_window_size = max(float(2.0 if sample_spectrum_window_size is None else sample_spectrum_window_size), 1.0)
         self.sample_spectrum_flex_window = max(float(0.0 if sample_spectrum_flex_window is None else sample_spectrum_flex_window), 0.0)
@@ -202,12 +232,18 @@ class TrainingSampler:
         self.sample_cns_strength = max(0.0, min(1.0, float(1.0 if sample_cns_strength is None else sample_cns_strength)))
         self.sample_cns_eta = max(0.0, float(1.0 if sample_cns_eta is None else sample_cns_eta))
         self._micro_vae_decoder = None
+        # Native-Anima preview: cache-first released vae/te; reload vae+qwen3 once
+        # on demand (the DiT stays resident as self.unet). None for non-native.
+        self.native_anima_reload = native_anima_reload
+        self._native_qwen3_encoder = (native_anima_reload or {}).get("qwen3_encoder")
+        self._native_qwen3_tokenizer = (native_anima_reload or {}).get("qwen3_tokenizer")
+        self._native_ready = False
 
         self._family: ModelFamily = get_model_family(model_arch)
 
         # Pipeline (延迟创建)
         self._pipeline = None
-    
+
     def _get_pipeline(self):
         """获取或创建 Pipeline"""
         if self._pipeline is not None:
@@ -271,7 +307,50 @@ class TrainingSampler:
             logger.warning(f"Failed to switch sampler to {self.sampler_name}: {exc}")
 
         return scheduler
-    
+
+    def _prepare_native_anima_embeds(self, prompt: str, negative_prompt: str, guidance_scale: float) -> Dict[str, Any]:
+        """Native-Anima: lazily reload vae+qwen3 (once) and encode prompt_embeds.
+
+        Returns ``{}`` for non-native paths so the CLIP route inside the sampler
+        is untouched. For native the live LoRA-injected DiT stays as ``self.unet``;
+        only the cache-first-released vae+qwen3 are reloaded, then cached on self.
+        """
+        if not getattr(self, "native_anima_reload", None):
+            return {}
+        if not self._native_ready:
+            reload = self.native_anima_reload or {}
+            enc, tok, vae = self._native_qwen3_encoder, self._native_qwen3_tokenizer, self.vae
+            if vae is None or enc is None or tok is None:
+                from .anima_native_inference import reload_vae_and_qwen3
+
+                r_vae, r_enc, r_tok = reload_vae_and_qwen3(
+                    reload.get("vae_path", ""), reload.get("qwen3_path", ""),
+                    device=self.device, dtype=self.dtype,
+                )
+                vae = vae if vae is not None else r_vae
+                enc = enc if enc is not None else r_enc
+                tok = tok if tok is not None else r_tok
+            self.vae, self._native_qwen3_encoder, self._native_qwen3_tokenizer = vae, enc, tok
+            self._native_ready = True
+            logger.info(
+                "Native-Anima preview components ready (vae=%s qwen3=%s)",
+                type(vae).__name__, type(enc).__name__,
+            )
+        from .anima_native_inference import encode_qwen3_hidden
+
+        embeds: Dict[str, Any] = {
+            "prompt_embeds": encode_qwen3_hidden(
+                self._native_qwen3_encoder, self._native_qwen3_tokenizer, prompt,
+                device=self.device, dtype=self.dtype,
+            )
+        }
+        if guidance_scale > 1.0:
+            embeds["negative_prompt_embeds"] = encode_qwen3_hidden(
+                self._native_qwen3_encoder, self._native_qwen3_tokenizer, negative_prompt or "",
+                device=self.device, dtype=self.dtype,
+            )
+        return embeds
+
     @torch.no_grad()
     def _generate_anima(
         self,
@@ -286,6 +365,9 @@ class TrainingSampler:
         """Generate preview using Anima flow-matching sampler."""
         # Choose between deterministic ODE (Euler) and stochastic SDE (ER-SDE) based on user preference
         use_sde = (self.sample_algorithm == "sde")
+        # Native-Anima: encode Qwen3 prompt_embeds (and reload vae+qwen3 if the
+        # cache-first run released them). Empty dict for CLIP-based anima.
+        native_kwargs = self._prepare_native_anima_embeds(prompt, negative_prompt, guidance_scale)
 
         if use_sde:
             # Use ER-SDE sampler (optionally with CNS colored noise)
@@ -312,7 +394,7 @@ class TrainingSampler:
                 smc_cfg=self.sample_smc_cfg,
                 smc_cfg_lambda=self.sample_smc_cfg_lambda,
                 smc_cfg_alpha=self.sample_smc_cfg_alpha,
-                tgate_probe=self.sample_tgate_probe,
+                tgate_probe=self.sample_tgate_probe or self.sample_tgate_skip,
                 tgate_start_step=self.sample_tgate_start_step,
                 tgate_min_block=self.sample_tgate_min_block,
                 spectrum_probe=self.sample_spectrum_probe,
@@ -323,6 +405,7 @@ class TrainingSampler:
                 smoothcache_probe=self.sample_smoothcache_probe,
                 smoothcache_error_threshold=self.sample_smoothcache_error_threshold,
                 smoothcache_warmup_steps=self.sample_smoothcache_warmup_steps,
+                **native_kwargs,
             )
         else:
             # Use deterministic ODE sampler (Euler/DPM-Solver)
@@ -348,7 +431,7 @@ class TrainingSampler:
                 smc_cfg=self.sample_smc_cfg,
                 smc_cfg_lambda=self.sample_smc_cfg_lambda,
                 smc_cfg_alpha=self.sample_smc_cfg_alpha,
-                tgate_probe=self.sample_tgate_probe,
+                tgate_probe=self.sample_tgate_probe or self.sample_tgate_skip,
                 tgate_start_step=self.sample_tgate_start_step,
                 tgate_min_block=self.sample_tgate_min_block,
                 spectrum_probe=self.sample_spectrum_probe,
@@ -359,6 +442,7 @@ class TrainingSampler:
                 smoothcache_probe=self.sample_smoothcache_probe,
                 smoothcache_error_threshold=self.sample_smoothcache_error_threshold,
                 smoothcache_warmup_steps=self.sample_smoothcache_warmup_steps,
+                **native_kwargs,
             )
 
     @torch.no_grad()
@@ -424,7 +508,7 @@ class TrainingSampler:
                 smc_cfg=self.sample_smc_cfg,
                 smc_cfg_lambda=self.sample_smc_cfg_lambda,
                 smc_cfg_alpha=self.sample_smc_cfg_alpha,
-                tgate_probe=self.sample_tgate_probe,
+                tgate_probe=self.sample_tgate_probe or self.sample_tgate_skip,
                 tgate_start_step=self.sample_tgate_start_step,
                 tgate_min_block=self.sample_tgate_min_block,
                 spectrum_probe=self.sample_spectrum_probe,
@@ -476,17 +560,21 @@ class TrainingSampler:
 
         # Opt-in unified cache execution seam (default off -> bitwise parity).
         from .unified_cache_seam import build_cache_seam, cache_seam_context
+        from .tgate import tgate_execution_context
         _seam_backend = str(getattr(self, "sample_cache_seam_backend", "none") or "none")
         cache_seam = build_cache_seam(
             enabled=_seam_backend.lower() not in {"", "none"},
             backend=_seam_backend,
             spectrum_window_size=int(getattr(self, "sample_cache_seam_window_size", 3) or 3),
         )
+        # Opt-in T-GATE real cross-attention skip (default off -> bitwise parity).
+        # ContextVar-scoped, propagates into the sampler denoise loop like the seam.
+        _tgate_skip = bool(getattr(self, "sample_tgate_skip", False))
 
         # Flow-matching DiT pipelines
         if pipeline == "anima_flow":
             try:
-                with cache_seam_context(cache_seam):
+                with cache_seam_context(cache_seam), tgate_execution_context(enabled=_tgate_skip):
                     return self._generate_anima(
                         prompt=prompt, negative_prompt=negative_prompt,
                         num_inference_steps=num_inference_steps, guidance_scale=guidance_scale,
@@ -498,7 +586,7 @@ class TrainingSampler:
                     torch.cuda.empty_cache()
         if pipeline == "newbie_flow":
             try:
-                with cache_seam_context(cache_seam):
+                with cache_seam_context(cache_seam), tgate_execution_context(enabled=_tgate_skip):
                     return self._generate_newbie(
                         prompt=prompt, negative_prompt=negative_prompt,
                         num_inference_steps=num_inference_steps, guidance_scale=guidance_scale,
@@ -575,6 +663,7 @@ class TrainingSampler:
                     dtype=self.dtype,
                     prefetch_enabled=self.dit_block_prefetch_enabled,
                     prefetch_depth=self.dit_block_prefetch_depth,
+                    prefetch_mode=self.dit_block_prefetch_mode,
                 )
                 return
             if pipeline == "newbie":
@@ -591,7 +680,7 @@ class TrainingSampler:
                 )
         except Exception as exc:
             logger.warning("Failed to restore %s block residency after preview: %s", pipeline, exc)
-    
+
     def generate_grid(
         self,
         prompts: List[str],
@@ -604,16 +693,16 @@ class TrainingSampler:
     ) -> Optional[Image.Image]:
         """
         生成图像网格
-        
+
         Args:
             prompts: 提示词列表
             其他参数同 generate
-        
+
         Returns:
             合并后的 PIL.Image
         """
         images = []
-        
+
         for i, prompt in enumerate(prompts[:4]):  # 最多 4 个
             image = self.generate(
                 prompt=prompt,
@@ -626,29 +715,29 @@ class TrainingSampler:
             )
             if image:
                 images.append(image)
-        
+
         if not images:
             return None
-        
+
         # 创建 2x2 网格
         return self._create_grid(images, cols=2)
-    
+
     def _create_grid(self, images: List[Image.Image], cols: int = 2) -> Image.Image:
         """创建图像网格"""
         if not images:
             return None
-        
+
         n = len(images)
         rows = (n + cols - 1) // cols
-        
+
         w, h = images[0].size
         grid = Image.new("RGB", (cols * w, rows * h), (255, 255, 255))
-        
+
         for i, img in enumerate(images):
             x = (i % cols) * w
             y = (i // cols) * h
             grid.paste(img, (x, y))
-        
+
         return grid
 
     def load_micro_decoder(self, model_type: str = "auto"):
@@ -715,6 +804,7 @@ def create_sampler_from_trainer(trainer) -> Optional[TrainingSampler]:
     # Guard: cache-first / native modes release TE/VAE after cache build.
     # Without these components, the sampler cannot generate images.
     pipeline_type = family.default_sampler_pipeline
+    native_anima_reload = None
     if pipeline_type in ("anima", "newbie"):
         missing = []
         if unet is None:
@@ -726,12 +816,27 @@ def create_sampler_from_trainer(trainer) -> Optional[TrainingSampler]:
         if tokenizer_1 is None:
             missing.append("tokenizer")
         if missing:
-            logger.info(
-                "Preview sampling disabled for %s: %s unavailable "
-                "(cache-first training releases these components after cache build).",
-                model_arch, ", ".join(missing),
-            )
-            return None
+            # Native-Anima can reload vae+qwen3 and render via Qwen3 (no CLIP) as
+            # long as the DiT is resident; other missing-component cases bail.
+            reload_paths = _resolve_anima_reload_paths(trainer) if pipeline_type == "anima" else None
+            if pipeline_type == "anima" and unet is not None and reload_paths is not None:
+                native_anima_reload = {
+                    **reload_paths,
+                    "qwen3_encoder": getattr(trainer.model, "anima_qwen3_encoder", None),
+                    "qwen3_tokenizer": getattr(trainer.model, "anima_qwen3_tokenizer", None),
+                }
+                logger.info(
+                    "Native-Anima preview: will reload vae+qwen3 from disk "
+                    "(cache-first released %s); DiT stays resident.",
+                    ", ".join(missing),
+                )
+            else:
+                logger.info(
+                    "Preview sampling disabled for %s: %s unavailable "
+                    "(cache-first training releases these components after cache build).",
+                    model_arch, ", ".join(missing),
+                )
+                return None
 
     # Read sampling algorithm configuration from UI
     sample_algorithm = str(getattr(trainer.config, "sample_algorithm", "sde") or "sde").strip().lower()
@@ -763,6 +868,7 @@ def create_sampler_from_trainer(trainer) -> Optional[TrainingSampler]:
         device=trainer.device,
         dtype=trainer.dtype,
         model_arch=model_arch,
+        native_anima_reload=native_anima_reload,
         sample_width=int(getattr(trainer.config, "sample_width", 0) or 0),
         sample_height=int(getattr(trainer.config, "sample_height", 0) or 0),
         sample_seed=int(getattr(trainer.config, "sample_seed", 0) or 0),
@@ -798,6 +904,11 @@ def create_sampler_from_trainer(trainer) -> Optional[TrainingSampler]:
             if family.default_sampler_pipeline == "newbie"
             else 0
         ),
+        dit_block_prefetch_mode=(
+            str(getattr(trainer.config, "anima_block_prefetch_mode", "original") or "original")
+            if family.default_sampler_pipeline == "anima"
+            else "original"
+        ),
         sample_algorithm=sample_algorithm,
         sample_sde_eta=sample_sde_eta,
         sample_smc_cfg=bool(getattr(trainer.config, "sample_smc_cfg", False)),
@@ -806,6 +917,7 @@ def create_sampler_from_trainer(trainer) -> Optional[TrainingSampler]:
         sample_tgate_probe=bool(getattr(trainer.config, "sample_tgate_probe", False)),
         sample_tgate_start_step=int(getattr(trainer.config, "sample_tgate_start_step", 0) or 0),
         sample_tgate_min_block=int(getattr(trainer.config, "sample_tgate_min_block", 0) or 0),
+        sample_tgate_skip=bool(getattr(trainer.config, "sample_tgate_skip", False)),
         sample_spectrum_probe=bool(getattr(trainer.config, "sample_spectrum_probe", False)) or _accel.spectrum_probe,
         sample_spectrum_window_size=float(getattr(trainer.config, "sample_spectrum_window_size", 2.0)),
         sample_spectrum_flex_window=float(getattr(trainer.config, "sample_spectrum_flex_window", 0.25)),

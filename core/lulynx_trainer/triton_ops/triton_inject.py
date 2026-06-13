@@ -457,3 +457,17 @@ def count_adaln_eligible(*roots: nn.Module) -> int:
             if _is_adaln_block(module):
                 count += 1
     return count
+
+
+# ---------------------------------------------------------------------------
+# Adapter-variant injections (ChimeraHydra, DoRA) live in a companion module to
+# keep this file focused; re-exported here so callers use one injection surface.
+# ---------------------------------------------------------------------------
+from .triton_inject_adapters import (  # noqa: E402
+    apply_chimera,
+    apply_dora,
+    count_chimera_eligible,
+    count_dora_eligible,
+    revert_chimera,
+    revert_dora,
+)

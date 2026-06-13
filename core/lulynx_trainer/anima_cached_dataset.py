@@ -228,6 +228,7 @@ class AnimaCachedDataset(Dataset):
         concept_geometry_total_epochs: int = 1,
         concept_geometry_total_steps: int = 0,
         benchmark_data_wait_stall_ms: float = 0.0,
+        easycontrol_v2_spec: Any = None,
         **legacy_geometry_kwargs: Any,
     ):
         """Initialize Anima cached dataset.
@@ -304,6 +305,11 @@ class AnimaCachedDataset(Dataset):
             sidecar_suffix=str(lossless_cache_sidecar_suffix or ".lxcs"),
         )
         self.lossless_cache_sidecar_last_report: Dict[str, Any] = {}
+        # EasyControl v2 (colorize) condition sidecars: default-off. When a task
+        # spec is provided, __getitem__ loads the per-target cond latent produced
+        # by colorize_cond_cache so the two-stream adapter consumes a REAL control
+        # condition (not the cache-first derived-from-target fallback).
+        self.easycontrol_v2_spec = easycontrol_v2_spec
         self._current_epoch = 0
         self._current_step = 0
         self.concept_geometry_enabled = bool(concept_geometry_enabled)
@@ -413,7 +419,30 @@ class AnimaCachedDataset(Dataset):
                 item["loss_mask"] = loss_mask
         if self.schema.require_loss_mask and "loss_mask" not in item:
             raise ValueError(f"Anima cache missing loss_mask: {sample.latent_path}")
+        if self.easycontrol_v2_spec is not None:
+            cond = self._load_easycontrol_v2_cond(sample.stem)
+            if cond is not None:
+                item["cond_latents"] = cond
+                item["control_latents"] = cond
         return item
+
+    def _load_easycontrol_v2_cond(self, stem: str) -> Optional[torch.Tensor]:
+        """Load the colorize cond-latent sidecar for ``stem`` (real control
+        condition). Returns None when no spec / no sidecar — the training step
+        then falls back to the cache-first derived reference."""
+        try:
+            from .easycontrol_v2_contract import sidecar_plan_for_target
+            from .dataset_loader import _load_sidecar_tensor
+        except Exception:
+            return None
+        try:
+            plan = sidecar_plan_for_target(stem, self.easycontrol_v2_spec)
+        except Exception:
+            return None
+        if not plan.cond_latent_path:
+            return None
+        cond = _load_sidecar_tensor(plan.cond_latent_path)
+        return cond if torch.is_tensor(cond) else None
 
     def _discover_samples(self) -> List[AnimaCachedSample]:
         native = _native_cache_index_api()
@@ -1501,6 +1530,17 @@ def anima_cached_collate(
                     q3_mask_batch[idx, :n] = True
         result["qwen3_hidden_states"] = q3_batch
         result["qwen3_attention_mask"] = q3_mask_batch
+
+    # EasyControl v2 (colorize) condition latents: stack when every sample carries
+    # one of matching shape (batch_size=1 or equal-shape buckets). Mixed/absent ->
+    # omit so the training step uses its derived-reference fallback.
+    cond_items = [item.get("cond_latents") for item in batch]
+    if all(torch.is_tensor(c) for c in cond_items):
+        cond_shapes = {tuple(c.shape) for c in cond_items}  # type: ignore[union-attr]
+        if len(cond_shapes) == 1:
+            cond_batch = torch.stack(cond_items)  # type: ignore[arg-type]
+            result["cond_latents"] = cond_batch
+            result["control_latents"] = cond_batch
 
     return result
 

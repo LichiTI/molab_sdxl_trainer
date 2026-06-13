@@ -45,6 +45,9 @@ def run_smoke() -> dict[str, Any]:
     )
     assert ready["ready_for_runtime_stream_guard"] is True, ready
     assert ready["stream_lifetime_bound"] is True, ready
+    assert ready["default_behavior_changed"] is False, ready
+    assert ready["requires_explicit_opt_in"] is True, ready
+    assert ready["training_path_enabled"] is False, ready
     assert ready["blocked_reasons"] == [], ready
 
     request = build_single_step_lifetime_lease_request(
@@ -61,6 +64,15 @@ def run_smoke() -> dict[str, Any]:
         "missing_ready": missing["ready_for_runtime_stream_guard"],
         "wrong_policy_ready": wrong_policy["ready_for_runtime_stream_guard"],
         "ready": ready["ready_for_runtime_stream_guard"],
+        "summary": {
+            "stream_lifetime_lease_ready_count": int(bool(ready["ready_for_runtime_stream_guard"])),
+            "stream_lifetime_lease_blocked_case_count": int(not missing["ready_for_runtime_stream_guard"])
+            + int(not wrong_policy["ready_for_runtime_stream_guard"]),
+            "stream_lifetime_default_behavior_changed_count": int(bool(ready["default_behavior_changed"])),
+            "stream_lifetime_requires_explicit_opt_in_count": int(bool(ready["requires_explicit_opt_in"])),
+            "stream_lifetime_training_path_enabled_count": int(bool(ready["training_path_enabled"])),
+            "stream_lifetime_request_training_path_enabled_count": int(bool(request["training_path_enabled"])),
+        },
     }
 
 

@@ -36,6 +36,48 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _safe_number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+
+
+DETECTED_UNACCEPTED_ROLLUP_FIELDS = (
+    "detected_unaccepted_input_ids",
+    "detected_unaccepted_next_focus_ids",
+    "detected_unaccepted_blocked_criteria_ids",
+    "detected_unaccepted_blocked_reason_ids",
+)
+
+
+def _detected_unaccepted_projection(source: Mapping[str, Any]) -> dict[str, list[str]]:
+    return {
+        field: _strings(source.get(field))[:50]
+        for field in DETECTED_UNACCEPTED_ROLLUP_FIELDS
+    }
+
+
+def _project_detected_unaccepted(
+    *,
+    target: dict[str, Any],
+    source: Mapping[str, Any],
+    row_key: str | None = None,
+) -> None:
+    target.update(_detected_unaccepted_projection(source))
+    if row_key is None:
+        return
+    source_rows = {
+        str(row.get(row_key) or ""): _detected_unaccepted_projection(row)
+        for row in (_mapping(item) for item in _list(source.get("rows")))
+        if str(row.get(row_key) or "")
+    }
+    empty_projection = {field: [] for field in DETECTED_UNACCEPTED_ROLLUP_FIELDS}
+    for row in target.get("rows", []):
+        if isinstance(row, dict):
+            row.update(source_rows.get(str(row.get(row_key) or ""), empty_projection))
+
+
 def _source_cache_stage_lineage_summary(pipeline: Mapping[str, Any]) -> dict[str, Any]:
     lineage = _mapping(pipeline.get("stage_roadmap_lineage"))
     return {
@@ -66,6 +108,79 @@ def _source_cache_stage_lineage_complete(
         and not bool(summary.get("release_claim_allowed"))
         and bool(summary.get("not_release_evidence"))
     )
+
+
+def _sd15_manual_ab_contract_summary(sd15_readiness: Mapping[str, Any]) -> dict[str, Any]:
+    envelope = _mapping(sd15_readiness.get("manual_ab_envelope"))
+    contract = _mapping(envelope.get("case_config_contract"))
+    post_success = _mapping(envelope.get("post_success_rebuild_contract"))
+    before = _mapping(contract.get("before"))
+    after = _mapping(contract.get("after"))
+    common = _mapping(contract.get("common"))
+    post_success_command_ids = _strings(
+        post_success.get("required_post_manual_command_ids")
+    )
+    post_success_artifact_ids = _strings(
+        post_success.get("required_rebuild_artifact_ids")
+    )
+    post_success_ready = bool(
+        str(post_success.get("contract") or "")
+        == "sd15_lora512_post_success_rebuild_contract_v1"
+        and "rebuild_current_combined_evidence_pack" in post_success_command_ids
+        and "refresh_post_manual_evidence_rebuild_plan" in post_success_command_ids
+        and "current_combined/release_claims.json" in post_success_artifact_ids
+        and bool(post_success.get("release_claims_rebuild_required"))
+        and bool(post_success.get("natural_load_rebuild_required"))
+        and not bool(post_success.get("safe_to_auto_start"))
+        and not bool(post_success.get("release_claim_allowed_after_success"))
+        and bool(post_success.get("not_release_evidence"))
+    )
+    return {
+        "summary_version": 1,
+        "roadmap": ROADMAP,
+        "artifact_role": "gpu_bubble_sd15_manual_ab_contract_summary",
+        "envelope": str(envelope.get("envelope") or ""),
+        "contract": str(contract.get("contract") or ""),
+        "post_success_rebuild_contract": str(post_success.get("contract") or ""),
+        "post_success_rebuild_contract_ready": post_success_ready,
+        "post_success_first_rebuild_command_id": str(
+            post_success.get("first_rebuild_command_id") or ""
+        ),
+        "post_success_required_command_ids": post_success_command_ids,
+        "post_success_required_artifact_ids": post_success_artifact_ids,
+        "post_success_release_claims_rebuild_required": bool(
+            post_success.get("release_claims_rebuild_required")
+        ),
+        "post_success_natural_load_rebuild_required": bool(
+            post_success.get("natural_load_rebuild_required")
+        ),
+        "post_success_safe_to_auto_start": bool(post_success.get("safe_to_auto_start")),
+        "post_success_release_claim_allowed_after_success": bool(
+            post_success.get("release_claim_allowed_after_success")
+        ),
+        "post_success_not_release_evidence": bool(
+            post_success.get("not_release_evidence")
+        ),
+        "status": str(envelope.get("status") or ""),
+        "case_id": str(contract.get("case_id") or envelope.get("case_id") or ""),
+        "release_case_id": str(contract.get("release_case_id") or envelope.get("release_case_id") or ""),
+        "family": str(contract.get("family") or envelope.get("family") or ""),
+        "contract_ready": bool(contract.get("contract_ready")),
+        "manual_start_required_after_ready": bool(envelope.get("manual_start_required_after_ready")),
+        "safe_to_auto_start": bool(envelope.get("safe_to_auto_start")),
+        "release_claim_allowed_after_success": bool(envelope.get("release_claim_allowed_after_success")),
+        "release_claim_allowed": False,
+        "requires_gpu_if_executed": bool(envelope.get("requires_gpu_if_executed")),
+        "allowed_side_diff_keys": _strings(contract.get("allowed_side_diff_keys")),
+        "before_dataloader_workers": _safe_int(before.get("dataloader_workers")),
+        "after_dataloader_workers": _safe_int(after.get("dataloader_workers")),
+        "resolution": _safe_int(common.get("resolution")),
+        "train_batch_size": _safe_int(common.get("train_batch_size")),
+        "steps": _safe_int(common.get("steps")),
+        "before_config_digest_present": str(before.get("config_digest") or "").startswith("sha256:"),
+        "after_config_digest_present": str(after.get("config_digest") or "").startswith("sha256:"),
+        "not_release_evidence": True,
+    }
 
 
 def _source_path_rows(readiness: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -162,6 +277,7 @@ def _external_input_filesystem_audit(
     checkpoint_exists = bool(sd15.get("checkpoint_exists"))
     checkpoint_count = _safe_int(sd15.get("checkpoint_count"), 1 if checkpoint_exists else 0)
     new_source_root_count = _safe_int(source_axis.get("new_source_root_count"))
+    new_source_root_required = bool(source_axis.get("new_source_root_required"))
     drift_reason_ids: list[str] = []
     if not registry:
         drift_reason_ids.append("external_input_intake_registry_missing")
@@ -177,7 +293,7 @@ def _external_input_filesystem_audit(
         drift_reason_ids.append("sd15_checkpoint_missing_but_not_marked_missing")
     if "new_source_root" in expected_set and new_source_root_count > 0:
         drift_reason_ids.append("new_source_root_present_but_still_marked_missing")
-    if "new_source_root" not in expected_set and new_source_root_count <= 0:
+    if "new_source_root" not in expected_set and new_source_root_required:
         drift_reason_ids.append("new_source_root_missing_but_not_marked_missing")
 
     return {
@@ -204,6 +320,7 @@ def _external_input_filesystem_audit(
         "source_root_exists": bool(source_axis.get("source_root_exists")),
         "source_root_count": _safe_int(source_axis.get("source_root_count")),
         "new_source_root_count": new_source_root_count,
+        "new_source_root_required": new_source_root_required,
         "new_source_roots": [
             str(item.get("root") or "")
             for item in (_mapping(raw) for raw in _list(source_axis.get("roots")))
@@ -325,6 +442,7 @@ def _compact_summary_mirror(
     string_fields: Sequence[str] = (),
     bool_fields: Sequence[str] = (),
     int_fields: Sequence[str] = (),
+    number_fields: Sequence[str] = (),
     list_fields: Sequence[str] = (),
     nested_fields: Sequence[str] = (),
 ) -> dict[str, Any]:
@@ -340,6 +458,8 @@ def _compact_summary_mirror(
         mirrored[field] = bool(source.get(field))
     for field in int_fields:
         mirrored[field] = _safe_int(source.get(field))
+    for field in number_fields:
+        mirrored[field] = _safe_number(source.get(field))
     for field in list_fields:
         mirrored[field] = _strings(source.get(field))[:20]
     for field in nested_fields:
@@ -553,6 +673,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
     ) or _mapping(_mapping(readiness.get("evidence_summary")).get("source_cache_axis_pipeline_readiness"))
     if not source_cache_axis_pipeline_readiness_summary and pipeline:
         axis_readiness = _mapping(pipeline.get("axis_readiness"))
+        stage_freshness = _mapping(pipeline.get("stage_freshness"))
         source_cache_axis_pipeline_readiness_summary = {
             "summary_version": 1,
             "roadmap": ROADMAP,
@@ -571,6 +692,13 @@ def build_gpu_bubble_readiness_terminal_self_check(
             "cache_axis_not_ready": bool(axis_readiness.get("cache_axis_not_ready")),
             "stage_count": _safe_int(pipeline.get("stage_count")),
             "stage_ok_count": _safe_int(pipeline.get("stage_ok_count")),
+            "stage_freshness_checked": bool(stage_freshness.get("freshness_checked")),
+            "stage_freshness_ok": bool(stage_freshness.get("freshness_ok")),
+            "stale_stage_count": _safe_int(stage_freshness.get("stale_stage_count")),
+            "stale_stage_ids": _strings(stage_freshness.get("stale_stage_ids"))[:20],
+            "stale_ready_stage_count": _safe_int(stage_freshness.get("stale_ready_stage_count")),
+            "stale_ready_stage_ids": _strings(stage_freshness.get("stale_ready_stage_ids"))[:20],
+            "ready_stage_freshness_ok": bool(stage_freshness.get("ready_stage_freshness_ok")),
             "blocker_count": len(_strings(pipeline.get("blockers"))),
             "next_action_count": len(_list(pipeline.get("next_actions"))),
             "release_claim_allowed": False,
@@ -598,6 +726,11 @@ def build_gpu_bubble_readiness_terminal_self_check(
     source_cache_axis_admission_preflight_summary = _mapping(
         readiness.get("source_cache_axis_admission_preflight_summary")
     ) or _mapping(_mapping(readiness.get("evidence_summary")).get("source_cache_axis_admission_preflight"))
+    source_axis_unblock_recommendation_summary = _mapping(
+        readiness.get("source_axis_unblock_recommendation_summary")
+    ) or _mapping(
+        _mapping(readiness.get("evidence_summary")).get("source_axis_unblock_recommendation_summary")
+    )
     source_cache_axis_manual_canary_plan_summary = _mapping(
         readiness.get("source_cache_axis_manual_canary_plan_summary")
     ) or _mapping(_mapping(readiness.get("evidence_summary")).get("source_cache_axis_manual_canary_plan"))
@@ -699,6 +832,41 @@ def build_gpu_bubble_readiness_terminal_self_check(
         readiness.get("sdxl_diagnostic_artifact_chain_summary")
     ) or _mapping(
         _mapping(readiness.get("evidence_summary")).get("sdxl_diagnostic_artifact_chain_summary")
+    )
+    newbie_blockskip_compute_bound_chain = _mapping(
+        readiness.get("newbie_blockskip_compute_bound_artifact_chain_summary")
+    ) or _mapping(
+        _mapping(readiness.get("evidence_summary")).get(
+            "newbie_blockskip_compute_bound_artifact_chain_summary"
+        )
+    )
+    newbie_compute_diagnosis_chain = _mapping(
+        readiness.get("newbie_compute_diagnosis_artifact_chain_summary")
+    ) or _mapping(
+        _mapping(readiness.get("evidence_summary")).get(
+            "newbie_compute_diagnosis_artifact_chain_summary"
+        )
+    )
+    newbie_tail8_attention_compute_review = _mapping(
+        readiness.get("newbie_tail8_attention_compute_review_summary")
+    ) or _mapping(
+        _mapping(readiness.get("evidence_summary")).get(
+            "newbie_tail8_attention_compute_review_summary"
+        )
+    )
+    newbie_tail8_forward_anomaly_review = _mapping(
+        readiness.get("newbie_tail8_forward_anomaly_review_summary")
+    ) or _mapping(
+        _mapping(readiness.get("evidence_summary")).get(
+            "newbie_tail8_forward_anomaly_review_summary"
+        )
+    )
+    newbie_tail8_seed2027_rerun_preflight = _mapping(
+        readiness.get("newbie_tail8_seed2027_rerun_preflight_summary")
+    ) or _mapping(
+        _mapping(readiness.get("evidence_summary")).get(
+            "newbie_tail8_seed2027_rerun_preflight_summary"
+        )
     )
     protected_followup_gpu_queue = _mapping(
         readiness.get("protected_followup_gpu_queue_summary")
@@ -896,6 +1064,211 @@ def build_gpu_bubble_readiness_terminal_self_check(
         and not bool(sdxl_diagnostic_artifact_chain.get("safe_to_auto_start"))
         and not bool(sdxl_diagnostic_artifact_chain.get("release_claim_allowed"))
     )
+    newbie_blockskip_compute_bound_chain_fail_closed = (
+        bool(newbie_blockskip_compute_bound_chain)
+        and str(newbie_blockskip_compute_bound_chain.get("roadmap") or "") == ROADMAP
+        and bool(newbie_blockskip_compute_bound_chain.get("fail_closed"))
+        and bool(newbie_blockskip_compute_bound_chain.get("not_release_evidence"))
+        and _safe_int(newbie_blockskip_compute_bound_chain.get("missing_artifact_count")) == 0
+        and _safe_int(newbie_blockskip_compute_bound_chain.get("unsafe_artifact_count")) == 0
+        and bool(newbie_blockskip_compute_bound_chain.get("quality_gate_blocked"))
+        and bool(newbie_blockskip_compute_bound_chain.get("quality_drift_review_blocked"))
+        and bool(newbie_blockskip_compute_bound_chain.get("loss_curve_nonrelease_ready"))
+        and bool(newbie_blockskip_compute_bound_chain.get("quality_semantic_nonrelease_ready"))
+        and bool(newbie_blockskip_compute_bound_chain.get("semantics_reviewed_blocked"))
+        and bool(newbie_blockskip_compute_bound_chain.get("policy_defined_blocked"))
+        and not bool(newbie_blockskip_compute_bound_chain.get("policy_compute_bound_exception_allowed"))
+        and not bool(newbie_blockskip_compute_bound_chain.get("safe_to_auto_start"))
+        and not bool(newbie_blockskip_compute_bound_chain.get("release_claim_allowed"))
+    )
+    newbie_compute_diagnosis_chain_fail_closed = (
+        bool(newbie_compute_diagnosis_chain)
+        and str(newbie_compute_diagnosis_chain.get("roadmap") or "") == ROADMAP
+        and bool(newbie_compute_diagnosis_chain.get("fail_closed"))
+        and bool(newbie_compute_diagnosis_chain.get("not_release_evidence"))
+        and bool(newbie_compute_diagnosis_chain.get("data_wait_route_exhausted"))
+        and _safe_int(newbie_compute_diagnosis_chain.get("unsafe_artifact_count")) == 0
+        and _safe_int(newbie_compute_diagnosis_chain.get("compute_bound_probe_count")) >= 2
+        and _safe_int(newbie_compute_diagnosis_chain.get("low_data_wait_probe_count")) >= 2
+        and _safe_int(newbie_compute_diagnosis_chain.get("dataloader_rebuild_observed_count")) == 0
+        and _safe_int(newbie_compute_diagnosis_chain.get("natural_candidate_count")) == 0
+        and not bool(newbie_compute_diagnosis_chain.get("safe_to_auto_start"))
+        and not bool(newbie_compute_diagnosis_chain.get("release_claim_allowed"))
+    )
+    newbie_tail8_attention_compute_review_fail_closed = (
+        bool(newbie_tail8_attention_compute_review)
+        and str(newbie_tail8_attention_compute_review.get("roadmap") or "") == ROADMAP
+        and bool(newbie_tail8_attention_compute_review.get("fail_closed"))
+        and bool(newbie_tail8_attention_compute_review.get("not_release_evidence"))
+        and str(newbie_tail8_attention_compute_review.get("candidate") or "")
+        == "newbie_target_scope:tail8_attention"
+        and not bool(newbie_tail8_attention_compute_review.get("release_claim_eligible"))
+        and _safe_int(newbie_tail8_attention_compute_review.get("unsafe_artifact_count")) == 0
+        and not bool(newbie_tail8_attention_compute_review.get("publishable"))
+        and not bool(newbie_tail8_attention_compute_review.get("safe_to_auto_start"))
+        and not bool(newbie_tail8_attention_compute_review.get("release_claim_allowed"))
+    )
+    newbie_tail8_target_depth_progression = _mapping(
+        newbie_tail8_attention_compute_review.get("target_depth_progression_summary")
+    )
+    newbie_tail8_target_depth_progression_fail_closed = (
+        newbie_tail8_attention_compute_review_fail_closed
+        and str(newbie_tail8_target_depth_progression.get("progression") or "")
+        == "newbie_target_depth_progression_v1"
+        and str(newbie_tail8_target_depth_progression.get("current_candidate_scope") or "")
+        == "tail8_attention"
+        and bool(newbie_tail8_target_depth_progression.get("fail_closed"))
+        and bool(newbie_tail8_target_depth_progression.get("not_release_evidence"))
+        and bool(newbie_tail8_target_depth_progression.get("does_not_run_training"))
+        and bool(newbie_tail8_target_depth_progression.get("does_not_run_cuda"))
+        and bool(newbie_tail8_target_depth_progression.get("does_not_run_gpu_heavy"))
+        and not bool(newbie_tail8_target_depth_progression.get("publishable"))
+        and not bool(newbie_tail8_target_depth_progression.get("safe_to_auto_start"))
+        and not bool(newbie_tail8_target_depth_progression.get("release_claim_allowed"))
+        and (
+            not bool(
+                newbie_tail8_target_depth_progression.get(
+                    "alternate_target_depth_comparison_allowed"
+                )
+            )
+            or (
+                bool(newbie_tail8_target_depth_progression.get("tail8_repeat_gate_ready"))
+                and bool(newbie_tail8_target_depth_progression.get("tail8_quality_gate_ready"))
+                and bool(
+                    newbie_tail8_target_depth_progression.get(
+                        "tail8_stable_for_depth_comparison"
+                    )
+                )
+            )
+        )
+    )
+    newbie_tail8_source_file_count = _safe_int(
+        newbie_tail8_attention_compute_review.get("source_file_count")
+    )
+    newbie_tail8_existing_source_file_count = _safe_int(
+        newbie_tail8_attention_compute_review.get("existing_source_file_count")
+    )
+    newbie_tail8_missing_source_file_count = _safe_int(
+        newbie_tail8_attention_compute_review.get("missing_source_file_count")
+    )
+    newbie_tail8_source_file_presence_status = str(
+        newbie_tail8_attention_compute_review.get("source_file_presence_status") or ""
+    )
+    newbie_tail8_source_file_presence_fail_closed = (
+        newbie_tail8_attention_compute_review_fail_closed
+        and newbie_tail8_source_file_count > 0
+        and newbie_tail8_existing_source_file_count >= 0
+        and newbie_tail8_missing_source_file_count >= 0
+        and newbie_tail8_source_file_count
+        == newbie_tail8_existing_source_file_count + newbie_tail8_missing_source_file_count
+        and (
+            (
+                newbie_tail8_missing_source_file_count == 0
+                and newbie_tail8_source_file_presence_status == "source_files_present"
+            )
+            or (
+                newbie_tail8_missing_source_file_count > 0
+                and newbie_tail8_source_file_presence_status
+                == "source_files_missing_fail_closed"
+                and bool(
+                    _strings(
+                        newbie_tail8_attention_compute_review.get(
+                            "missing_source_file_pair_ids"
+                        )
+                    )
+                )
+                and bool(
+                    _strings(
+                        newbie_tail8_attention_compute_review.get(
+                            "missing_source_file_ids"
+                        )
+                    )
+                )
+            )
+        )
+    )
+    newbie_tail8_forward_anomaly_review_fail_closed = (
+        bool(newbie_tail8_forward_anomaly_review)
+        and str(newbie_tail8_forward_anomaly_review.get("roadmap") or "") == ROADMAP
+        and bool(newbie_tail8_forward_anomaly_review.get("fail_closed"))
+        and bool(newbie_tail8_forward_anomaly_review.get("not_release_evidence"))
+        and str(newbie_tail8_forward_anomaly_review.get("candidate") or "")
+        == "newbie_target_scope:tail8_attention seed:2027"
+        and bool(newbie_tail8_forward_anomaly_review.get("review_ready"))
+        and _safe_int(newbie_tail8_forward_anomaly_review.get("unsafe_artifact_count")) == 0
+        and _safe_int(newbie_tail8_forward_anomaly_review.get("comparison_source_present_count"))
+        + _safe_int(newbie_tail8_forward_anomaly_review.get("comparison_source_missing_count"))
+        == 3
+        and (
+            _safe_int(newbie_tail8_forward_anomaly_review.get("comparison_source_missing_count"))
+            == 0
+            or bool(
+                _strings(
+                    newbie_tail8_forward_anomaly_review.get(
+                        "missing_source_manifest_ids"
+                    )
+                )
+            )
+        )
+        and not bool(newbie_tail8_forward_anomaly_review.get("publishable"))
+        and not bool(newbie_tail8_forward_anomaly_review.get("safe_to_auto_start"))
+        and not bool(newbie_tail8_forward_anomaly_review.get("release_claim_allowed"))
+    )
+    tail8_preflight_forward_missing_count = _safe_int(
+        newbie_tail8_seed2027_rerun_preflight.get(
+            "forward_anomaly_comparison_source_missing_count"
+        )
+    )
+    tail8_preflight_forward_present_count = _safe_int(
+        newbie_tail8_seed2027_rerun_preflight.get(
+            "forward_anomaly_comparison_source_present_count"
+        )
+    )
+    tail8_preflight_forward_gate_fail_closed = (
+        tail8_preflight_forward_present_count + tail8_preflight_forward_missing_count
+        == 3
+        and bool(
+            newbie_tail8_seed2027_rerun_preflight.get(
+                "forward_anomaly_comparison_source_ready"
+            )
+        )
+        == (tail8_preflight_forward_missing_count == 0)
+        and (
+            tail8_preflight_forward_missing_count == 0
+            or bool(
+                _strings(
+                    newbie_tail8_seed2027_rerun_preflight.get(
+                        "forward_anomaly_missing_source_manifest_ids"
+                    )
+                )
+            )
+        )
+    )
+    newbie_tail8_seed2027_rerun_preflight_fail_closed = (
+        bool(newbie_tail8_seed2027_rerun_preflight)
+        and str(newbie_tail8_seed2027_rerun_preflight.get("roadmap") or "") == ROADMAP
+        and bool(newbie_tail8_seed2027_rerun_preflight.get("fail_closed"))
+        and bool(newbie_tail8_seed2027_rerun_preflight.get("not_release_evidence"))
+        and str(newbie_tail8_seed2027_rerun_preflight.get("candidate") or "")
+        == "newbie_target_scope:tail8_attention seed:2027"
+        and bool(newbie_tail8_seed2027_rerun_preflight.get("review_ready"))
+        and tail8_preflight_forward_gate_fail_closed
+        and (
+            not bool(newbie_tail8_seed2027_rerun_preflight.get("manual_rerun_ready"))
+            or (
+                bool(newbie_tail8_seed2027_rerun_preflight.get("gpu_idle_ready"))
+                and bool(newbie_tail8_seed2027_rerun_preflight.get("environment_snapshot_ready"))
+                and bool(newbie_tail8_seed2027_rerun_preflight.get("disk_space_ready"))
+                and not bool(newbie_tail8_seed2027_rerun_preflight.get("gpu_compute_apps_present"))
+                and _safe_int(
+                    newbie_tail8_seed2027_rerun_preflight.get("gpu_compute_apps_count")
+                )
+                == 0
+            )
+        )
+        and not bool(newbie_tail8_seed2027_rerun_preflight.get("safe_to_auto_start"))
+        and not bool(newbie_tail8_seed2027_rerun_preflight.get("release_claim_allowed"))
+    )
     protected_followup_gpu_queue_fail_closed = (
         bool(protected_followup_gpu_queue)
         and str(protected_followup_gpu_queue.get("roadmap") or "") == ROADMAP
@@ -1031,6 +1404,12 @@ def build_gpu_bubble_readiness_terminal_self_check(
         and bool(release_gate_input_acceptance_criteria.get("fail_closed"))
         and bool(release_gate_input_acceptance_criteria.get("not_release_evidence"))
         and _safe_int(release_gate_input_acceptance_criteria.get("unsafe_acceptance_count")) == 0
+        and _safe_int(
+            release_gate_input_acceptance_criteria.get(
+                "accepted_with_blocked_criteria_count"
+            )
+        )
+        == 0
         and str(release_gate_input_acceptance_criteria.get("execution_policy") or "")
         == "release_gate_input_acceptance_criteria_only"
         and not bool(release_gate_input_acceptance_criteria.get("safe_to_auto_start"))
@@ -1224,6 +1603,11 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "not_release_evidence"
             )
         )
+        and bool(
+            release_gate_post_input_refresh_guard_consumption_runner_row.get(
+                "safety_contract_ok"
+            )
+        )
         and not bool(release_gate_post_input_refresh_guard_consumption_runner_row.get("unsafe"))
         and not bool(
             release_gate_post_input_refresh_guard_consumption_runner_row.get(
@@ -1234,15 +1618,6 @@ def build_gpu_bubble_readiness_terminal_self_check(
             release_gate_post_input_refresh_guard_consumption_runner_row.get(
                 "release_claim_allowed"
             )
-        )
-        and bool(
-            release_gate_post_input_refresh_guard_consumption_runner_row.get("manifest_ok")
-        )
-        and bool(
-            release_gate_post_input_refresh_guard_consumption_runner_row.get("runner_ready")
-        )
-        and bool(
-            release_gate_post_input_refresh_guard_consumption_runner_row.get("execution_ok")
         )
         and bool(
             release_gate_post_input_refresh_guard_consumption_runner_row.get(
@@ -1259,18 +1634,6 @@ def build_gpu_bubble_readiness_terminal_self_check(
             release_gate_post_input_refresh_guard_consumption_runner_row.get("row_count")
         )
         == external_input_json_refresh_runner_expected_count
-        and _safe_int(
-            release_gate_post_input_refresh_guard_consumption_runner_row.get(
-                "executed_row_count"
-            )
-        )
-        == external_input_json_refresh_runner_expected_count
-        and _safe_int(
-            release_gate_post_input_refresh_guard_consumption_runner_row.get(
-                "failed_row_count"
-            )
-        )
-        == 0
         and _safe_int(
             release_gate_post_input_refresh_guard_consumption_runner_row.get(
                 "missing_output_row_count"
@@ -1351,6 +1714,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
         bool(external_input_json_refresh_runner_manifest_summary)
         and str(external_input_json_refresh_runner_manifest_summary.get("roadmap") or "") == ROADMAP
         and bool(external_input_json_refresh_runner_manifest_summary.get("fail_closed"))
+        and bool(external_input_json_refresh_runner_manifest_summary.get("safety_contract_ok"))
         and bool(external_input_json_refresh_runner_manifest_summary.get("not_release_evidence"))
         and str(external_input_json_refresh_runner_manifest_summary.get("execution_policy") or "")
         == "external_input_json_refresh_runner_manifest_acceptance_only"
@@ -1366,14 +1730,6 @@ def build_gpu_bubble_readiness_terminal_self_check(
         == 0
         and _safe_int(external_input_json_refresh_runner_manifest_summary.get("row_count"))
         == external_input_json_refresh_runner_expected_count
-        and _safe_int(
-            external_input_json_refresh_runner_manifest_summary.get("executed_row_count")
-        )
-        == external_input_json_refresh_runner_expected_count
-        and _safe_int(
-            external_input_json_refresh_runner_manifest_summary.get("failed_row_count")
-        )
-        == 0
         and _safe_int(
             external_input_json_refresh_runner_manifest_summary.get(
                 "missing_output_row_count"
@@ -1545,8 +1901,10 @@ def build_gpu_bubble_readiness_terminal_self_check(
     hard_gates = _strings(
         unblocker.get("gpu_bubble_release_hard_gate_ids")
     ) or _strings(remaining.get("gpu_bubble_release_hard_gate_ids"))
-    missing_inputs = _strings(handoff.get("missing_external_inputs")) or _strings(
-        unblocker.get("missing_external_inputs")
+    missing_inputs = (
+        _strings(unblocker.get("missing_external_inputs"))
+        or _strings(input_resolution.get("missing_external_inputs"))
+        or _strings(handoff.get("missing_external_inputs"))
     )
     manual_inputs = _strings(manual_evidence_blocking.get("next_required_inputs")) or _strings(
         unblocker.get("post_manual_next_required_inputs")
@@ -1583,6 +1941,13 @@ def build_gpu_bubble_readiness_terminal_self_check(
         and manual_review_queue_fail_closed
         and manual_review_artifact_chain_fail_closed
         and sdxl_diagnostic_artifact_chain_fail_closed
+        and newbie_blockskip_compute_bound_chain_fail_closed
+        and newbie_compute_diagnosis_chain_fail_closed
+        and newbie_tail8_attention_compute_review_fail_closed
+        and newbie_tail8_target_depth_progression_fail_closed
+        and newbie_tail8_source_file_presence_fail_closed
+        and newbie_tail8_forward_anomaly_review_fail_closed
+        and newbie_tail8_seed2027_rerun_preflight_fail_closed
         and remaining_work_fail_closed
         and protected_followup_gpu_queue_fail_closed
         and blocker_matrix_fail_closed
@@ -1647,12 +2012,18 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "warm_cache_or_caption_repair_required": bool(
             input_resolution.get("warm_cache_or_caption_repair_required")
         ),
+        "anima_source_or_cache_axis_required": bool(
+            input_resolution.get(
+                "anima_source_or_cache_axis_required",
+                "anima_source_or_cache_axis" in set(missing_inputs),
+            )
+        ),
         "external_input_detected": bool(input_resolution.get("external_input_detected")),
         "json_replay_ready": bool(input_resolution.get("json_replay_ready")),
         "preflight_admitted": bool(input_resolution.get("preflight_admitted")),
         "manual_canary_plan_ready": bool(input_resolution.get("manual_canary_plan_ready")),
         "handoff_step_ids": _strings(input_resolution.get("handoff_step_ids"))[:20],
-        "next_json_refresh_sequence": _strings(input_resolution.get("next_json_refresh_sequence"))[:20],
+        "next_json_refresh_sequence": _strings(input_resolution.get("next_json_refresh_sequence"))[:50],
         "next_manual_gpu_gate": str(input_resolution.get("next_manual_gpu_gate") or ""),
         "release_gate_blockers": _strings(input_resolution.get("release_gate_blockers"))[:20],
         "safe_to_auto_start": False,
@@ -1683,6 +2054,68 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "release_claim_allowed": False,
         "not_release_evidence": True,
     }
+    terminal_sd15_manual_ab_contract_summary = _sd15_manual_ab_contract_summary(sd15)
+    natural_load_gate = _mapping(unblocker.get("natural_load_gate_summary"))
+    terminal_natural_load_gate_summary = {
+        "summary_version": _safe_int(natural_load_gate.get("summary_version"), 1),
+        "roadmap": str(natural_load_gate.get("roadmap") or ROADMAP),
+        "gate_id": str(natural_load_gate.get("gate_id") or "natural_load_canary_pending"),
+        "gate_blocked": bool(natural_load_gate.get("gate_blocked")),
+        "blocked_families": _strings(natural_load_gate.get("blocked_families"))[:20],
+        "blocked_family_count": _safe_int(
+            natural_load_gate.get("blocked_family_count"),
+            len(_strings(natural_load_gate.get("blocked_families"))),
+        ),
+        "blocked_family_statuses": dict(_mapping(natural_load_gate.get("blocked_family_statuses"))),
+        "missing_families": _strings(natural_load_gate.get("missing_families"))[:20],
+        "blocker_summary": dict(_mapping(natural_load_gate.get("blocker_summary"))),
+        "reason": str(natural_load_gate.get("reason") or ""),
+        "requires_new_source_or_cache_axis": bool(natural_load_gate.get("requires_new_source_or_cache_axis")),
+        "requires_warm_cache_or_caption_repair": bool(
+            natural_load_gate.get("requires_warm_cache_or_caption_repair")
+        ),
+        "manual_canary_plan_ready": bool(natural_load_gate.get("manual_canary_plan_ready")),
+        "preflight_admitted": bool(natural_load_gate.get("preflight_admitted")),
+        "source_cache_preflight_status": str(
+            natural_load_gate.get("source_cache_preflight_status") or ""
+        ),
+        "source_cache_preflight_blockers": _strings(
+            natural_load_gate.get("source_cache_preflight_blockers")
+        )[:20],
+        "source_cache_preflight_blocker_count": _safe_int(
+            natural_load_gate.get("source_cache_preflight_blocker_count")
+        ),
+        "source_cache_candidate_source": str(
+            natural_load_gate.get("source_cache_candidate_source") or ""
+        ),
+        "source_cache_candidate_family": str(
+            natural_load_gate.get("source_cache_candidate_family") or ""
+        ),
+        "source_cache_candidate_root": str(
+            natural_load_gate.get("source_cache_candidate_root") or ""
+        ),
+        "source_cache_candidate_sample_offset": natural_load_gate.get(
+            "source_cache_candidate_sample_offset"
+        ),
+        "source_cache_matched_axis_found": bool(
+            natural_load_gate.get("source_cache_matched_axis_found")
+        ),
+        "source_cache_matched_axis_cache_ready": bool(
+            natural_load_gate.get("source_cache_matched_axis_cache_ready")
+        ),
+        "source_cache_matched_axis_quality_ok": bool(
+            natural_load_gate.get("source_cache_matched_axis_quality_ok")
+        ),
+        "source_cache_matched_axis_candidate_rank_score": _safe_number(
+            natural_load_gate.get("source_cache_matched_axis_candidate_rank_score")
+        ),
+        "source_cache_matched_axis_caption_sample_coverage": _safe_number(
+            natural_load_gate.get("source_cache_matched_axis_caption_sample_coverage")
+        ),
+        "safe_to_auto_start": False,
+        "release_claim_allowed": False,
+        "not_release_evidence": True,
+    }
     terminal_external_input_transition_table = {
         "summary_version": _safe_int(external_input_transition.get("summary_version"), 1),
         "roadmap": str(external_input_transition.get("roadmap") or ""),
@@ -1693,7 +2126,31 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "row_count": _safe_int(external_input_transition.get("row_count")),
         "required_row_count": _safe_int(external_input_transition.get("required_row_count")),
         "blocked_row_count": _safe_int(external_input_transition.get("blocked_row_count")),
+        "pending_not_missing_input_count": _safe_int(
+            external_input_transition.get("pending_not_missing_input_count")
+        ),
+        "pending_not_missing_input_ids": _strings(
+            external_input_transition.get("pending_not_missing_input_ids")
+        )[:50],
+        "pending_not_missing_reason_ids": _strings(
+            external_input_transition.get("pending_not_missing_reason_ids")
+        )[:50],
         "detected_row_count": _safe_int(external_input_transition.get("detected_row_count")),
+        "detected_unaccepted_input_count": _safe_int(
+            external_input_transition.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            external_input_transition.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            external_input_transition.get("detected_unaccepted_next_focus_ids")
+        )[:50],
+        "detected_unaccepted_blocked_criteria_ids": _strings(
+            external_input_transition.get("detected_unaccepted_blocked_criteria_ids")
+        )[:50],
+        "detected_unaccepted_blocked_reason_ids": _strings(
+            external_input_transition.get("detected_unaccepted_blocked_reason_ids")
+        )[:50],
         "admitted_row_count": _safe_int(external_input_transition.get("admitted_row_count")),
         "manual_plan_ready_row_count": _safe_int(
             external_input_transition.get("manual_plan_ready_row_count")
@@ -1701,7 +2158,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "unsafe_row_count": _safe_int(external_input_transition.get("unsafe_row_count")),
         "unsafe_row_ids": _strings(external_input_transition.get("unsafe_row_ids"))[:20],
         "transition_state_counts": dict(_mapping(external_input_transition.get("transition_state_counts"))),
-        "next_json_refresh_sequence": _strings(external_input_transition.get("next_json_refresh_sequence"))[:20],
+        "next_json_refresh_sequence": _strings(external_input_transition.get("next_json_refresh_sequence"))[:50],
         "replay_command_count": _safe_int(external_input_transition.get("replay_command_count")),
         "replay_ready_command_count": _safe_int(external_input_transition.get("replay_ready_command_count")),
         "handoff_step_ids": _strings(external_input_transition.get("handoff_step_ids"))[:20],
@@ -1709,6 +2166,11 @@ def build_gpu_bubble_readiness_terminal_self_check(
             {
                 "input_id": str(row.get("input_id") or ""),
                 "required": bool(row.get("required")),
+                "external_input_missing": bool(row.get("external_input_missing")),
+                "pending_not_missing": bool(row.get("pending_not_missing")),
+                "pending_not_missing_reason_ids": _strings(
+                    row.get("pending_not_missing_reason_ids")
+                )[:20],
                 "detected": bool(row.get("detected")),
                 "detected_count": _safe_int(row.get("detected_count")),
                 "admitted": bool(row.get("admitted")),
@@ -1719,6 +2181,12 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "admission_stage": str(row.get("admission_stage") or ""),
                 "blocker_ids": _strings(row.get("blocker_ids"))[:10],
                 "upstream_artifact_ids": _strings(row.get("upstream_artifact_ids"))[:10],
+                "blocked_criteria_ids": _strings(row.get("blocked_criteria_ids"))[:20],
+                "blocked_reason_ids": _strings(row.get("blocked_reason_ids"))[:20],
+                "required_evidence_artifact_ids": _strings(
+                    row.get("required_evidence_artifact_ids")
+                )[:20],
+                "detector_artifact_ids": _strings(row.get("detector_artifact_ids"))[:20],
                 "replay_command_ids": _strings(row.get("replay_command_ids"))[:20],
                 "next_manual_gpu_gate": str(row.get("next_manual_gpu_gate") or ""),
                 "safe_to_auto_start": bool(row.get("safe_to_auto_start")),
@@ -1866,6 +2334,54 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "release_gate_related_action_ids": _strings(
             remaining.get("release_gate_related_action_ids")
         )[:50],
+        "external_input_lifecycle_status": str(
+            remaining.get("external_input_lifecycle_status") or ""
+        ),
+        "detected_input_count": _safe_int(remaining.get("detected_input_count")),
+        "detected_input_ids": _strings(remaining.get("detected_input_ids"))[:50],
+        "accepted_input_count": _safe_int(remaining.get("accepted_input_count")),
+        "accepted_input_ids": _strings(remaining.get("accepted_input_ids"))[:50],
+        "still_missing_input_count": _safe_int(
+            remaining.get("still_missing_input_count")
+        ),
+        "still_missing_input_ids": _strings(
+            remaining.get("still_missing_input_ids")
+        )[:50],
+        "detected_unaccepted_input_count": _safe_int(
+            remaining.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            remaining.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            remaining.get("detected_unaccepted_next_focus_ids")
+        )[:50],
+        "detected_but_not_accepted_input_count": _safe_int(
+            remaining.get("detected_but_not_accepted_input_count")
+        ),
+        "detected_but_not_accepted_input_ids": _strings(
+            remaining.get("detected_but_not_accepted_input_ids")
+        )[:50],
+        "detected_unaccepted_blocked_criteria_ids": _strings(
+            remaining.get("detected_unaccepted_blocked_criteria_ids")
+        )[:50],
+        "detected_unaccepted_blocked_reason_ids": _strings(
+            remaining.get("detected_unaccepted_blocked_reason_ids")
+        )[:50],
+        "pending_not_missing_input_count": _safe_int(
+            remaining.get("pending_not_missing_input_count")
+        ),
+        "pending_not_missing_input_ids": _strings(
+            remaining.get("pending_not_missing_input_ids")
+        )[:50],
+        "pending_not_missing_reason_ids": _strings(
+            remaining.get("pending_not_missing_reason_ids")
+        )[:50],
+        "pending_input_count": _safe_int(remaining.get("pending_input_count")),
+        "pending_input_ids": _strings(remaining.get("pending_input_ids"))[:50],
+        "recommended_external_input_focus": str(
+            remaining.get("recommended_external_input_focus") or ""
+        ),
         "recommended_release_policy": str(remaining.get("recommended_release_policy") or ""),
         "recommended_next_non_gpu_focus": str(
             remaining.get("recommended_next_non_gpu_focus") or ""
@@ -2011,6 +2527,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
         },
         "unsafe_action_count": _safe_int(manual_review_queue.get("unsafe_action_count")),
         "unsafe_action_ids": _strings(manual_review_queue.get("unsafe_action_ids"))[:50],
+        "blocked_actions": _strings(manual_review_queue.get("blocked_actions"))[:50],
         "fail_closed": manual_review_queue_fail_closed,
         "safe_to_auto_start": bool(manual_review_queue.get("safe_to_auto_start")),
         "release_claim_allowed": bool(manual_review_queue.get("release_claim_allowed")),
@@ -2027,6 +2544,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "followup_gpu_required_action_ids": _strings(
             protected_followup_gpu_queue.get("followup_gpu_required_action_ids")
         )[:20],
+        "row_ids": _strings(protected_followup_gpu_queue.get("row_ids"))[:50],
         "family_counts": dict(_mapping(protected_followup_gpu_queue.get("family_counts"))),
         "readiness_state_counts": dict(
             _mapping(protected_followup_gpu_queue.get("readiness_state_counts"))
@@ -2235,9 +2753,51 @@ def build_gpu_bubble_readiness_terminal_self_check(
         ),
         "blocker_bucket_counts": dict(_mapping(blocker_handoff.get("blocker_bucket_counts"))),
         "next_unlock_input_ids": _strings(blocker_handoff.get("next_unlock_input_ids"))[:50],
+        "still_missing_input_count": _safe_int(
+            blocker_handoff.get("still_missing_input_count")
+        ),
+        "still_missing_input_ids": _strings(
+            blocker_handoff.get("still_missing_input_ids")
+        )[:50],
+        "detected_unaccepted_input_count": _safe_int(
+            blocker_handoff.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            blocker_handoff.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            blocker_handoff.get("detected_unaccepted_next_focus_ids")
+        )[:50],
+        "detected_but_not_accepted_input_count": _safe_int(
+            blocker_handoff.get("detected_but_not_accepted_input_count")
+        ),
+        "detected_but_not_accepted_input_ids": _strings(
+            blocker_handoff.get("detected_but_not_accepted_input_ids")
+        )[:50],
+        "detected_unaccepted_blocked_criteria_ids": _strings(
+            blocker_handoff.get("detected_unaccepted_blocked_criteria_ids")
+        )[:50],
+        "detected_unaccepted_blocked_reason_ids": _strings(
+            blocker_handoff.get("detected_unaccepted_blocked_reason_ids")
+        )[:50],
+        "pending_not_missing_input_count": _safe_int(
+            blocker_handoff.get("pending_not_missing_input_count")
+        ),
+        "pending_not_missing_input_ids": _strings(
+            blocker_handoff.get("pending_not_missing_input_ids")
+        )[:50],
+        "pending_not_missing_reason_ids": _strings(
+            blocker_handoff.get("pending_not_missing_reason_ids")
+        )[:50],
+        "natural_load_blocked_family_ids": _strings(
+            blocker_handoff.get("natural_load_blocked_family_ids")
+        )[:20],
+        "natural_load_next_family_focus_ids": _strings(
+            blocker_handoff.get("natural_load_next_family_focus_ids")
+        )[:20],
         "required_refresh_command_ids": _strings(
             blocker_handoff.get("required_refresh_command_ids")
-        )[:20],
+        )[:50],
         "external_input_row_count": _safe_int(blocker_handoff.get("external_input_row_count")),
         "current_gpu_row_count": _safe_int(blocker_handoff.get("current_gpu_row_count")),
         "protected_followup_gpu_row_count": _safe_int(
@@ -2280,7 +2840,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
                     )[:20],
                     "post_unlock_refresh_command_ids": _strings(
                         _mapping(row.get("resolution_contract")).get("post_unlock_refresh_command_ids")
-                    )[:20],
+                    )[:50],
                     "post_unlock_required_artifact_ids": _strings(
                         _mapping(row.get("resolution_contract")).get("post_unlock_required_artifact_ids")
                     )[:20],
@@ -2302,7 +2862,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
                     ),
                 },
                 "next_unlock_input_ids": _strings(row.get("next_unlock_input_ids"))[:20],
-                "required_refresh_command_ids": _strings(row.get("required_refresh_command_ids"))[:20],
+                "required_refresh_command_ids": _strings(row.get("required_refresh_command_ids"))[:50],
                 "requires_external_input": bool(row.get("requires_external_input")),
                 "current_action_requires_gpu": bool(row.get("current_action_requires_gpu")),
                 "followup_requires_gpu_heavy_run": bool(row.get("followup_requires_gpu_heavy_run")),
@@ -2343,9 +2903,45 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "dependency_kind_counts": dict(_mapping(action_dependency_graph.get("dependency_kind_counts"))),
         "missing_external_inputs": _strings(action_dependency_graph.get("missing_external_inputs"))[:20],
         "release_hard_gate_ids": _strings(action_dependency_graph.get("release_hard_gate_ids"))[:20],
+        "still_missing_input_count": _safe_int(
+            action_dependency_graph.get("still_missing_input_count")
+        ),
+        "still_missing_input_ids": _strings(
+            action_dependency_graph.get("still_missing_input_ids")
+        )[:50],
+        "detected_unaccepted_input_count": _safe_int(
+            action_dependency_graph.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            action_dependency_graph.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            action_dependency_graph.get("detected_unaccepted_next_focus_ids")
+        )[:50],
+        "detected_but_not_accepted_input_count": _safe_int(
+            action_dependency_graph.get("detected_but_not_accepted_input_count")
+        ),
+        "detected_but_not_accepted_input_ids": _strings(
+            action_dependency_graph.get("detected_but_not_accepted_input_ids")
+        )[:50],
+        "detected_unaccepted_blocked_criteria_ids": _strings(
+            action_dependency_graph.get("detected_unaccepted_blocked_criteria_ids")
+        )[:50],
+        "detected_unaccepted_blocked_reason_ids": _strings(
+            action_dependency_graph.get("detected_unaccepted_blocked_reason_ids")
+        )[:50],
+        "pending_not_missing_input_count": _safe_int(
+            action_dependency_graph.get("pending_not_missing_input_count")
+        ),
+        "pending_not_missing_input_ids": _strings(
+            action_dependency_graph.get("pending_not_missing_input_ids")
+        )[:50],
+        "pending_not_missing_reason_ids": _strings(
+            action_dependency_graph.get("pending_not_missing_reason_ids")
+        )[:50],
         "required_refresh_command_ids": _strings(
             action_dependency_graph.get("required_refresh_command_ids")
-        )[:20],
+        )[:50],
         "refresh_sequence_terminal_guard_ok": bool(
             action_dependency_graph.get("refresh_sequence_terminal_guard_ok")
         ),
@@ -2366,7 +2962,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "evidence_path_count": _safe_int(row.get("evidence_path_count")),
                 "post_unlock_refresh_command_ids": _strings(
                     row.get("post_unlock_refresh_command_ids")
-                )[:20],
+                )[:50],
                 "terminal_guard_required": bool(row.get("terminal_guard_required")),
                 "safe_to_auto_start": bool(row.get("safe_to_auto_start")),
                 "release_claim_allowed_after_success": bool(
@@ -2395,6 +2991,48 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "stage_ids": _strings(action_unblock_sequence.get("stage_ids"))[:20],
         "current_stage_id": str(action_unblock_sequence.get("current_stage_id") or ""),
         "next_required_input_ids": _strings(action_unblock_sequence.get("next_required_input_ids"))[:50],
+        "still_missing_input_count": _safe_int(
+            action_unblock_sequence.get("still_missing_input_count")
+        ),
+        "still_missing_input_ids": _strings(
+            action_unblock_sequence.get("still_missing_input_ids")
+        )[:50],
+        "detected_unaccepted_input_count": _safe_int(
+            action_unblock_sequence.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            action_unblock_sequence.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            action_unblock_sequence.get("detected_unaccepted_next_focus_ids")
+        )[:50],
+        "detected_but_not_accepted_input_count": _safe_int(
+            action_unblock_sequence.get("detected_but_not_accepted_input_count")
+        ),
+        "detected_but_not_accepted_input_ids": _strings(
+            action_unblock_sequence.get("detected_but_not_accepted_input_ids")
+        )[:50],
+        "detected_unaccepted_blocked_criteria_ids": _strings(
+            action_unblock_sequence.get("detected_unaccepted_blocked_criteria_ids")
+        )[:50],
+        "detected_unaccepted_blocked_reason_ids": _strings(
+            action_unblock_sequence.get("detected_unaccepted_blocked_reason_ids")
+        )[:50],
+        "pending_not_missing_input_count": _safe_int(
+            action_unblock_sequence.get("pending_not_missing_input_count")
+        ),
+        "pending_not_missing_input_ids": _strings(
+            action_unblock_sequence.get("pending_not_missing_input_ids")
+        )[:50],
+        "pending_not_missing_reason_ids": _strings(
+            action_unblock_sequence.get("pending_not_missing_reason_ids")
+        )[:50],
+        "natural_load_blocked_family_ids": _strings(
+            action_unblock_sequence.get("natural_load_blocked_family_ids")
+        )[:20],
+        "natural_load_next_family_focus_ids": _strings(
+            action_unblock_sequence.get("natural_load_next_family_focus_ids")
+        )[:20],
         "manual_gpu_stage_count": _safe_int(action_unblock_sequence.get("manual_gpu_stage_count")),
         "external_input_stage_count": _safe_int(action_unblock_sequence.get("external_input_stage_count")),
         "protected_runner_stage_count": _safe_int(
@@ -2404,7 +3042,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "terminal_guard_required": bool(action_unblock_sequence.get("terminal_guard_required")),
         "required_refresh_command_ids": _strings(
             action_unblock_sequence.get("required_refresh_command_ids")
-        )[:20],
+        )[:50],
         "refresh_sequence_terminal_guard_ok": bool(
             action_unblock_sequence.get("refresh_sequence_terminal_guard_ok")
         ),
@@ -2419,7 +3057,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "requires_external_input": bool(row.get("requires_external_input")),
                 "requires_manual_gpu": bool(row.get("requires_manual_gpu")),
                 "requires_protected_runner": bool(row.get("requires_protected_runner")),
-                "required_refresh_command_ids": _strings(row.get("required_refresh_command_ids"))[:20],
+                "required_refresh_command_ids": _strings(row.get("required_refresh_command_ids"))[:50],
                 "terminal_guard_required_after_stage": bool(
                     row.get("terminal_guard_required_after_stage")
                 ),
@@ -2516,6 +3154,42 @@ def build_gpu_bubble_readiness_terminal_self_check(
         ),
         "unsafe_gate_count": _safe_int(release_exit.get("unsafe_gate_count")),
         "unsafe_gate_ids": _strings(release_exit.get("unsafe_gate_ids"))[:50],
+        "still_missing_input_count": _safe_int(
+            release_exit.get("still_missing_input_count")
+        ),
+        "still_missing_input_ids": _strings(
+            release_exit.get("still_missing_input_ids")
+        )[:50],
+        "detected_unaccepted_input_count": _safe_int(
+            release_exit.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            release_exit.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            release_exit.get("detected_unaccepted_next_focus_ids")
+        )[:50],
+        "detected_but_not_accepted_input_count": _safe_int(
+            release_exit.get("detected_but_not_accepted_input_count")
+        ),
+        "detected_but_not_accepted_input_ids": _strings(
+            release_exit.get("detected_but_not_accepted_input_ids")
+        )[:50],
+        "detected_unaccepted_blocked_criteria_ids": _strings(
+            release_exit.get("detected_unaccepted_blocked_criteria_ids")
+        )[:50],
+        "detected_unaccepted_blocked_reason_ids": _strings(
+            release_exit.get("detected_unaccepted_blocked_reason_ids")
+        )[:50],
+        "pending_not_missing_input_count": _safe_int(
+            release_exit.get("pending_not_missing_input_count")
+        ),
+        "pending_not_missing_input_ids": _strings(
+            release_exit.get("pending_not_missing_input_ids")
+        )[:50],
+        "pending_not_missing_reason_ids": _strings(
+            release_exit.get("pending_not_missing_reason_ids")
+        )[:50],
         "rows": [
             {
                 "gate_id": str(row.get("gate_id") or ""),
@@ -2547,6 +3221,18 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "required_output_ids": _strings(row.get("required_output_ids"))[:20],
                 "missing_declared_output_action_ids": _strings(
                     row.get("missing_declared_output_action_ids")
+                )[:50],
+                "detected_unaccepted_input_ids": _strings(
+                    row.get("detected_unaccepted_input_ids")
+                )[:50],
+                "detected_unaccepted_next_focus_ids": _strings(
+                    row.get("detected_unaccepted_next_focus_ids")
+                )[:50],
+                "detected_unaccepted_blocked_criteria_ids": _strings(
+                    row.get("detected_unaccepted_blocked_criteria_ids")
+                )[:50],
+                "detected_unaccepted_blocked_reason_ids": _strings(
+                    row.get("detected_unaccepted_blocked_reason_ids")
                 )[:50],
                 "manual_gpu_required": bool(row.get("manual_gpu_required")),
                 "protected_runner_required": bool(row.get("protected_runner_required")),
@@ -2665,7 +3351,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
         ),
         "required_refresh_command_ids": _strings(
             release_gate_post_input_refresh_plan.get("required_refresh_command_ids")
-        )[:20],
+        )[:50],
         "terminal_guard_command_ids": _strings(
             release_gate_post_input_refresh_plan.get("terminal_guard_command_ids")
         )[:10],
@@ -2696,7 +3382,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "source_cache_refresh_input": bool(row.get("source_cache_refresh_input")),
                 "required_refresh_command_ids": _strings(
                     row.get("required_refresh_command_ids")
-                )[:20],
+                )[:50],
                 "terminal_guard_command_ids": _strings(
                     row.get("terminal_guard_command_ids")
                 )[:10],
@@ -2751,6 +3437,9 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "detected_input_count": _safe_int(
             release_gate_input_detection_source.get("detected_input_count")
         ),
+        "detected_input_ids": _strings(
+            release_gate_input_detection_source.get("detected_input_ids")
+        )[:50],
         "external_input_detector_count": _safe_int(
             release_gate_input_detection_source.get("external_input_detector_count")
         ),
@@ -2774,10 +3463,11 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "detector_artifact_ids": _strings(row.get("detector_artifact_ids"))[:20],
                 "required_refresh_command_ids": _strings(
                     row.get("required_refresh_command_ids")
-                )[:20],
+                )[:50],
                 "related_gate_ids": _strings(row.get("related_gate_ids"))[:20],
                 "affected_family_ids": _strings(row.get("affected_family_ids"))[:20],
                 "input_missing": bool(row.get("input_missing")),
+                "still_missing": bool(row.get("still_missing")),
                 "detected": bool(row.get("detected")),
                 "requires_external_input": bool(row.get("requires_external_input")),
                 "requires_manual_gpu": bool(row.get("requires_manual_gpu")),
@@ -2824,12 +3514,84 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "accepted_input_ids": _strings(
             release_gate_input_acceptance_criteria.get("accepted_input_ids")
         )[:50],
+        "criteria_passed_input_count": _safe_int(
+            release_gate_input_acceptance_criteria.get("criteria_passed_input_count")
+        ),
+        "criteria_passed_input_ids": _strings(
+            release_gate_input_acceptance_criteria.get("criteria_passed_input_ids")
+        )[:50],
+        "criteria_blocked_input_count": _safe_int(
+            release_gate_input_acceptance_criteria.get("criteria_blocked_input_count")
+        ),
+        "criteria_blocked_input_ids": _strings(
+            release_gate_input_acceptance_criteria.get("criteria_blocked_input_ids")
+        )[:50],
+        "accepted_with_blocked_criteria_count": _safe_int(
+            release_gate_input_acceptance_criteria.get(
+                "accepted_with_blocked_criteria_count"
+            )
+        ),
+        "accepted_with_blocked_criteria_ids": _strings(
+            release_gate_input_acceptance_criteria.get(
+                "accepted_with_blocked_criteria_ids"
+            )
+        )[:50],
         "unsatisfied_input_count": _safe_int(
             release_gate_input_acceptance_criteria.get("unsatisfied_input_count")
         ),
         "unsatisfied_input_ids": _strings(
             release_gate_input_acceptance_criteria.get("unsatisfied_input_ids")
         )[:50],
+        "detected_unaccepted_input_count": _safe_int(
+            release_gate_input_acceptance_criteria.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            release_gate_input_acceptance_criteria.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            release_gate_input_acceptance_criteria.get(
+                "detected_unaccepted_next_focus_ids"
+            )
+        )[:50],
+        "detected_unaccepted_blocked_criteria_ids": _strings(
+            release_gate_input_acceptance_criteria.get(
+                "detected_unaccepted_blocked_criteria_ids"
+            )
+        )[:50],
+        "detected_unaccepted_reason_rows": [
+            {
+                "input_id": str(row.get("input_id") or ""),
+                "input_kind": str(row.get("input_kind") or ""),
+                "detected": bool(row.get("detected")),
+                "accepted": bool(row.get("accepted")),
+                "input_missing": bool(row.get("input_missing")),
+                "still_missing": bool(row.get("still_missing")),
+                "detected_but_not_accepted": bool(row.get("detected_but_not_accepted")),
+                "refresh_ready": bool(row.get("refresh_ready")),
+                "blocked_refresh": bool(row.get("blocked_refresh")),
+                "reason_ids": _strings(row.get("reason_ids"))[:20],
+                "required_evidence_artifact_ids": _strings(
+                    row.get("required_evidence_artifact_ids")
+                )[:20],
+                "detector_artifact_ids": _strings(
+                    row.get("detector_artifact_ids")
+                )[:20],
+                "required_refresh_command_ids": _strings(
+                    row.get("required_refresh_command_ids")
+                )[:50],
+                "safe_to_auto_start": bool(row.get("safe_to_auto_start")),
+                "release_claim_allowed": bool(row.get("release_claim_allowed")),
+                "not_release_evidence": bool(row.get("not_release_evidence")),
+            }
+            for row in (
+                _mapping(item)
+                for item in _list(
+                    release_gate_input_acceptance_criteria.get(
+                        "detected_unaccepted_reason_rows"
+                    )
+                )
+            )
+        ],
         "external_input_acceptance_count": _safe_int(
             release_gate_input_acceptance_criteria.get("external_input_acceptance_count")
         ),
@@ -2850,6 +3612,13 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "input_id": str(row.get("input_id") or ""),
                 "input_kind": str(row.get("input_kind") or ""),
                 "acceptance_status": str(row.get("acceptance_status") or ""),
+                "criteria_status": str(row.get("criteria_status") or ""),
+                "criteria_passed": bool(row.get("criteria_passed")),
+                "blocked_criteria_ids": _strings(row.get("blocked_criteria_ids"))[:20],
+                "criteria_flags": dict(_mapping(row.get("criteria_flags"))),
+                "accepted_with_blocked_criteria": bool(
+                    row.get("accepted_with_blocked_criteria")
+                ),
                 "acceptance_criteria_ids": _strings(row.get("acceptance_criteria_ids"))[:20],
                 "required_evidence_artifact_ids": _strings(
                     row.get("required_evidence_artifact_ids")
@@ -2857,12 +3626,14 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "detector_artifact_ids": _strings(row.get("detector_artifact_ids"))[:20],
                 "required_refresh_command_ids": _strings(
                     row.get("required_refresh_command_ids")
-                )[:20],
+                )[:50],
                 "related_gate_ids": _strings(row.get("related_gate_ids"))[:20],
                 "affected_family_ids": _strings(row.get("affected_family_ids"))[:20],
                 "input_missing": bool(row.get("input_missing")),
+                "still_missing": bool(row.get("still_missing")),
                 "detected": bool(row.get("detected")),
                 "accepted": bool(row.get("accepted")),
+                "detected_but_not_accepted": bool(row.get("detected_but_not_accepted")),
                 "requires_external_input": bool(row.get("requires_external_input")),
                 "requires_manual_gpu": bool(row.get("requires_manual_gpu")),
                 "requires_source_cache_refresh": bool(row.get("requires_source_cache_refresh")),
@@ -2925,6 +3696,27 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "blocked_refresh_input_ids": _strings(
             release_gate_input_refresh_readiness.get("blocked_refresh_input_ids")
         )[:50],
+        "detected_unaccepted_input_count": _safe_int(
+            release_gate_input_refresh_readiness.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            release_gate_input_refresh_readiness.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            release_gate_input_refresh_readiness.get(
+                "detected_unaccepted_next_focus_ids"
+            )
+        )[:50],
+        "detected_unaccepted_refresh_blocked_input_count": _safe_int(
+            release_gate_input_refresh_readiness.get(
+                "detected_unaccepted_refresh_blocked_input_count"
+            )
+        ),
+        "detected_unaccepted_refresh_blocked_input_ids": _strings(
+            release_gate_input_refresh_readiness.get(
+                "detected_unaccepted_refresh_blocked_input_ids"
+            )
+        )[:50],
         "external_input_refresh_count": _safe_int(
             release_gate_input_refresh_readiness.get("external_input_refresh_count")
         ),
@@ -2949,7 +3741,9 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 ),
                 "accepted": bool(row.get("accepted")),
                 "input_missing": bool(row.get("input_missing")),
+                "still_missing": bool(row.get("still_missing")),
                 "detected": bool(row.get("detected")),
+                "detected_but_not_accepted": bool(row.get("detected_but_not_accepted")),
                 "refresh_ready": bool(row.get("refresh_ready")),
                 "blocked_refresh": bool(row.get("blocked_refresh")),
                 "acceptance_status": str(row.get("acceptance_status") or ""),
@@ -2960,7 +3754,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 )[:20],
                 "required_refresh_command_ids": _strings(
                     row.get("required_refresh_command_ids")
-                )[:20],
+                )[:50],
                 "terminal_guard_command_ids": _strings(
                     row.get("terminal_guard_command_ids")
                 )[:10],
@@ -3037,6 +3831,54 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "unaccepted_input_blocker_count": _safe_int(
             release_gate_input_refresh_blocker.get("unaccepted_input_blocker_count")
         ),
+        "detected_unaccepted_input_count": _safe_int(
+            release_gate_input_refresh_blocker.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            release_gate_input_refresh_blocker.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            release_gate_input_refresh_blocker.get("detected_unaccepted_next_focus_ids")
+        )[:50],
+        "detected_unaccepted_blocked_reason_ids": _strings(
+            release_gate_input_refresh_blocker.get(
+                "detected_unaccepted_blocked_reason_ids"
+            )
+        )[:50],
+        "detected_unaccepted_blocker_rows": [
+            {
+                "input_id": str(row.get("input_id") or ""),
+                "input_kind": str(row.get("input_kind") or ""),
+                "detected": bool(row.get("detected")),
+                "accepted": bool(row.get("accepted")),
+                "input_missing": bool(row.get("input_missing")),
+                "still_missing": bool(row.get("still_missing")),
+                "detected_but_not_accepted": bool(row.get("detected_but_not_accepted")),
+                "refresh_ready": bool(row.get("refresh_ready")),
+                "blocked_refresh": bool(row.get("blocked_refresh")),
+                "reason_ids": _strings(row.get("reason_ids"))[:20],
+                "required_evidence_artifact_ids": _strings(
+                    row.get("required_evidence_artifact_ids")
+                )[:20],
+                "detector_artifact_ids": _strings(
+                    row.get("detector_artifact_ids")
+                )[:20],
+                "required_refresh_command_ids": _strings(
+                    row.get("required_refresh_command_ids")
+                )[:50],
+                "safe_to_auto_start": bool(row.get("safe_to_auto_start")),
+                "release_claim_allowed": bool(row.get("release_claim_allowed")),
+                "not_release_evidence": bool(row.get("not_release_evidence")),
+            }
+            for row in (
+                _mapping(item)
+                for item in _list(
+                    release_gate_input_refresh_blocker.get(
+                        "detected_unaccepted_blocker_rows"
+                    )
+                )
+            )
+        ],
         "external_input_blocker_count": _safe_int(
             release_gate_input_refresh_blocker.get("external_input_blocker_count")
         ),
@@ -3066,12 +3908,14 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "accepted": bool(row.get("accepted")),
                 "detected": bool(row.get("detected")),
                 "input_missing": bool(row.get("input_missing")),
+                "still_missing": bool(row.get("still_missing")),
+                "detected_but_not_accepted": bool(row.get("detected_but_not_accepted")),
                 "requires_external_input": bool(row.get("requires_external_input")),
                 "requires_manual_gpu": bool(row.get("requires_manual_gpu")),
                 "requires_source_cache_refresh": bool(row.get("requires_source_cache_refresh")),
                 "required_refresh_command_ids": _strings(
                     row.get("required_refresh_command_ids")
-                )[:20],
+                )[:50],
                 "terminal_guard_command_ids": _strings(
                     row.get("terminal_guard_command_ids")
                 )[:10],
@@ -3124,11 +3968,47 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "detected_input_ids": _strings(
             release_gate_input_lifecycle.get("detected_input_ids")
         )[:50],
+        "still_missing_input_count": _safe_int(
+            release_gate_input_lifecycle.get("still_missing_input_count")
+        ),
+        "still_missing_input_ids": _strings(
+            release_gate_input_lifecycle.get("still_missing_input_ids")
+        )[:50],
         "detected_unaccepted_input_count": _safe_int(
             release_gate_input_lifecycle.get("detected_unaccepted_input_count")
         ),
         "detected_unaccepted_input_ids": _strings(
             release_gate_input_lifecycle.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            release_gate_input_lifecycle.get("detected_unaccepted_next_focus_ids")
+        )[:50],
+        "detected_but_not_accepted_input_count": _safe_int(
+            release_gate_input_lifecycle.get(
+                "detected_but_not_accepted_input_count"
+            )
+        ),
+        "detected_but_not_accepted_input_ids": _strings(
+            release_gate_input_lifecycle.get("detected_but_not_accepted_input_ids")
+        )[:50],
+        "detected_unaccepted_blocked_criteria_ids": _strings(
+            release_gate_input_lifecycle.get(
+                "detected_unaccepted_blocked_criteria_ids"
+            )
+        )[:50],
+        "detected_unaccepted_blocked_reason_ids": _strings(
+            release_gate_input_lifecycle.get(
+                "detected_unaccepted_blocked_reason_ids"
+            )
+        )[:50],
+        "pending_not_missing_input_count": _safe_int(
+            release_gate_input_lifecycle.get("pending_not_missing_input_count")
+        ),
+        "pending_not_missing_input_ids": _strings(
+            release_gate_input_lifecycle.get("pending_not_missing_input_ids")
+        )[:50],
+        "pending_not_missing_reason_ids": _strings(
+            release_gate_input_lifecycle.get("pending_not_missing_reason_ids")
         )[:50],
         "accepted_input_count": _safe_int(
             release_gate_input_lifecycle.get("accepted_input_count")
@@ -3180,14 +4060,21 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "refresh_readiness_status": str(row.get("refresh_readiness_status") or ""),
                 "blocker_status": str(row.get("blocker_status") or ""),
                 "missing": bool(row.get("missing")),
+                "still_missing": bool(row.get("still_missing")),
                 "detected": bool(row.get("detected")),
                 "accepted": bool(row.get("accepted")),
+                "detected_but_not_accepted": bool(row.get("detected_but_not_accepted")),
                 "refresh_ready": bool(row.get("refresh_ready")),
                 "blocked_refresh": bool(row.get("blocked_refresh")),
+                "blocked_criteria_ids": _strings(row.get("blocked_criteria_ids"))[:20],
                 "blocked_reason_ids": _strings(row.get("blocked_reason_ids"))[:20],
+                "required_evidence_artifact_ids": _strings(
+                    row.get("required_evidence_artifact_ids")
+                )[:20],
+                "detector_artifact_ids": _strings(row.get("detector_artifact_ids"))[:20],
                 "required_refresh_command_ids": _strings(
                     row.get("required_refresh_command_ids")
-                )[:20],
+                )[:50],
                 "terminal_guard_command_ids": _strings(
                     row.get("terminal_guard_command_ids")
                 )[:10],
@@ -3287,6 +4174,54 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "release_external_missing_from_transition_ids"
             )
         )[:50],
+        "detected_input_count": _safe_int(
+            external_input_release_gate_alignment.get("detected_input_count")
+        ),
+        "detected_input_ids": _strings(
+            external_input_release_gate_alignment.get("detected_input_ids")
+        )[:50],
+        "accepted_input_count": _safe_int(
+            external_input_release_gate_alignment.get("accepted_input_count")
+        ),
+        "accepted_input_ids": _strings(
+            external_input_release_gate_alignment.get("accepted_input_ids")
+        )[:50],
+        "detected_unaccepted_input_count": _safe_int(
+            external_input_release_gate_alignment.get("detected_unaccepted_input_count")
+        ),
+        "detected_unaccepted_input_ids": _strings(
+            external_input_release_gate_alignment.get("detected_unaccepted_input_ids")
+        )[:50],
+        "detected_unaccepted_next_focus_ids": _strings(
+            external_input_release_gate_alignment.get(
+                "detected_unaccepted_next_focus_ids"
+            )
+        )[:50],
+        "detected_unaccepted_blocked_criteria_ids": _strings(
+            external_input_release_gate_alignment.get(
+                "detected_unaccepted_blocked_criteria_ids"
+            )
+        )[:50],
+        "detected_unaccepted_blocked_reason_ids": _strings(
+            external_input_release_gate_alignment.get(
+                "detected_unaccepted_blocked_reason_ids"
+            )
+        )[:50],
+        "pending_not_missing_input_count": _safe_int(
+            external_input_release_gate_alignment.get(
+                "pending_not_missing_input_count"
+            )
+        ),
+        "pending_not_missing_input_ids": _strings(
+            external_input_release_gate_alignment.get(
+                "pending_not_missing_input_ids"
+            )
+        )[:50],
+        "pending_not_missing_reason_ids": _strings(
+            external_input_release_gate_alignment.get(
+                "pending_not_missing_reason_ids"
+            )
+        )[:50],
         "blocked_input_count": _safe_int(
             external_input_release_gate_alignment.get("blocked_input_count")
         ),
@@ -3313,6 +4248,10 @@ def build_gpu_bubble_readiness_terminal_self_check(
                     row.get("expected_in_external_transition_table")
                 ),
                 "external_input_missing": bool(row.get("external_input_missing")),
+                "pending_not_missing": bool(row.get("pending_not_missing")),
+                "pending_not_missing_reason_ids": _strings(
+                    row.get("pending_not_missing_reason_ids")
+                )[:20],
                 "release_gate_input_present": bool(
                     row.get("release_gate_input_present")
                 ),
@@ -3323,6 +4262,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 "accepted": bool(row.get("accepted")),
                 "blocked_refresh": bool(row.get("blocked_refresh")),
                 "related_gate_ids": _strings(row.get("related_gate_ids"))[:20],
+                "blocked_criteria_ids": _strings(row.get("blocked_criteria_ids"))[:20],
                 "blocked_reason_ids": _strings(row.get("blocked_reason_ids"))[:20],
                 "handoff_step_id": str(row.get("handoff_step_id") or ""),
                 "replay_command_ids": _strings(row.get("replay_command_ids"))[:20],
@@ -3578,6 +4518,14 @@ def build_gpu_bubble_readiness_terminal_self_check(
                 )
             )
         ][:10],
+        "expected_terminal_guard_command_orders": [
+            _safe_int(item)
+            for item in _list(
+                release_gate_post_input_refresh_terminal_guard_dependency.get(
+                    "expected_terminal_guard_command_orders"
+                )
+            )
+        ][:10],
         "terminal_self_check_required": bool(
             release_gate_post_input_refresh_terminal_guard_dependency.get("terminal_self_check_required")
         ),
@@ -3793,7 +4741,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
         )[:20],
         "command_ids_without_artifacts": _strings(
             release_gate_post_input_refresh_command_artifact_link.get("command_ids_without_artifacts")
-        )[:20],
+        )[:50],
         "readiness_command_id": str(
             release_gate_post_input_refresh_command_artifact_link.get("readiness_command_id") or ""
         ),
@@ -3982,6 +4930,11 @@ def build_gpu_bubble_readiness_terminal_self_check(
                         "manifest_ok": bool(row.get("manifest_ok")),
                         "runner_ready": bool(row.get("runner_ready")),
                         "execution_ok": bool(row.get("execution_ok")),
+                        "in_progress_runner_manifest_accepted": bool(
+                            row.get("in_progress_runner_manifest_accepted")
+                        ),
+                        "safety_contract_ok": bool(row.get("safety_contract_ok")),
+                        "execution_status": str(row.get("execution_status") or ""),
                         "row_execution_consistent": bool(
                             row.get("row_execution_consistent")
                         ),
@@ -4158,6 +5111,41 @@ def build_gpu_bubble_readiness_terminal_self_check(
             release_gate_post_input_refresh_guard_report_acceptance.get("not_release_evidence")
         ),
     }
+    _project_detected_unaccepted(
+        target=terminal_release_gate_post_input_refresh_plan_summary,
+        source=release_gate_post_input_refresh_plan,
+        row_key="input_id",
+    )
+    _project_detected_unaccepted(
+        target=terminal_release_gate_post_input_refresh_command_surface_summary,
+        source=release_gate_post_input_refresh_command_surface,
+        row_key="command_id",
+    )
+    _project_detected_unaccepted(
+        target=terminal_release_gate_post_input_refresh_sequence_integrity_summary,
+        source=release_gate_post_input_refresh_sequence_integrity,
+    )
+    _project_detected_unaccepted(
+        target=terminal_release_gate_post_input_refresh_terminal_guard_dependency_summary,
+        source=release_gate_post_input_refresh_terminal_guard_dependency,
+    )
+    _project_detected_unaccepted(
+        target=terminal_release_gate_post_input_refresh_artifact_coverage_summary,
+        source=release_gate_post_input_refresh_artifact_coverage,
+        row_key="input_id",
+    )
+    _project_detected_unaccepted(
+        target=terminal_release_gate_post_input_refresh_command_artifact_link_summary,
+        source=release_gate_post_input_refresh_command_artifact_link,
+    )
+    _project_detected_unaccepted(
+        target=terminal_release_gate_post_input_refresh_guard_consumption_summary,
+        source=release_gate_post_input_refresh_guard_consumption,
+    )
+    _project_detected_unaccepted(
+        target=terminal_release_gate_post_input_refresh_guard_report_acceptance_summary,
+        source=release_gate_post_input_refresh_guard_report_acceptance,
+    )
     terminal_external_input_json_refresh_runner_manifest_summary = {
         "summary_version": _safe_int(
             external_input_json_refresh_runner_manifest_summary.get("summary_version"), 1
@@ -4167,6 +5155,9 @@ def build_gpu_bubble_readiness_terminal_self_check(
             external_input_json_refresh_runner_manifest_summary.get("artifact_role") or ""
         ),
         "status": str(external_input_json_refresh_runner_manifest_summary.get("status") or ""),
+        "execution_status": str(
+            external_input_json_refresh_runner_manifest_summary.get("execution_status") or ""
+        ),
         "manifest_available": bool(
             external_input_json_refresh_runner_manifest_summary.get("manifest_available")
         ),
@@ -4177,6 +5168,9 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "runner_ready": bool(external_input_json_refresh_runner_manifest_summary.get("runner_ready")),
         "execution_ok": bool(
             external_input_json_refresh_runner_manifest_summary.get("execution_ok")
+        ),
+        "safety_contract_ok": bool(
+            external_input_json_refresh_runner_manifest_summary.get("safety_contract_ok")
         ),
         "row_execution_consistent": bool(
             external_input_json_refresh_runner_manifest_summary.get(
@@ -4229,13 +5223,13 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "sequence_ok": bool(external_input_json_refresh_runner_manifest_summary.get("sequence_ok")),
         "canonical_stage_ids": _strings(
             external_input_json_refresh_runner_manifest_summary.get("canonical_stage_ids")
-        )[:20],
+        )[:50],
         "observed_stage_ids": _strings(
             external_input_json_refresh_runner_manifest_summary.get("observed_stage_ids")
-        )[:20],
+        )[:50],
         "row_stage_ids": _strings(
             external_input_json_refresh_runner_manifest_summary.get("row_stage_ids")
-        )[:20],
+        )[:50],
         "stage_manifest_source": str(
             external_input_json_refresh_runner_manifest_summary.get("stage_manifest_source")
             or ""
@@ -4258,7 +5252,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
         ),
         "stage_ids": _strings(
             external_input_json_refresh_runner_manifest_summary.get("stage_ids")
-        )[:20],
+        )[:50],
         "script_count": _safe_int(
             external_input_json_refresh_runner_manifest_summary.get("script_count")
         ),
@@ -4300,35 +5294,122 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "source_artifact_count": _safe_int(command_surface.get("source_artifact_count")),
         "source_artifact_ids": _strings(command_surface.get("source_artifact_ids"))[:20],
         "command_surface_row_count": _safe_int(command_surface.get("command_surface_row_count")),
+        "row_ids": _strings(command_surface.get("row_ids"))[:50],
+        "row_refs": _strings(command_surface.get("row_refs"))[:50],
+        "status_counts": dict(_mapping(command_surface.get("status_counts"))),
+        "family_counts": dict(_mapping(command_surface.get("family_counts"))),
+        "source_artifact_counts": dict(_mapping(command_surface.get("source_artifact_counts"))),
         "manual_gpu_command_count": _safe_int(command_surface.get("manual_gpu_command_count")),
+        "manual_gpu_command_ids": _strings(command_surface.get("manual_gpu_command_ids"))[:50],
+        "manual_gpu_command_row_refs": _strings(command_surface.get("manual_gpu_command_row_refs"))[:50],
         "protected_gpu_command_count": _safe_int(command_surface.get("protected_gpu_command_count")),
+        "protected_gpu_command_ids": _strings(command_surface.get("protected_gpu_command_ids"))[:50],
+        "protected_gpu_command_row_refs": _strings(command_surface.get("protected_gpu_command_row_refs"))[:50],
         "dry_run_command_count": _safe_int(command_surface.get("dry_run_command_count")),
+        "dry_run_command_ids": _strings(command_surface.get("dry_run_command_ids"))[:50],
+        "dry_run_command_row_refs": _strings(command_surface.get("dry_run_command_row_refs"))[:50],
         "template_command_count": _safe_int(command_surface.get("template_command_count")),
+        "template_command_ids": _strings(command_surface.get("template_command_ids"))[:50],
+        "template_command_row_refs": _strings(command_surface.get("template_command_row_refs"))[:50],
         "ready_command_count": _safe_int(command_surface.get("ready_command_count")),
+        "ready_command_ids": _strings(command_surface.get("ready_command_ids"))[:50],
+        "ready_command_row_refs": _strings(command_surface.get("ready_command_row_refs"))[:50],
         "blocked_command_count": _safe_int(command_surface.get("blocked_command_count")),
+        "blocked_command_ids": _strings(command_surface.get("blocked_command_ids"))[:50],
+        "blocked_command_row_refs": _strings(command_surface.get("blocked_command_row_refs"))[:50],
         "completed_existing_command_count": _safe_int(
             command_surface.get("completed_existing_command_count")
         ),
+        "completed_existing_command_ids": _strings(
+            command_surface.get("completed_existing_command_ids")
+        )[:50],
+        "completed_existing_command_row_refs": _strings(
+            command_surface.get("completed_existing_command_row_refs")
+        )[:50],
         "rerun_blocked_without_new_axis_count": _safe_int(
             command_surface.get("rerun_blocked_without_new_axis_count")
         ),
+        "rerun_blocked_without_new_axis_ids": _strings(
+            command_surface.get("rerun_blocked_without_new_axis_ids")
+        )[:50],
+        "rerun_blocked_without_new_axis_row_refs": _strings(
+            command_surface.get("rerun_blocked_without_new_axis_row_refs")
+        )[:50],
         "requires_gpu_if_executed_count": _safe_int(
             command_surface.get("requires_gpu_if_executed_count")
         ),
+        "requires_gpu_if_executed_ids": _strings(command_surface.get("requires_gpu_if_executed_ids"))[:50],
+        "requires_gpu_if_executed_row_refs": _strings(
+            command_surface.get("requires_gpu_if_executed_row_refs")
+        )[:50],
         "manual_start_required_count": _safe_int(
             command_surface.get("manual_start_required_count")
         ),
+        "manual_start_required_ids": _strings(command_surface.get("manual_start_required_ids"))[:50],
+        "manual_start_required_row_refs": _strings(
+            command_surface.get("manual_start_required_row_refs")
+        )[:50],
         "release_relevant_command_count": _safe_int(
             command_surface.get("release_relevant_command_count")
         ),
+        "release_relevant_command_ids": _strings(command_surface.get("release_relevant_command_ids"))[:50],
+        "release_relevant_command_row_refs": _strings(
+            command_surface.get("release_relevant_command_row_refs")
+        )[:50],
         "diagnostic_only_command_count": _safe_int(
             command_surface.get("diagnostic_only_command_count")
         ),
+        "diagnostic_only_command_ids": _strings(command_surface.get("diagnostic_only_command_ids"))[:50],
+        "diagnostic_only_command_row_refs": _strings(
+            command_surface.get("diagnostic_only_command_row_refs")
+        )[:50],
         "release_claim_allowed_after_success_count": _safe_int(
             command_surface.get("release_claim_allowed_after_success_count")
         ),
+        "release_claim_allowed_after_success_ids": _strings(
+            command_surface.get("release_claim_allowed_after_success_ids")
+        )[:50],
+        "release_claim_allowed_after_success_row_refs": _strings(
+            command_surface.get("release_claim_allowed_after_success_row_refs")
+        )[:50],
         "unsafe_command_count": _safe_int(command_surface.get("unsafe_command_count")),
         "unsafe_command_ids": _strings(command_surface.get("unsafe_command_ids"))[:50],
+        "unsafe_command_row_refs": _strings(command_surface.get("unsafe_command_row_refs"))[:50],
+        "run_plan_source_artifact_id": str(command_surface.get("run_plan_source_artifact_id") or ""),
+        "run_plan_command_count": _safe_int(command_surface.get("run_plan_command_count")),
+        "run_plan_execution_surface_status": str(
+            command_surface.get("run_plan_execution_surface_status") or ""
+        ),
+        "run_plan_active_release_relevant_command_count": _safe_int(
+            command_surface.get("run_plan_active_release_relevant_command_count")
+        ),
+        "run_plan_active_release_relevant_command_ids": _strings(
+            command_surface.get("run_plan_active_release_relevant_command_ids")
+        )[:50],
+        "run_plan_diagnostic_manual_ready_command_count": _safe_int(
+            command_surface.get("run_plan_diagnostic_manual_ready_command_count")
+        ),
+        "run_plan_diagnostic_manual_ready_command_ids": _strings(
+            command_surface.get("run_plan_diagnostic_manual_ready_command_ids")
+        )[:50],
+        "run_plan_completed_existing_command_count": _safe_int(
+            command_surface.get("run_plan_completed_existing_command_count")
+        ),
+        "run_plan_completed_existing_command_ids": _strings(
+            command_surface.get("run_plan_completed_existing_command_ids")
+        )[:50],
+        "run_plan_rerun_blocked_without_new_axis_count": _safe_int(
+            command_surface.get("run_plan_rerun_blocked_without_new_axis_count")
+        ),
+        "run_plan_rerun_blocked_without_new_axis_command_ids": _strings(
+            command_surface.get("run_plan_rerun_blocked_without_new_axis_command_ids")
+        )[:50],
+        "run_plan_blocked_nonrelease_command_count": _safe_int(
+            command_surface.get("run_plan_blocked_nonrelease_command_count")
+        ),
+        "run_plan_blocked_nonrelease_command_ids": _strings(
+            command_surface.get("run_plan_blocked_nonrelease_command_ids")
+        )[:50],
         "rows": [
             {
                 "id": str(row.get("id") or ""),
@@ -4451,6 +5532,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "input_resolution_summary": terminal_input_resolution_summary,
         "external_input_transition_table": terminal_external_input_transition_table,
         "manual_evidence_blocking_summary": terminal_manual_evidence_blocking_summary,
+        "natural_load_gate_summary": terminal_natural_load_gate_summary,
         "blocked_actions": _strings(unblocker.get("blocked_actions"))[:20]
         or [
             "do_not_publish_gpu_bubble_release_claim_until_unblocker_summary_clears",
@@ -4804,6 +5886,328 @@ def build_gpu_bubble_readiness_terminal_self_check(
             ],
             nested_fields=["artifact_status_counts"],
         ),
+        "newbie_blockskip_compute_bound_artifact_chain_summary": _compact_summary_mirror(
+            newbie_blockskip_compute_bound_chain,
+            string_fields=[
+                "status",
+                "followup_status",
+                "quality_status",
+                "quality_drift_status",
+                "quality_drift_quality_review_type",
+                "loss_curve_status",
+                "loss_curve_review_type",
+                "quality_semantic_status",
+                "quality_semantic_review_type",
+                "semantics_status",
+                "policy_status",
+            ],
+            bool_fields=[
+                "quality_throughput_repeat_ready",
+                "quality_loss_quality_ready",
+                "quality_gate_blocked",
+                "quality_drift_review_ready",
+                "quality_drift_quality_evidence_present",
+                "quality_drift_loss_curve_ready",
+                "quality_drift_shape_stable",
+                "quality_drift_disabled_parity_ok",
+                "quality_drift_checkpoint_semantics_ok",
+                "quality_drift_residual_reuse_parity_ok",
+                "quality_drift_loss_gate_blocked",
+                "quality_drift_semantic_ready",
+                "quality_drift_review_blocked",
+                "loss_curve_review_ready",
+                "loss_curve_shape_stable",
+                "loss_curve_disabled_parity_ok",
+                "loss_curve_checkpoint_semantics_ok",
+                "loss_curve_residual_reuse_parity_ok",
+                "loss_curve_nonrelease_ready",
+                "quality_semantic_review_ready",
+                "quality_semantic_semantic_ready",
+                "quality_semantic_loss_curve_ready",
+                "quality_semantic_cached_token_ab_ready",
+                "quality_semantic_shape_stable",
+                "quality_semantic_disabled_parity_ok",
+                "quality_semantic_checkpoint_semantics_ok",
+                "quality_semantic_residual_reuse_parity_ok",
+                "quality_semantic_cpu_replay_only",
+                "quality_semantic_default_behavior_changed",
+                "quality_semantic_runtime_activation_enabled",
+                "quality_semantic_trainer_wiring_allowed",
+                "quality_semantic_nonrelease_ready",
+                "semantics_review_ready",
+                "semantics_reviewed_blocked",
+                "policy_ready",
+                "policy_compute_bound_exception_allowed",
+                "policy_natural_load_gate_exit_allowed",
+                "policy_blockskip_counts_as_release_evidence",
+                "policy_defined_blocked",
+            ],
+            int_fields=[
+                "expected_artifact_count",
+                "present_artifact_count",
+                "missing_artifact_count",
+                "followup_complete_pair_count",
+                "followup_pending_pair_count",
+                "followup_executed_count",
+                "followup_execution_failure_count",
+                "followup_manual_start_required_count",
+                "quality_completed_seed_pair_count",
+                "loss_curve_pair_count",
+                "loss_curve_ready_pair_count",
+                "quality_semantic_pair_count",
+                "quality_semantic_checkpoint_semantics_pair_count",
+                "unsafe_artifact_count",
+                "blocker_count",
+            ],
+            list_fields=[
+                "present_artifact_ids",
+                "missing_artifact_ids",
+                "semantics_blocked_families",
+                "unsafe_artifact_ids",
+                "blocked_actions",
+            ],
+            nested_fields=["artifact_status_counts"],
+        ),
+        "newbie_compute_diagnosis_artifact_chain_summary": _compact_summary_mirror(
+            newbie_compute_diagnosis_chain,
+            string_fields=["status", "diagnosis_status", "diagnosis_report", "family"],
+            bool_fields=[
+                "data_wait_route_exhausted",
+                "fail_closed",
+                "not_release_evidence",
+                "does_not_run_training",
+                "does_not_run_cuda",
+                "does_not_run_gpu_heavy",
+                "safe_to_auto_start",
+                "release_claim_allowed",
+            ],
+            int_fields=[
+                "analyzed_probe_count",
+                "low_data_wait_probe_count",
+                "compute_bound_probe_count",
+                "dataloader_rebuild_observed_count",
+                "natural_candidate_count",
+                "train_step_compute_substage_profile_available_count",
+                "newbie_backward_op_profile_available_count",
+                "newbie_backward_shape_profile_available_count",
+                "newbie_module_timing_profile_available_count",
+                "unsafe_artifact_count",
+            ],
+            list_fields=["next_focus_ids", "unsafe_artifact_ids", "blocked_actions"],
+            nested_fields=[
+                "dominant_bottleneck_counts",
+                "dominant_train_step_substage_counts",
+                "newbie_backward_top_op_counts",
+                "newbie_backward_top_matmul_shape_counts",
+                "newbie_module_timing_top_group_counts",
+            ],
+        ),
+        "newbie_tail8_attention_compute_review_summary": _compact_summary_mirror(
+            newbie_tail8_attention_compute_review,
+            string_fields=[
+                "status",
+                "review_status",
+                "review_report",
+                "family",
+                "candidate",
+                "source_file_presence_status",
+            ],
+            bool_fields=[
+                "repeat_evidence_complete",
+                "throughput_repeat_ready",
+                "loss_curve_quality_ready",
+                "release_claim_eligible",
+                "fail_closed",
+                "not_release_evidence",
+                "publishable",
+                "does_not_run_training",
+                "does_not_run_cuda",
+                "does_not_run_gpu_heavy",
+                "safe_to_auto_start",
+                "release_claim_allowed",
+            ],
+            int_fields=[
+                "completed_seed_pair_count",
+                "required_seed_pair_count",
+                "blocker_count",
+                "unsafe_artifact_count",
+                "source_file_count",
+                "existing_source_file_count",
+                "missing_source_file_count",
+            ],
+            list_fields=[
+                "blockers",
+                "blocked_release_reasons",
+                "recommended_next_actions",
+                "unsafe_artifact_ids",
+                "blocked_actions",
+                "missing_source_file_pair_ids",
+                "missing_source_file_ids",
+            ],
+            nested_fields=["target_depth_progression_summary"],
+        ),
+        "newbie_tail8_forward_anomaly_review_summary": _compact_summary_mirror(
+            newbie_tail8_forward_anomaly_review,
+            string_fields=[
+                "status",
+                "review_status",
+                "report",
+                "family",
+                "candidate",
+                "candidate_status",
+                "root_cause_confidence",
+            ],
+            bool_fields=[
+                "review_ready",
+                "candidate_run_present",
+                "tail8_seed1337_reference_present",
+                "layer0_seed2027_baseline_present",
+                "comparison_source_ready",
+                "candidate_incomplete",
+                "forward_runtime_anomaly",
+                "low_data_wait",
+                "natural_load_or_dataloader_regression_evidence",
+                "counts_as_tail8_repeat_pair",
+                "root_cause_proven",
+                "fail_closed",
+                "not_release_evidence",
+                "publishable",
+                "does_not_run_training",
+                "does_not_run_cuda",
+                "does_not_run_gpu_heavy",
+                "safe_to_auto_start",
+                "release_claim_allowed",
+            ],
+            int_fields=[
+                "comparison_source_present_count",
+                "comparison_source_missing_count",
+                "candidate_global_step",
+                "candidate_total_steps",
+                "blocker_count",
+                "unsafe_artifact_count",
+            ],
+            list_fields=[
+                "missing_source_manifest_ids",
+                "blockers",
+                "recommended_next_actions",
+                "unsafe_artifact_ids",
+                "blocked_actions",
+            ],
+        ),
+        "newbie_tail8_seed2027_rerun_preflight_summary": _compact_summary_mirror(
+            newbie_tail8_seed2027_rerun_preflight,
+            string_fields=[
+                "report",
+                "status",
+                "family",
+                "candidate",
+                "candidate_status",
+                "candidate_run_status",
+                "candidate_run_id",
+                "reference_run_id",
+                "baseline_run_id",
+                "planned_out_dir",
+                "manual_runner",
+                "request_config_digest_excluding_seed",
+                "case_config_contract_id",
+                "case_config_contract_digest_excluding_seed",
+                "forward_anomaly_review_status",
+            ],
+            bool_fields=[
+                "review_ready",
+                "candidate_incomplete",
+                "forward_runtime_anomaly",
+                "low_data_wait",
+                "forward_anomaly_review_ready",
+                "forward_anomaly_candidate_run_present",
+                "forward_anomaly_tail8_seed1337_reference_present",
+                "forward_anomaly_layer0_seed2027_baseline_present",
+                "forward_anomaly_comparison_source_ready",
+                "candidate_incomplete_forward_anomaly_ready",
+                "manual_rerun_ready",
+                "gpu_idle_ready",
+                "gpu_summary_available",
+                "compute_apps_present",
+                "gpu_compute_apps_present",
+                "environment_snapshot_ready",
+                "disk_space_ready",
+                "compute_apps_probe_present",
+                "compute_apps_probe_command_present",
+                "compute_apps_probe_query_ok",
+                "compute_apps_probe_inspection_ready",
+                "compute_apps_probe_permission_denied",
+                "compute_apps_probe_proof_ready",
+                "compute_apps_probe_proof_probe_present",
+                "compute_apps_probe_proof_inspection_ready",
+                "compute_apps_probe_proof_permission_denied",
+                "compute_apps_probe_proof_explicit_empty_result",
+                "compute_apps_classification_explicit_empty_result",
+                "candidate_release_claim_allowed",
+                "candidate_safe_to_auto_start",
+                "case_config_contract_ready",
+                "fail_closed",
+                "not_release_evidence",
+                "publishable",
+                "release_claim_allowed",
+                "safe_to_auto_start",
+                "does_not_run_training",
+                "does_not_run_cuda",
+                "does_not_run_gpu_heavy",
+            ],
+            int_fields=[
+                "gpu_compute_apps_count",
+                "gpu_sample_count",
+                "gpu_valid_sample_count",
+                "gpu_sample_error_count",
+                "compute_apps_probe_row_count",
+                "compute_apps_probe_raw_line_count",
+                "compute_apps_probe_proof_permission_unknown_count",
+                "compute_apps_probe_proof_row_count",
+                "compute_apps_probe_proof_raw_line_count",
+                "compute_apps_blocking_compute_like_count",
+                "compute_apps_background_gpu_client_count",
+                "compute_apps_unknown_gpu_client_count",
+                "forward_anomaly_comparison_source_present_count",
+                "forward_anomaly_comparison_source_missing_count",
+                "candidate_run_global_step",
+                "candidate_run_total_steps",
+                "blocker_count",
+                "unsafe_artifact_count",
+            ],
+            number_fields=[
+                "gpu_util_pct_mean",
+                "gpu_util_pct_p95",
+                "gpu_util_pct_max",
+                "gpu_active_sample_ratio",
+                "gpu_idle_sample_ratio",
+                "gpu_memory_util_pct_mean",
+                "disk_free_gb",
+                "min_disk_free_gb",
+                "candidate_run_data_wait_share",
+                "candidate_run_forward_model_execution_mean_ms",
+                "candidate_run_newbie_transformer_smoke_seconds",
+            ],
+            list_fields=[
+                "blockers",
+                "recommended_next_actions",
+                "forward_anomaly_missing_source_manifest_ids",
+                "manual_execute_command",
+                "manual_dry_run_command",
+                "post_rerun_refresh_sequence",
+                "expected_post_rerun_outputs",
+                "unsafe_artifact_ids",
+            ],
+            nested_fields=[
+                "candidate_diagnosis",
+                "gpu_summary",
+                "compute_apps_probe",
+                "compute_apps_probe_proof",
+                "compute_apps_classification_summary",
+                "tail8_manual_rerun_envelope",
+                "resource_summary",
+                "environment_snapshot",
+            ],
+        ),
         "protected_followup_gpu_queue_summary": terminal_protected_followup_gpu_queue_summary,
         "source_artifact_inventory_summary": _compact_summary_mirror(
             source_artifact_inventory,
@@ -4957,32 +6361,59 @@ def build_gpu_bubble_readiness_terminal_self_check(
         "manual_gpu_execution_summary": {
             "summary_version": _safe_int(manual_gpu_execution.get("summary_version"), 1),
             "gpu_related_action_count": _safe_int(manual_gpu_execution.get("gpu_related_action_count")),
+            "gpu_related_action_ids": _strings(
+                manual_gpu_execution.get("gpu_related_action_ids")
+            )[:20],
             "current_gpu_heavy_action_count": _safe_int(
                 manual_gpu_execution.get("current_gpu_heavy_action_count"),
                 _safe_int(remaining.get("current_gpu_heavy_action_count")),
             ),
+            "current_gpu_heavy_action_ids": _strings(
+                manual_gpu_execution.get("current_gpu_heavy_action_ids")
+            )[:20],
             "followup_gpu_required_action_count": _safe_int(
                 manual_gpu_execution.get("followup_gpu_required_action_count"),
                 _safe_int(remaining.get("followup_gpu_required_action_count")),
             ),
+            "followup_gpu_required_action_ids": _strings(
+                manual_gpu_execution.get("followup_gpu_required_action_ids")
+            )[:20],
             "protected_manual_gpu_ready_action_count": _safe_int(
                 manual_gpu_execution.get("protected_manual_gpu_ready_action_count")
             ),
+            "protected_manual_gpu_ready_action_ids": _strings(
+                manual_gpu_execution.get("protected_manual_gpu_ready_action_ids")
+            )[:20],
             "blocked_missing_prerequisite_gpu_action_count": _safe_int(
                 manual_gpu_execution.get("blocked_missing_prerequisite_gpu_action_count")
             ),
+            "blocked_missing_prerequisite_gpu_action_ids": _strings(
+                manual_gpu_execution.get("blocked_missing_prerequisite_gpu_action_ids")
+            )[:20],
             "waiting_manual_gpu_evidence_action_count": _safe_int(
                 manual_gpu_execution.get("waiting_manual_gpu_evidence_action_count")
             ),
+            "waiting_manual_gpu_evidence_action_ids": _strings(
+                manual_gpu_execution.get("waiting_manual_gpu_evidence_action_ids")
+            )[:20],
             "manual_start_required_action_count": _safe_int(
                 manual_gpu_execution.get("manual_start_required_action_count")
             ),
+            "manual_start_required_action_ids": _strings(
+                manual_gpu_execution.get("manual_start_required_action_ids")
+            )[:20],
             "auto_startable_gpu_action_count": _safe_int(
                 manual_gpu_execution.get("auto_startable_gpu_action_count")
             ),
+            "auto_startable_gpu_action_ids": _strings(
+                manual_gpu_execution.get("auto_startable_gpu_action_ids")
+            )[:20],
             "release_claim_allowed_after_success_action_count": _safe_int(
                 manual_gpu_execution.get("release_claim_allowed_after_success_action_count")
             ),
+            "release_claim_allowed_after_success_action_ids": _strings(
+                manual_gpu_execution.get("release_claim_allowed_after_success_action_ids")
+            )[:20],
             "execution_policy": str(manual_gpu_execution.get("execution_policy") or ""),
             "safe_to_auto_start": bool(manual_gpu_execution.get("safe_to_auto_start")),
             "release_claim_allowed": bool(manual_gpu_execution.get("release_claim_allowed")),
@@ -5025,6 +6456,27 @@ def build_gpu_bubble_readiness_terminal_self_check(
             "stage_count": _safe_int(source_cache_axis_pipeline_readiness_summary.get("stage_count")),
             "stage_ok_count": _safe_int(
                 source_cache_axis_pipeline_readiness_summary.get("stage_ok_count")
+            ),
+            "stage_freshness_checked": bool(
+                source_cache_axis_pipeline_readiness_summary.get("stage_freshness_checked")
+            ),
+            "stage_freshness_ok": bool(
+                source_cache_axis_pipeline_readiness_summary.get("stage_freshness_ok")
+            ),
+            "stale_stage_count": _safe_int(
+                source_cache_axis_pipeline_readiness_summary.get("stale_stage_count")
+            ),
+            "stale_stage_ids": _strings(
+                source_cache_axis_pipeline_readiness_summary.get("stale_stage_ids")
+            )[:20],
+            "stale_ready_stage_count": _safe_int(
+                source_cache_axis_pipeline_readiness_summary.get("stale_ready_stage_count")
+            ),
+            "stale_ready_stage_ids": _strings(
+                source_cache_axis_pipeline_readiness_summary.get("stale_ready_stage_ids")
+            )[:20],
+            "ready_stage_freshness_ok": bool(
+                source_cache_axis_pipeline_readiness_summary.get("ready_stage_freshness_ok")
             ),
             "blocker_count": _safe_int(source_cache_axis_pipeline_readiness_summary.get("blocker_count")),
             "next_action_count": _safe_int(
@@ -5250,6 +6702,9 @@ def build_gpu_bubble_readiness_terminal_self_check(
             "warm_cache_or_caption_repair_required": bool(
                 external_input_handoff_packet_summary.get("warm_cache_or_caption_repair_required")
             ),
+            "anima_source_or_cache_axis_required": bool(
+                external_input_handoff_packet_summary.get("anima_source_or_cache_axis_required")
+            ),
             "json_replay_ready": bool(
                 external_input_handoff_packet_summary.get("json_replay_ready")
             ),
@@ -5307,16 +6762,83 @@ def build_gpu_bubble_readiness_terminal_self_check(
             string_fields=[
                 "report",
                 "status",
+                "candidate_source",
                 "candidate_family",
                 "candidate_root",
+                "candidate_source_manifest_sha1",
+                "matched_axis_source_kind",
+                "matched_axis_state",
+                "next_action",
             ],
             bool_fields=[
                 "admission_allows_protected_manual_gpu_plan",
                 "matched_axis_found",
                 "matched_axis_cache_ready",
                 "matched_axis_quality_ok",
+                "matched_axis_attempted_or_completed",
+                "new_axis_required",
+                "duplicate_or_stale_axis_blocked",
+                "current_axis_do_not_rerun_without_new_axis",
             ],
-            int_fields=["blocker_count"],
+            int_fields=["blocker_count", "current_axis_completed_canary_command_count"],
+            number_fields=[
+                "matched_axis_candidate_rank_score",
+                "matched_axis_caption_sample_coverage",
+            ],
+            list_fields=[
+                "blockers",
+                "acceptance_gates",
+                "new_axis_reason_ids",
+                "new_axis_required_identity_change_fields",
+                "new_axis_same_root_identity_change_fields",
+                "new_axis_acceptance_requirements",
+            ],
+        ),
+        "source_axis_unblock_recommendation_summary": _compact_summary_mirror(
+            source_axis_unblock_recommendation_summary,
+            string_fields=[
+                "status",
+                "gate_id",
+                "source_axis_requirement_status",
+                "source_cache_preflight_status",
+                "source_cache_preflight_next_action",
+                "followup_execution_surface_status",
+                "recommended_next_action",
+                "recommended_release_policy",
+            ],
+            bool_fields=[
+                "natural_load_gate_blocked",
+                "source_axis_external_input_required",
+                "new_axis_required",
+                "duplicate_or_stale_axis_blocked",
+                "current_axis_do_not_rerun_without_new_axis",
+                "no_active_release_relevant_gpu_work",
+                "no_diagnostic_manual_gpu_work",
+                "old_axes_exhausted_without_new_axis",
+            ],
+            int_fields=[
+                "natural_load_blocked_family_count",
+                "source_axis_external_input_required_count",
+                "source_axis_no_ready_family_count",
+                "current_axis_completed_canary_command_count",
+                "active_release_relevant_command_count",
+                "diagnostic_manual_ready_command_count",
+                "completed_existing_command_count",
+                "rerun_blocked_without_new_axis_count",
+            ],
+            list_fields=[
+                "natural_load_blocked_family_ids",
+                "next_family_focus_ids",
+                "new_axis_reason_ids",
+                "required_identity_change_fields",
+                "same_root_identity_change_fields",
+                "new_axis_acceptance_requirements",
+                "active_release_relevant_command_ids",
+                "diagnostic_manual_ready_command_ids",
+                "completed_existing_command_ids",
+                "rerun_blocked_without_new_axis_command_ids",
+                "blocked_actions",
+            ],
         ),
         "source_cache_axis_manual_canary_plan_summary": _compact_summary_mirror(
             source_cache_axis_manual_canary_plan_summary,
@@ -5438,6 +6960,7 @@ def build_gpu_bubble_readiness_terminal_self_check(
             or _strings(unblocker.get("post_manual_release_gate_blockers")),
         },
         "manual_evidence_blocking_summary": terminal_manual_evidence_blocking_summary,
+        "sd15_manual_ab_contract_summary": terminal_sd15_manual_ab_contract_summary,
         "sd15_release_gap": {
             "status": str(sd15.get("status") or unblocker.get("sd15_release_gap_status") or ""),
             "blockers": _strings(sd15.get("blockers")) or _strings(unblocker.get("sd15_release_gap_blockers")),
@@ -5467,6 +6990,20 @@ def build_gpu_bubble_readiness_terminal_self_check(
             "source_cache_axis_pipeline_readiness": str(pipeline.get("report") or ""),
             "post_manual_evidence_rebuild_plan": str(post_manual.get("report") or ""),
             "sd15_readiness": str(sd15.get("report") or ""),
+            "newbie_tail8_seed2027_rerun_preflight": str(
+                _mapping(readiness.get("newbie_tail8_seed2027_rerun_preflight_summary")).get("report")
+                or _mapping(_mapping(readiness.get("evidence_summary")).get(
+                    "newbie_tail8_seed2027_rerun_preflight_summary"
+                )).get("report")
+                or ""
+            ),
+            "newbie_tail8_forward_anomaly_review": str(
+                _mapping(readiness.get("newbie_tail8_forward_anomaly_review_summary")).get("report")
+                or _mapping(_mapping(readiness.get("evidence_summary")).get(
+                    "newbie_tail8_forward_anomaly_review_summary"
+                )).get("report")
+                or ""
+            ),
             "release_readiness_guard_report": str(guard_report.get("report") or ""),
         },
     }

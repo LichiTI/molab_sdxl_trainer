@@ -54,6 +54,12 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _split_targets(value: Any) -> list[str]:
+    import re
+
+    return [part.strip() for part in re.split(r"[\r\n,;]+", str(value or "")) if part.strip()]
+
+
 def _iter_parameters(module: Any):
     parameters = getattr(module, "parameters", None)
     if not callable(parameters):
@@ -161,6 +167,8 @@ def build_adapter_runtime_profile(config: Any, injector: Any, *, model_arch: str
         "model_arch": model_arch_value,
         "network_module": _value(_field(config, "network_module", "")),
         "newbie_adapter_type": str(_field(config, "newbie_adapter_type", "") or "").strip().lower().replace("-", "_"),
+        "newbie_target_scope": str(_field(config, "newbie_target_scope", "") or "").strip().lower().replace("-", "_"),
+        "newbie_target_module_count": len(_split_targets(_field(config, "newbie_target_modules", ""))),
         "adapter_method": _infer_adapter_method(layer_type_dict, effective_type_dict, config),
         "rank": rank,
         "alpha": alpha,

@@ -35,13 +35,22 @@ def run_smoke() -> dict[str, Any]:
     assert current["product_training_route_binding_preflight_ready"] is False, current
     assert current["product_training_route_bound"] is False, current
     assert "owner_release_approval_missing" in current["blocked_reasons"], current
+    assert "owner_release_direction_not_recorded" in current["blocked_reasons"], current
     assert "product_exposure_decision_not_recorded" in current["blocked_reasons"], current
     assert summary["route_family_count"] == 10, current
     assert summary["plugin_optimizer_count"] == 124, current
     assert summary["runtime_launch_coverage_ready_family_count"] == 10, current
+    assert summary["runtime_launch_coverage_ready_optimizer_count"] == 124, current
+    assert summary["runtime_launch_coverage_mode_counts"] == {
+        "dispatch": 52,
+        "missing": 0,
+        "precondition_adapter": 72,
+    }, current
     assert summary["family_specific_runtime_launch_adapter_ready_optimizer_count"] == 72, current
     assert summary["owner_release_hold_ready_family_count"] == 10, current
     assert summary["request_schema_ui_non_exposure_ready_family_count"] == 10, current
+    assert summary["owner_release_direction_recorded_count"] == 0, current
+    assert summary["owner_release_direction_approval_recorded_count"] == 0, current
     assert summary["product_training_route_binding_ready_count"] == 0, current
     assert summary["post_approval_training_route_binding_candidate_count"] == 0, current
     assert current["post_approval_training_route_binding_candidate"] == {}, current
@@ -50,6 +59,7 @@ def run_smoke() -> dict[str, Any]:
     signed_candidate = build_optimizer_product_training_route_binding_preflight(
         native_readiness_gap=_read_json(artifact_dir / "turbocore_optimizer_native_readiness_gap_scorecard.json"),
         owner_release_review_record=_signed_owner_record(),
+        owner_release_direction_record=_signed_owner_direction_record(),
         product_exposure_decision=_signed_product_exposure_decision(),
         release_review_package=_signed_release_package(),
         write_artifact=False,
@@ -61,16 +71,26 @@ def run_smoke() -> dict[str, Any]:
     assert signed_candidate["blocked_reasons"] == [], signed_candidate
     assert "training_path_dispatch_not_enabled" in signed_candidate["promotion_blockers"], signed_candidate
     assert signed_summary["owner_release_approval_recorded_count"] == 1, signed_candidate
+    assert signed_summary["owner_release_direction_recorded_count"] == 1, signed_candidate
+    assert signed_summary["owner_release_direction_approval_recorded_count"] == 1, signed_candidate
     assert signed_summary["release_review_recorded_count"] == 1, signed_candidate
     assert signed_summary["product_exposure_decision_recorded_count"] == 1, signed_candidate
     assert signed_summary["product_training_route_binding_ready_count"] == 10, signed_candidate
     assert signed_summary["post_approval_training_route_binding_candidate_count"] == 1, signed_candidate
+    optimizer_scope = signed_candidate["post_approval_training_route_binding_candidate"]["optimizer_scope"]
+    assert optimizer_scope["runtime_launch_coverage_ready_optimizer_count"] == 124, signed_candidate
+    assert optimizer_scope["runtime_launch_coverage_mode_counts"] == {
+        "dispatch": 52,
+        "missing": 0,
+        "precondition_adapter": 72,
+    }, signed_candidate
     _assert_candidate_contract(signed_candidate["post_approval_training_route_binding_candidate"])
     _assert_default_off(signed_candidate)
 
     unsafe = build_optimizer_product_training_route_binding_preflight(
         native_readiness_gap={**_read_json(artifact_dir / "turbocore_optimizer_native_readiness_gap_scorecard.json")},
         owner_release_review_record={**_signed_owner_record(), "training_path_enabled": True},
+        owner_release_direction_record=_signed_owner_direction_record(),
         product_exposure_decision=_signed_product_exposure_decision(),
         release_review_package=_signed_release_package(),
         write_artifact=False,
@@ -107,6 +127,37 @@ def _signed_owner_record() -> dict[str, Any]:
         "native_dispatch_allowed": False,
         "training_path_enabled": False,
         "training_launch_executed": False,
+    }
+
+
+def _signed_owner_direction() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "gate": "native_update_owner_release_direction",
+        "ok": True,
+        "owner_release_direction_recorded": True,
+        "owner_release_approval_recorded": True,
+        "product_exposure_allowed": False,
+        "request_fields_emitted": False,
+        "schema_exposure_allowed": False,
+        "ui_exposure_allowed": False,
+        "runtime_dispatch_allowed": False,
+        "native_dispatch_allowed": False,
+        "training_path_enabled": False,
+        "training_launch_executed": False,
+    }
+
+
+def _signed_owner_direction_record() -> dict[str, Any]:
+    return {
+        **_signed_owner_direction(),
+        "package": "turbocore_native_update_owner_release_direction_record_v0",
+        "gate": "native_update_owner_release_direction_record",
+        "owner_direction_packet_ready": True,
+        "signed_direction_present": True,
+        "signed_direction_valid": True,
+        "signed_owner_release_direction_digest_match": True,
+        "decision": "native_update_owner_release_direction_recorded_default_off",
     }
 
 

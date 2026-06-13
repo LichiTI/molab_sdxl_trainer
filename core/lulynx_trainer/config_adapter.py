@@ -579,6 +579,37 @@ class ConfigAdapter:
         if "lokr_export_mode" in normalized_data:
             mode = str(normalized_data["lokr_export_mode"]).strip().lower()
             normalized_data["lokr_export_mode"] = mode if mode in {"native", "lora_compatible"} else "native"
+        # GLoRA Phase 2 aliases (defaults preserve Phase 1 standard behavior when absent)
+        if "glora_rank_dropout" in normalized_data:
+            normalized_data["glora_rank_dropout"] = float(normalized_data["glora_rank_dropout"] or 0.0)
+        if "glora_module_dropout" in normalized_data:
+            normalized_data["glora_module_dropout"] = float(normalized_data["glora_module_dropout"] or 0.0)
+        if "glora_no_materialize_forward" in normalized_data:
+            normalized_data["glora_no_materialize_forward"] = boolish(normalized_data["glora_no_materialize_forward"])
+        if "glora_use_tucker" in normalized_data:
+            normalized_data["glora_use_tucker"] = boolish(normalized_data["glora_use_tucker"])
+        if "glora_train_bias" in normalized_data:
+            normalized_data["glora_train_bias"] = boolish(normalized_data["glora_train_bias"])
+        if "glora_export_mode" in normalized_data:
+            mode = str(normalized_data["glora_export_mode"]).strip().lower()
+            normalized_data["glora_export_mode"] = mode if mode in {"native", "lora_compatible"} else "native"
+        # GLoKr Phase 3 aliases
+        if "glokr_factor" in normalized_data:
+            try:
+                normalized_data["glokr_factor"] = int(normalized_data["glokr_factor"])
+            except (TypeError, ValueError):
+                normalized_data["glokr_factor"] = -1
+        if "glokr_rank_dropout" in normalized_data:
+            normalized_data["glokr_rank_dropout"] = float(normalized_data["glokr_rank_dropout"] or 0.0)
+        if "glokr_module_dropout" in normalized_data:
+            normalized_data["glokr_module_dropout"] = float(normalized_data["glokr_module_dropout"] or 0.0)
+        if "glokr_no_materialize_forward" in normalized_data:
+            normalized_data["glokr_no_materialize_forward"] = boolish(normalized_data["glokr_no_materialize_forward"])
+        if "glokr_train_bias" in normalized_data:
+            normalized_data["glokr_train_bias"] = boolish(normalized_data["glokr_train_bias"])
+        if "glokr_export_mode" in normalized_data:
+            mode = str(normalized_data["glokr_export_mode"]).strip().lower()
+            normalized_data["glokr_export_mode"] = mode if mode in {"native", "lora_compatible"} else "native"
         if "newbie_target_modules" in normalized_data:
             raw_targets = normalized_data["newbie_target_modules"]
             if isinstance(raw_targets, (list, tuple)):
@@ -677,8 +708,9 @@ class ConfigAdapter:
             ("pcie_delta_cache_mode", {"observe", "cache_v0"}, "observe"),
             ("anima_block_residency", {"resident", "streaming_offload", "block_cpu_pinned"}, "resident"),
             ("newbie_block_residency", {"resident", "streaming_offload", "block_cpu_pinned"}, "resident"),
-            ("anima_block_checkpointing_mode", {"block"}, "block"),
-            ("newbie_block_checkpointing_mode", {"block"}, "block"),
+            ("anima_block_prefetch_mode", {"original", "adaptive"}, "original"),
+            ("anima_block_checkpointing_mode", {"block", "selective"}, "block"),
+            ("newbie_block_checkpointing_mode", {"block", "selective"}, "block"),
             (
                 "cuda_cache_release_strategy",
                 {"off", "oom_only", "phase_boundary", "after_optimizer", "aggressive", "every_step", "after_step"},
@@ -726,6 +758,14 @@ class ConfigAdapter:
                 normalized_data[int_key] = max(int(float(normalized_data.get(int_key) or 0)), 0)
             except Exception:
                 normalized_data[int_key] = 0
+        if "anima_block_checkpointing_interval" in normalized_data:
+            # interval is 1-based: 1 = checkpoint every block; clamp bad input back to 1.
+            try:
+                normalized_data["anima_block_checkpointing_interval"] = max(
+                    int(float(normalized_data.get("anima_block_checkpointing_interval") or 1)), 1
+                )
+            except Exception:
+                normalized_data["anima_block_checkpointing_interval"] = 1
         if "vram_smart_sensing_slowdown_ratio" in normalized_data:
             try:
                 normalized_data["vram_smart_sensing_slowdown_ratio"] = max(
@@ -909,6 +949,7 @@ class ConfigAdapter:
         if "pissa_niter" in normalized_data and "pissa_init_iters" not in normalized_data:
             normalized_data["pissa_init_iters"] = normalized_data["pissa_niter"]
         cls._normalize_adapter_init_values(normalized_data, boolish)
+        cls._normalize_fg_lora_rank_values(normalized_data, boolish)
         if "smart_rank_enabled" not in normalized_data and "smart_rank" in normalized_data:
             normalized_data["smart_rank_enabled"] = normalized_data["smart_rank"]
         if "smart_rank_enabled" not in normalized_data and "lulynx_smart_rank_enabled" in normalized_data:
@@ -1441,6 +1482,10 @@ class ConfigAdapter:
             "lycoris_ia3": "ia3",
             "lycoris_full": "full",
             "lycoris_diag_oft": "diag-oft",
+            "lycoris_glora": "glora",
+            "generalized_lora": "glora",
+            "lycoris_glokr": "glokr",
+            "generalized_lokr": "glokr",
             "diag_oft": "diag-oft",
             "diag-oft": "diag-oft",
             "oft": "diag-oft",
@@ -1564,6 +1609,35 @@ class ConfigAdapter:
         normalized_data["adapter_init_export_mode"] = init_export_mode if init_export_mode in {"auto", "raw", "lora_compatible", "approximate"} else "auto"
 
     @staticmethod
+    def _normalize_fg_lora_rank_values(normalized_data: Dict[str, Any], boolish) -> None:
+        """Validate the FG-LoRA per-layer rank policy knob (frontier #4).
+
+        Mirrors fg_lora_rank_policy.FgLoraRankPolicyConfig.normalized() so an
+        illegal value from the frontend degrades to the parity default ("uniform")
+        before reaching pydantic/the trainer. Absent keys are left untouched so the
+        pydantic defaults apply (default-off = bitwise parity). The accepted sets
+        are kept in lock-step with SUPPORTED_FG_LORA_RANK_{POLICIES,PROFILES}.
+        """
+        if "fg_lora_rank_policy" in normalized_data:
+            policy = str(normalized_data["fg_lora_rank_policy"] or "uniform").strip().lower().replace("-", "_")
+            normalized_data["fg_lora_rank_policy"] = (
+                policy if policy in {"uniform", "coupled_prune", "orthogonal_redistribute"} else "uniform"
+            )
+        if "fg_lora_rank_profile" in normalized_data:
+            profile = str(normalized_data["fg_lora_rank_profile"] or "center_peak").strip().lower().replace("-", "_")
+            normalized_data["fg_lora_rank_profile"] = (
+                profile if profile in {"center_peak", "ascending", "descending", "flat"} else "center_peak"
+            )
+        for key, default in (("fg_lora_rank_min", 1), ("fg_lora_rank_max", 64)):
+            if key in normalized_data:
+                try:
+                    normalized_data[key] = max(int(normalized_data[key]), 1)
+                except (TypeError, ValueError):
+                    normalized_data[key] = default
+        if "fg_lora_rank_conserve_budget" in normalized_data:
+            normalized_data["fg_lora_rank_conserve_budget"] = boolish(normalized_data["fg_lora_rank_conserve_budget"])
+
+    @staticmethod
     def _normalize_lora_alias_values(normalized_data: Dict[str, Any], boolish) -> None:
         lora_type = str(normalized_data.pop("lora_type", "") or "").strip().lower().replace("-", "_")
         lora_type = ConfigAdapter._normalize_lora_type_alias(lora_type)
@@ -1597,7 +1671,7 @@ class ConfigAdapter:
             elif lora_type == "fera":
                 normalized_data["network_module"] = "networks.lora"
                 normalized_data["fera_enabled"] = True
-            elif lora_type in {"loha", "locon", "lokr", "ia3", "full", "diag-oft"}:
+            elif lora_type in {"loha", "locon", "lokr", "ia3", "full", "diag-oft", "glora", "glokr"}:
                 normalized_data["network_module"] = "lycoris.locon"
                 normalized_data["lycoris_algo"] = lora_type
 
@@ -1643,6 +1717,37 @@ class ConfigAdapter:
         if "lokr_export_mode" in normalized_data:
             mode = str(normalized_data["lokr_export_mode"]).strip().lower()
             normalized_data["lokr_export_mode"] = mode if mode in {"native", "lora_compatible"} else "native"
+        # GLoRA Phase 2 aliases (defaults preserve Phase 1 standard behavior when absent)
+        if "glora_rank_dropout" in normalized_data:
+            normalized_data["glora_rank_dropout"] = float(normalized_data["glora_rank_dropout"] or 0.0)
+        if "glora_module_dropout" in normalized_data:
+            normalized_data["glora_module_dropout"] = float(normalized_data["glora_module_dropout"] or 0.0)
+        if "glora_no_materialize_forward" in normalized_data:
+            normalized_data["glora_no_materialize_forward"] = boolish(normalized_data["glora_no_materialize_forward"])
+        if "glora_use_tucker" in normalized_data:
+            normalized_data["glora_use_tucker"] = boolish(normalized_data["glora_use_tucker"])
+        if "glora_train_bias" in normalized_data:
+            normalized_data["glora_train_bias"] = boolish(normalized_data["glora_train_bias"])
+        if "glora_export_mode" in normalized_data:
+            mode = str(normalized_data["glora_export_mode"]).strip().lower()
+            normalized_data["glora_export_mode"] = mode if mode in {"native", "lora_compatible"} else "native"
+        # GLoKr Phase 3 aliases
+        if "glokr_factor" in normalized_data:
+            try:
+                normalized_data["glokr_factor"] = int(normalized_data["glokr_factor"])
+            except (TypeError, ValueError):
+                normalized_data["glokr_factor"] = -1
+        if "glokr_rank_dropout" in normalized_data:
+            normalized_data["glokr_rank_dropout"] = float(normalized_data["glokr_rank_dropout"] or 0.0)
+        if "glokr_module_dropout" in normalized_data:
+            normalized_data["glokr_module_dropout"] = float(normalized_data["glokr_module_dropout"] or 0.0)
+        if "glokr_no_materialize_forward" in normalized_data:
+            normalized_data["glokr_no_materialize_forward"] = boolish(normalized_data["glokr_no_materialize_forward"])
+        if "glokr_train_bias" in normalized_data:
+            normalized_data["glokr_train_bias"] = boolish(normalized_data["glokr_train_bias"])
+        if "glokr_export_mode" in normalized_data:
+            mode = str(normalized_data["glokr_export_mode"]).strip().lower()
+            normalized_data["glokr_export_mode"] = mode if mode in {"native", "lora_compatible"} else "native"
         if "pissa_init" in normalized_data and "pissa_enabled" not in normalized_data:
             normalized_data["pissa_enabled"] = normalized_data["pissa_init"]
         if "pissa_method" in normalized_data and "pissa_svd_algo" not in normalized_data:

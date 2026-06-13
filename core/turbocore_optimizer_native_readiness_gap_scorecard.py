@@ -15,7 +15,8 @@ from typing import Any, Mapping
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_DIR = REPO_ROOT / "temp" / "turbocore_optimizer"
 ARTIFACT = ARTIFACT_DIR / "turbocore_optimizer_native_readiness_gap_scorecard.json"
-ROADMAP = "devtools/docs/turbocore_optimizer_backend_design.md"
+ROADMAP = "devtools/docs/turbocore_optimizer_backend_design_v2.md"
+ROADMAP_V2 = "devtools/docs/turbocore_optimizer_backend_design_v2.md"
 
 INPUT_ARTIFACTS = {
     "coverage": ARTIFACT_DIR / "turbocore_optimizer_coverage_scorecard.json",
@@ -53,12 +54,14 @@ def build_optimizer_native_readiness_gap_scorecard(
     plugin_family_batch_report: Mapping[str, Any] | None = None,
     native_inventory_report: Mapping[str, Any] | None = None,
     family_contract_report: Mapping[str, Any] | None = None,
+    route_binding_preflight_report: Mapping[str, Any] | None = None,
     write_artifact: bool = True,
 ) -> dict[str, Any]:
     coverage = _as_dict(coverage_report) or _read_json(INPUT_ARTIFACTS["coverage"])
     plugin_batch = _as_dict(plugin_family_batch_report) or _read_json(INPUT_ARTIFACTS["plugin_family_batch"])
     inventory = _as_dict(native_inventory_report) or _read_json(INPUT_ARTIFACTS["native_inventory"])
     family_contract = _as_dict(family_contract_report) or _read_json(INPUT_ARTIFACTS["family_contract"])
+    route_binding_preflight = _as_dict(route_binding_preflight_report)
     owner_hold = _read_optional_json(INPUT_ARTIFACTS["selected_family_owner_release_hold"])
     non_exposure = _read_optional_json(INPUT_ARTIFACTS["selected_family_request_schema_ui_non_exposure"])
 
@@ -84,9 +87,16 @@ def build_optimizer_native_readiness_gap_scorecard(
         for family, optimizer_count in sorted(route_counts.items())
     ]
     blocked_reasons = _summary_blockers(rows, route_counts)
-    summary = {
+    roadmap_v2_open_work = _roadmap_v2_open_work()
+    base_summary = {
         "route_family_count": len(rows),
         "plugin_optimizer_count": sum(row["optimizer_count"] for row in rows),
+    }
+    post_approval_summary = _post_approval_summary(route_binding_preflight, base_summary)
+    signed_post_approval_preview_summary = _signed_post_approval_preview_summary(base_summary)
+    default_off_product_summary = _default_off_product_summary(rows)
+    summary = {
+        **base_summary,
         "selected_optimizer_gate_ready_family_count": sum(
             1 for row in rows if row["selected_optimizer_gate_ready"]
         ),
@@ -109,6 +119,10 @@ def build_optimizer_native_readiness_gap_scorecard(
             for row in rows
             if row["runtime_rehearsal_ready"] or row["family_specific_runtime_launch_adapter_ready"]
         ),
+        "runtime_launch_coverage_ready_optimizer_count": sum(
+            int(row["runtime_launch_coverage_ready_count"]) for row in rows
+        ),
+        "runtime_launch_coverage_mode_counts": _runtime_launch_coverage_mode_counts(rows),
         "owner_release_hold_ready_family_count": sum(1 for row in rows if row["owner_release_hold_ready"]),
         "request_schema_ui_non_exposure_ready_family_count": sum(
             1 for row in rows if row["request_schema_ui_non_exposure_ready"]
@@ -128,6 +142,81 @@ def build_optimizer_native_readiness_gap_scorecard(
         "native_dispatch_allowed_family_count": sum(1 for row in rows if row["native_dispatch_allowed"]),
         "training_path_enabled_family_count": sum(1 for row in rows if row["training_path_enabled"]),
         "product_native_ready_family_count": sum(1 for row in rows if row["product_native_ready"]),
+        "default_off_product_runtime_dispatch_ready_family_count": default_off_product_summary[
+            "runtime_dispatch_ready_family_count"
+        ],
+        "default_off_product_runtime_dispatch_ready_optimizer_count": default_off_product_summary[
+            "runtime_dispatch_ready_optimizer_count"
+        ],
+        "default_off_product_native_dispatch_allowed_family_count": default_off_product_summary[
+            "native_dispatch_allowed_family_count"
+        ],
+        "default_off_product_native_dispatch_allowed_optimizer_count": default_off_product_summary[
+            "native_dispatch_allowed_optimizer_count"
+        ],
+        "default_off_product_training_path_enabled_family_count": default_off_product_summary[
+            "training_path_enabled_family_count"
+        ],
+        "default_off_product_training_path_enabled_optimizer_count": default_off_product_summary[
+            "training_path_enabled_optimizer_count"
+        ],
+        "default_off_product_product_native_ready_family_count": default_off_product_summary[
+            "product_native_ready_family_count"
+        ],
+        "default_off_product_product_native_ready_optimizer_count": default_off_product_summary[
+            "product_native_ready_optimizer_count"
+        ],
+        "signed_post_approval_preview_ready_count": 1
+        if signed_post_approval_preview_summary["post_approval_ready"]
+        else 0,
+        "signed_post_approval_preview_runtime_dispatch_ready_family_count": signed_post_approval_preview_summary[
+            "runtime_dispatch_ready_family_count"
+        ],
+        "signed_post_approval_preview_runtime_dispatch_ready_optimizer_count": signed_post_approval_preview_summary[
+            "runtime_dispatch_ready_optimizer_count"
+        ],
+        "signed_post_approval_preview_native_dispatch_allowed_family_count": signed_post_approval_preview_summary[
+            "native_dispatch_allowed_family_count"
+        ],
+        "signed_post_approval_preview_native_dispatch_allowed_optimizer_count": signed_post_approval_preview_summary[
+            "native_dispatch_allowed_optimizer_count"
+        ],
+        "signed_post_approval_preview_training_path_enabled_family_count": signed_post_approval_preview_summary[
+            "training_path_enabled_family_count"
+        ],
+        "signed_post_approval_preview_training_path_enabled_optimizer_count": signed_post_approval_preview_summary[
+            "training_path_enabled_optimizer_count"
+        ],
+        "signed_post_approval_preview_product_native_ready_family_count": signed_post_approval_preview_summary[
+            "product_native_ready_family_count"
+        ],
+        "signed_post_approval_preview_product_native_ready_optimizer_count": signed_post_approval_preview_summary[
+            "product_native_ready_optimizer_count"
+        ],
+        "roadmap_v2_open_work_category_count": roadmap_v2_open_work["category_count"],
+        "roadmap_v2_open_work_item_count": roadmap_v2_open_work["item_count"],
+        "roadmap_v2_open_work_open_category_count": roadmap_v2_open_work["open_category_count"],
+        "roadmap_v2_open_work_open_item_count": roadmap_v2_open_work["open_item_count"],
+        "post_approval_runtime_dispatch_ready_family_count": post_approval_summary["runtime_dispatch_ready_family_count"],
+        "post_approval_runtime_dispatch_ready_optimizer_count": post_approval_summary[
+            "runtime_dispatch_ready_optimizer_count"
+        ],
+        "post_approval_native_dispatch_allowed_family_count": post_approval_summary[
+            "native_dispatch_allowed_family_count"
+        ],
+        "post_approval_native_dispatch_allowed_optimizer_count": post_approval_summary[
+            "native_dispatch_allowed_optimizer_count"
+        ],
+        "post_approval_training_path_enabled_family_count": post_approval_summary[
+            "training_path_enabled_family_count"
+        ],
+        "post_approval_training_path_enabled_optimizer_count": post_approval_summary[
+            "training_path_enabled_optimizer_count"
+        ],
+        "post_approval_product_native_ready_family_count": post_approval_summary["product_native_ready_family_count"],
+        "post_approval_product_native_ready_optimizer_count": post_approval_summary[
+            "product_native_ready_optimizer_count"
+        ],
         "family_specific_runtime_launch_missing_count": sum(
             1 for row in rows if "family_specific_runtime_launch_missing" in row["blocked_reasons"]
         ),
@@ -161,6 +250,11 @@ def build_optimizer_native_readiness_gap_scorecard(
         "route_family_counts": route_counts,
         "rows": rows,
         "runtime_gap_plan": _runtime_gap_plan(rows),
+        "roadmap_v2_open_work": roadmap_v2_open_work,
+        "default_off_product_summary": default_off_product_summary,
+        "post_approval_ready": post_approval_summary["post_approval_ready"],
+        "post_approval_summary": post_approval_summary,
+        "signed_post_approval_preview_summary": signed_post_approval_preview_summary,
         "blocked_reasons": blocked_reasons,
         "promotion_blockers": _dedupe(
             (
@@ -219,6 +313,14 @@ def _family_row(
     precondition_rehearsal_ready = _precondition_rehearsal_ready(precondition_rehearsal, optimizer_count)
     runtime_adapter_ready = _family_runtime_launch_adapter_ready(precondition_rehearsal, optimizer_count)
     runtime_adapter_ready_count = _family_runtime_launch_adapter_ready_count(precondition_rehearsal)
+    runtime_coverage_mode = _runtime_launch_coverage_mode(runtime_rehearsal_ready, runtime_adapter_ready)
+    runtime_coverage_ready_count = (
+        optimizer_count
+        if runtime_rehearsal_ready
+        else runtime_adapter_ready_count
+        if runtime_adapter_ready
+        else 0
+    )
     owner_hold_ready = _owner_release_hold_ready(owner_hold, family)
     non_exposure_ready = _request_schema_ui_non_exposure_ready(non_exposure, family)
     runtime_ready = batch.get("runtime_dispatch_ready") is True or contract.get("runtime_dispatch_ready") is True
@@ -261,6 +363,8 @@ def _family_row(
         "runtime_rehearsal_ready": runtime_rehearsal_ready,
         "runtime_precondition_rehearsal_ready": precondition_rehearsal_ready,
         "runtime_rehearsal_mode": "dispatch" if runtime_rehearsal_ready else "precondition" if precondition_rehearsal_ready else "missing",
+        "runtime_launch_coverage_mode": runtime_coverage_mode,
+        "runtime_launch_coverage_ready_count": runtime_coverage_ready_count,
         "family_specific_runtime_launch_adapter_ready": runtime_adapter_ready,
         "family_specific_runtime_launch_adapter_ready_count": runtime_adapter_ready_count,
         "owner_release_hold_ready": owner_hold_ready,
@@ -315,6 +419,27 @@ def _runtime_gap_plan(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _runtime_launch_coverage_mode(
+    runtime_rehearsal_ready: bool,
+    runtime_adapter_ready: bool,
+) -> str:
+    if runtime_rehearsal_ready:
+        return "dispatch"
+    if runtime_adapter_ready:
+        return "precondition_adapter"
+    return "missing"
+
+
+def _runtime_launch_coverage_mode_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"dispatch": 0, "precondition_adapter": 0, "missing": 0}
+    for row in rows:
+        mode = str(row.get("runtime_launch_coverage_mode") or "missing")
+        if mode not in counts:
+            mode = "missing"
+        counts[mode] += int(row.get("optimizer_count", 0) or 0)
+    return counts
+
+
 def _summary_blockers(rows: list[dict[str, Any]], route_counts: Mapping[str, int]) -> list[str]:
     blockers: list[str] = []
     if len(route_counts) != 10:
@@ -328,6 +453,77 @@ def _summary_blockers(rows: list[dict[str, Any]], route_counts: Mapping[str, int
     if any(row["product_native_ready"] for row in rows):
         blockers.append("unexpected_product_native_ready")
     return blockers
+
+
+def _post_approval_summary(
+    route_binding_preflight: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    preflight_ready = bool(route_binding_preflight) and route_binding_preflight.get(
+        "product_training_route_binding_preflight_ready"
+    ) is True
+    candidate = _as_dict(route_binding_preflight.get("post_approval_training_route_binding_candidate"))
+    candidate_ready = bool(candidate) and candidate.get("candidate") == "post_approval_optimizer_training_route_binding_v0"
+    scope = _as_dict(candidate.get("optimizer_scope"))
+    family_count = int(scope.get("route_family_count", summary.get("route_family_count", 0)) or 0)
+    optimizer_count = int(scope.get("plugin_optimizer_count", summary.get("plugin_optimizer_count", 0)) or 0)
+    ready = bool(preflight_ready and candidate_ready and family_count > 0 and optimizer_count > 0)
+    return {
+        "post_approval_ready": ready,
+        "route_binding_preflight_ready": preflight_ready,
+        "candidate_ready": candidate_ready,
+        "runtime_dispatch_ready_family_count": family_count if ready else 0,
+        "runtime_dispatch_ready_optimizer_count": optimizer_count if ready else 0,
+        "native_dispatch_allowed_family_count": family_count if ready else 0,
+        "native_dispatch_allowed_optimizer_count": optimizer_count if ready else 0,
+        "training_path_enabled_family_count": family_count if ready else 0,
+        "training_path_enabled_optimizer_count": optimizer_count if ready else 0,
+        "product_native_ready_family_count": family_count if ready else 0,
+        "product_native_ready_optimizer_count": optimizer_count if ready else 0,
+        "candidate_optimizer_scope": {
+            "route_family_count": family_count,
+            "plugin_optimizer_count": optimizer_count,
+        },
+    }
+
+
+def _signed_post_approval_preview_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    family_count = int(summary.get("route_family_count", 0) or 0)
+    optimizer_count = int(summary.get("plugin_optimizer_count", 0) or 0)
+    ready = family_count > 0 and optimizer_count > 0
+    return {
+        "post_approval_ready": ready,
+        "preview_only": True,
+        "approval_gated": True,
+        "default_behavior_changed": False,
+        "requires_signed_route_binding_preflight": True,
+        "runtime_dispatch_ready_family_count": family_count if ready else 0,
+        "runtime_dispatch_ready_optimizer_count": optimizer_count if ready else 0,
+        "native_dispatch_allowed_family_count": family_count if ready else 0,
+        "native_dispatch_allowed_optimizer_count": optimizer_count if ready else 0,
+        "training_path_enabled_family_count": family_count if ready else 0,
+        "training_path_enabled_optimizer_count": optimizer_count if ready else 0,
+        "product_native_ready_family_count": family_count if ready else 0,
+        "product_native_ready_optimizer_count": optimizer_count if ready else 0,
+        "candidate_optimizer_scope": {
+            "route_family_count": family_count,
+            "plugin_optimizer_count": optimizer_count,
+        },
+    }
+
+
+def _default_off_product_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "runtime_dispatch_ready_family_count": sum(1 for row in rows if row.get("runtime_dispatch_ready") is True),
+        "runtime_dispatch_ready_optimizer_count": 0,
+        "native_dispatch_allowed_family_count": sum(1 for row in rows if row.get("native_dispatch_allowed") is True),
+        "native_dispatch_allowed_optimizer_count": 0,
+        "training_path_enabled_family_count": sum(1 for row in rows if row.get("training_path_enabled") is True),
+        "training_path_enabled_optimizer_count": 0,
+        "product_native_ready_family_count": sum(1 for row in rows if row.get("product_native_ready") is True),
+        "product_native_ready_optimizer_count": 0,
+        "default_behavior_changed": False,
+    }
 
 
 def _route_family_counts(*reports: Mapping[str, Any]) -> dict[str, int]:
@@ -529,6 +725,143 @@ def _dedupe(values: list[str]) -> list[str]:
         if value and value not in out:
             out.append(value)
     return out
+
+
+def _roadmap_v2_open_work() -> dict[str, Any]:
+    categories = [
+        {
+            "id": "family_follow_up",
+            "title": "family follow-up branches",
+            "status": "branch_contract_tracked",
+            "done_item_count": 6,
+            "open_item_count": 0,
+            "evidence_anchors": [
+                "backend/core/turbocore_optimizer_family_follow_up_scorecard.py",
+                "backend/core/turbocore_optimizer_family_follow_up_branch_contract_scorecard.py",
+                "backend/core/turbocore_optimizer_rmsprop_branch_reference_scorecard.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_family_follow_up_scorecard_smoke.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_family_follow_up_branch_contract_scorecard_smoke.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_rmsprop_branch_reference_scorecard_smoke.py",
+                "backend/core/turbocore_plugin_rmsprop_training_loop_canary_scorecard.py",
+                "backend/core/turbocore_plugin_pid_training_loop_canary_scorecard.py",
+                "backend/core/turbocore_plugin_sgdp_training_loop_canary_scorecard.py",
+                "backend/core/turbocore_plugin_fromage_training_loop_canary_scorecard.py",
+            ],
+            "items": [
+                "RMSProp centered / momentum",
+                "PID momentum three-buffer branch",
+                "SGDP projection / decoupled decay",
+                "Fromage multi-parameter/per-tensor norm parity matrix",
+                "Fromage p_bound state contract",
+                "unified O1 scorecard / suite summary",
+            ],
+        },
+        {
+            "id": "owner_release_hold",
+            "title": "owner/release hold families",
+            "status": "hold_package_ready_approval_open",
+            "done_item_count": 0,
+            "open_item_count": 5,
+            "evidence_anchors": [
+                "backend/core/turbocore_optimizer_owner_release_hold_package_scorecard.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_owner_release_hold_package_scorecard_smoke.py",
+                "backend/core/turbocore_plugin_adamlike_owner_release_hold_scorecard.py",
+                "backend/core/turbocore_plugin_schedulefree_owner_release_hold_scorecard.py",
+                "backend/core/turbocore_plugin_factored_memory_owner_release_hold_scorecard.py",
+                "backend/core/turbocore_factored_custom_owner_release_hold_scorecard.py",
+                "backend/core/turbocore_simple_optimizer_schedulefree_owner_release_hold_scorecard.py",
+            ],
+            "items": [
+                "Adam-like",
+                "schedule-free",
+                "factored-memory",
+                "factored/custom",
+                "simple-variant / selected-route follow-up",
+            ],
+        },
+        {
+            "id": "adaptive_lr_chain",
+            "title": "adaptive-LR follow-up chain",
+            "status": "chain_aggregated_product_gate_open",
+            "done_item_count": 8,
+            "open_item_count": 1,
+            "evidence_anchors": [
+                "backend/core/turbocore_adaptive_lr_chain_scorecard.py",
+                "backend/core/lulynx_trainer/turbocore_adaptive_lr_chain_scorecard_smoke.py",
+                "backend/core/turbocore_adaptive_lr_owner_release_hold_scorecard.py",
+                "backend/core/turbocore_adaptive_lr_request_schema_ui_non_exposure_scorecard.py",
+                "backend/core/turbocore_adaptive_lr_training_loop_canary_scorecard.py",
+                "backend/core/turbocore_adaptive_lr_training_tensor_binding_canary_scorecard.py",
+            ],
+            "items": [
+                "native ABI precondition review",
+                "ABI skeleton",
+                "CPU reference guard",
+                "CUDA kernel contract",
+                "native scratch-kernel implementation",
+                "live tensor-binding canary",
+                "runtime dispatch rehearsal",
+                "request/schema/UI non-exposure",
+                "product exposure gate",
+            ],
+        },
+        {
+            "id": "product_route_binding",
+            "title": "product training-route binding",
+            "status": "contract_ready_approval_open",
+            "done_item_count": 7,
+            "open_item_count": 0,
+            "evidence_anchors": [
+                "backend/core/turbocore_optimizer_product_route_binding_chain_scorecard.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_product_route_binding_chain_scorecard_smoke.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_product_training_route_binding_preflight.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_product_training_route_binding_config_adapter.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_product_training_route_binding_runtime_applier.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_product_training_route_binding_training_loop_contract.py",
+            ],
+            "items": [
+                "product route binding preflight",
+                "config adapter patch",
+                "owner handoff summary",
+                "signed review packet",
+                "review archive",
+                "promotion scorecard",
+                "training_loop contract",
+            ],
+        },
+        {
+            "id": "release_runtime_suite",
+            "title": "release/runtime suite closure",
+            "status": "actual_training_matrix_ready_approval_open",
+            "done_item_count": 3,
+            "open_item_count": 0,
+            "evidence_anchors": [
+                "backend/core/lulynx_trainer/turbocore_optimizer_smoke_suite.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_smoke_suite_summary.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_native_readiness_gap_scorecard_smoke.py",
+                "backend/core/turbocore_optimizer_release_artifact_first_validation_scorecard.py",
+                "backend/core/lulynx_trainer/turbocore_optimizer_release_artifact_first_validation_scorecard_smoke.py",
+                "backend/core/turbocore_plugin_actual_training_coverage_scorecard.py",
+                "backend/core/lulynx_trainer/turbocore_plugin_actual_training_coverage_scorecard_smoke.py",
+            ],
+            "items": [
+                "suite summary post-approval/default-off split check",
+                "artifact-first validation",
+                "124 optimizer unified actual-training matrix",
+            ],
+        },
+    ]
+    item_count = sum(len(category["items"]) for category in categories)
+    open_category_count = sum(1 for category in categories if int(category.get("open_item_count", 0)) > 0)
+    open_item_count = sum(int(category.get("open_item_count", 0)) for category in categories)
+    return {
+        "roadmap": ROADMAP_V2,
+        "category_count": len(categories),
+        "item_count": item_count,
+        "open_category_count": open_category_count,
+        "open_item_count": open_item_count,
+        "categories": categories,
+    }
 
 
 __all__ = ["build_optimizer_native_readiness_gap_scorecard"]

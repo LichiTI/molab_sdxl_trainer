@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,19 +15,27 @@ from core.turbocore_native_update_release_review_package import (
     build_native_update_release_review_package,
     load_gate_artifacts,
 )
+from core.turbocore_optimizer_v2_approval_preflight_guard import (
+    approval_preflight_phase_ready as _approval_preflight_phase_ready,
+    approval_preflight_record_binding as _approval_preflight_record_binding,
+    approval_preflight_record_blockers as _approval_preflight_record_blockers,
+    approval_preflight_signed_digest_match as _approval_preflight_signed_digest_match,
+    digest_payload as _digest_payload,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_DIR = REPO_ROOT / "temp" / "turbocore_optimizer"
 PACKET_ARTIFACT = ARTIFACT_DIR / "native_update_owner_release_review_packet.json"
 ARTIFACT = ARTIFACT_DIR / "native_update_owner_release_review_record.json"
-ROADMAP = "devtools/docs/turbocore_optimizer_backend_design.md"
+ROADMAP = "devtools/docs/turbocore_optimizer_backend_design_v2.md"
 
 
 def build_native_update_owner_release_review_record(
     *,
     signed_review: Mapping[str, Any] | None = None,
     owner_packet: Mapping[str, Any] | None = None,
+    approval_preflight: Mapping[str, Any] | None = None,
     artifact_dir: str | Path | None = None,
     write_artifact: bool = True,
 ) -> dict[str, Any]:
@@ -42,6 +49,14 @@ def build_native_update_owner_release_review_record(
         blockers.append("signed_owner_release_review_missing")
         package = {}
     else:
+        blockers.extend(
+            _approval_preflight_blockers(
+                approval_preflight,
+                phase="phase1",
+                signature_id="owner_release_review",
+                signed_payload=review,
+            )
+        )
         blockers.extend(_signed_review_blockers(review, packet))
         package = build_native_update_release_review_package(
             gate_artifacts=load_gate_artifacts(directory),
@@ -55,6 +70,11 @@ def build_native_update_owner_release_review_record(
         and package.get("release_review_recorded") is True
         and package.get("decision") == READY_DECISION
         and not _unsafe_top_level_enabled(package)
+    )
+    preflight_binding = _approval_preflight_record_binding(
+        approval_preflight,
+        "owner_release_review",
+        review,
     )
     payload = {
         "schema_version": 1,
@@ -75,6 +95,14 @@ def build_native_update_owner_release_review_record(
         "source_owner_packet_digest": _digest_payload(packet),
         "source_release_review_template_digest": str(packet.get("source_release_review_template_digest", "") or ""),
         "signed_review_template_digest": str(review.get("source_release_review_template_digest", "") or ""),
+        "approval_preflight_present": bool(approval_preflight),
+        "approval_preflight_phase1_ready": _approval_preflight_phase_ready(approval_preflight, phase="phase1"),
+        "approval_preflight_signed_review_digest_match": _approval_preflight_signed_digest_match(
+            approval_preflight,
+            "owner_release_review",
+            review,
+        ),
+        **preflight_binding,
         "signed_review_digest_match": bool(
             signed_review_present
             and review.get("source_release_review_template_digest")
@@ -100,6 +128,24 @@ def build_native_update_owner_release_review_record(
             if package
             else int(_as_dict(packet.get("compact_evidence")).get("supplemental_gate_count", 0) or 0),
             "release_review_recorded_count": 1 if signed_ready else 0,
+            "approval_preflight_phase1_ready_count": 1
+            if _approval_preflight_phase_ready(approval_preflight, phase="phase1")
+            else 0,
+            "approval_preflight_signed_review_digest_match_count": 1
+            if _approval_preflight_signed_digest_match(approval_preflight, "owner_release_review", review)
+            else 0,
+            "approval_preflight_digest_present_count": 1
+            if preflight_binding["approval_preflight_digest"]
+            else 0,
+            "approval_preflight_signed_payload_digest_present_count": 1
+            if preflight_binding["approval_preflight_signed_payload_digest"]
+            else 0,
+            "approval_preflight_signed_bundle_entry_digest_present_count": 1
+            if preflight_binding["approval_preflight_signed_bundle_entry_digest"]
+            else 0,
+            "approval_preflight_binding_ready_count": 1
+            if preflight_binding["approval_preflight_binding_ready"]
+            else 0,
             "product_exposure_allowed_count": 0,
             "native_dispatch_allowed_count": 0,
             "training_path_enabled_count": 0,
@@ -168,6 +214,24 @@ def _package_blockers(package: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _approval_preflight_blockers(
+    preflight: Mapping[str, Any] | None,
+    *,
+    phase: str,
+    signature_id: str,
+    signed_payload: Mapping[str, Any],
+) -> list[str]:
+    return _approval_preflight_record_blockers(
+        preflight,
+        phase=phase,
+        signature_id=signature_id,
+        signed_payload=signed_payload,
+        unsafe_blockers=lambda value: ["approval_execution_preflight_unsafe_top_level_claim"]
+        if _unsafe_top_level_enabled(value)
+        else [],
+    )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return _as_dict(json.loads(path.read_text(encoding="utf-8")))
 
@@ -178,16 +242,10 @@ def _read_json_if_supplied(path: str | Path | None) -> dict[str, Any] | None:
     return _read_json(Path(path))
 
 
-def _digest_payload(value: Mapping[str, Any]) -> str:
-    if not value:
-        return ""
-    payload = {str(key): item for key, item in value.items() if not str(key).startswith("_source_")}
-    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
-
-
 def _unsafe_top_level_enabled(value: Mapping[str, Any]) -> bool:
     for key in (
+        "approval_artifact_written",
+        "default_behavior_changed",
         "product_exposure_allowed",
         "request_fields_emitted",
         "schema_exposure_allowed",
@@ -224,6 +282,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--signed-review", default="", help="Path to owner-signed release review JSON.")
     parser.add_argument("--owner-packet", default="", help="Optional owner review packet JSON path.")
+    parser.add_argument("--approval-preflight", default="", help="Required v2 approval execution preflight JSON for signed records.")
     parser.add_argument("--artifact-dir", default="", help="Directory containing native-update release artifacts.")
     parser.add_argument("--no-artifact", action="store_true", help="Print validation without writing the record artifact.")
     return parser
@@ -234,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
     payload = build_native_update_owner_release_review_record(
         signed_review=_read_json_if_supplied(args.signed_review),
         owner_packet=_read_json_if_supplied(args.owner_packet),
+        approval_preflight=_read_json_if_supplied(args.approval_preflight),
         artifact_dir=args.artifact_dir or None,
         write_artifact=not bool(args.no_artifact),
     )

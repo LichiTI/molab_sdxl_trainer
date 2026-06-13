@@ -26,6 +26,7 @@ def _sync_release_gate_fields(report: dict[str, Any]) -> None:
     claim_allowed = str(report.get("release_readiness") or "") == "ready_with_case_specific_wording"
     report["publishable"] = claim_allowed
     report["release_claim_allowed"] = claim_allowed
+    report["not_release_evidence"] = not claim_allowed
     report["safe_to_auto_start"] = False
     report["claim_publication_scope"] = (
         "case_specific_benchmark_claims" if claim_allowed else "non_release_benchmark_claims"
@@ -80,8 +81,8 @@ def gate_natural_claims(release_claims: Mapping[str, Any], canary: Mapping[str, 
 
     gated["publishable_claims"] = publishable
     gated["blocked_claims"] = blocked
-    if moved:
-        gaps = [dict(_mapping(item)) for item in gated.get("evidence_gaps", [])]
+    gaps = [dict(_mapping(item)) for item in gated.get("evidence_gaps", [])]
+    if not any(str(item.get("id") or "") == "natural_load_canary_pending" for item in gaps):
         gaps.append(
             {
                 "id": "natural_load_canary_pending",
@@ -91,8 +92,8 @@ def gate_natural_claims(release_claims: Mapping[str, Any], canary: Mapping[str, 
                 "blocked_families": _string_list(canary.get("blocked_families")),
             }
         )
-        gated["evidence_gaps"] = gaps
-        gated["release_readiness"] = "blocked_pending_evidence"
+    gated["evidence_gaps"] = gaps
+    gated["release_readiness"] = "blocked_pending_evidence"
     _sync_release_gate_fields(gated)
     return gated
 
