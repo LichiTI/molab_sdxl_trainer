@@ -1,3 +1,4 @@
+import backend  # noqa: F401,E402  molab flattened-export compat
 """
 Lulynx Core - LoRA Training Toolkit
 
