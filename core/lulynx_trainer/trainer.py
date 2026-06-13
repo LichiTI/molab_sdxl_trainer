@@ -7324,36 +7324,10 @@ class LulynxTrainer(TrainerThermalMixin, TrainerOptimizerFactoryMixin, TrainerAr
             getattr(self.config, "sample_every", 0) > 0
             or getattr(self.config, "sample_every_n_epochs", 0) > 0
         ):
-            try:
-                from .sampler import create_sampler_from_trainer, get_preview_state, PreviewState
-                preview_state = get_preview_state(self)
-                preview_device = str(getattr(self.config, "preview_device", "gpu") or "gpu").strip().lower()
-                if preview_state == PreviewState.REAL_PREVIEW or preview_device == "cpu":
-                    self._sampler = create_sampler_from_trainer(self)
-                    if self._sampler:
-                        if bool(getattr(self.config, "micro_vae_preview", False)):
-                            if hasattr(self._sampler, "load_micro_decoder"):
-                                self._sampler.load_micro_decoder(
-                                    str(getattr(self.config, "micro_vae_model", "auto") or "auto")
-                                )
-                        mode = "CPU preview queue" if preview_device == "cpu" else "Sampling"
-                        self._log(f"{mode} enabled ({len(sample_groups)} preview groups)")
-                        if bool(getattr(self.config, "sample_at_first", False)):
-                            try:
-                                self._run_sampling(0, current_epoch=0)
-                            except Exception as e:
-                                logger.warning(f"Initial sampling failed: {e}")
-                    else:
-                        self._log("Sampling requested, but sampler creation failed.")
-                elif preview_state == PreviewState.ADAPTER_INSPECT:
-                    self._log(
-                        "Real-time preview unavailable (TE/VAE released in cache-first mode). "
-                        "Adapter metadata inspection is still available."
-                    )
-                else:
-                    self._log("Sampling requested, but this training mode has no compatible sampler pipeline.")
-            except Exception as e:
-                self._log(f"Sampling initialization failed: {e}")
+            # molab build: in-training sample preview is intentionally removed.
+            # Keep the sampler unset so the CPU preview queue is never created and
+            # no "Generating samples" / "CPU preview job scheduled" work runs.
+            self._sampler = None
 
             # 训练前准备 (捕获基线)
             self._log("Capturing baseline for Manifold Constraint...")

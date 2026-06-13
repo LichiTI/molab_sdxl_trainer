@@ -27,6 +27,7 @@ from ..constants import (
 )
 from .anima_train_norm_compat import export_anima_train_norm_state_dict
 from .lokr_export_rules import export_lokr_state_dict
+from .sdxl_lora_key_export import export_sdxl_compatible_lora_keys
 from core.safe_pickle import safe_torch_load
 
 logger = logging.getLogger(__name__)
@@ -389,6 +390,48 @@ class TrainerArtifactIoMixin:
         self._log(f"Thin-SVD compression applied to {compression_count} LoRA layer pairs")
         return compressed_state, metadata
 
+    def _prepare_sdxl_compatible_lora_export_for_save(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        metadata: Optional[Dict[str, str]],
+    ) -> tuple[Dict[str, torch.Tensor], Optional[Dict[str, str]]]:
+        """把 SDXL 标准 LoRA 的“裸 key”转成 kohya/ComfyUI 兼容格式。
+
+        molab native trainer 注入时用 prefix=unet/te1/te2，导出 key 形如
+        ``unet_..._.lora_down.weight`` / ``te1_encoder_layers_..._.lora_up.weight``，
+        缺少 sd-scripts 标准的 ``lora_`` 前缀与 ``text_model_`` 段，且无 per-module
+        ``.alpha``、无 ``ss_network_module``。通用 ComfyUI / A1111 加载器按 ``lora_unet_`` /
+        ``lora_te1_text_model_`` 前缀正则匹配，匹配不到就整份跳过，导致出图无效。
+        这里在保存阶段补齐前缀 / alpha / 元数据，使产物可被通用工具加载。
+
+        仅对 SDXL 架构生效；anima 等走各自的导出规则，不受影响。
+        """
+        model_arch = getattr(getattr(self.config, "model_type", ""), "value", getattr(self.config, "model_type", ""))
+        if str(model_arch).lower() != "sdxl":
+            return state_dict, metadata
+
+        try:
+            network_alpha = float(getattr(self.config, "network_alpha", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            network_alpha = 0.0
+        if network_alpha <= 0.0 and metadata:
+            try:
+                network_alpha = float(metadata.get("ss_network_alpha", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                network_alpha = 0.0
+        if network_alpha <= 0.0:
+            network_alpha = 1.0
+
+        new_state, new_meta, converted = export_sdxl_compatible_lora_keys(
+            state_dict, metadata, network_alpha=network_alpha
+        )
+        if converted:
+            self._log(
+                f"SDXL LoRA key export: normalized {converted} modules to kohya/ComfyUI "
+                f"format (lora_unet_/lora_te1_text_model_ prefixes + alpha)"
+            )
+        return new_state, new_meta
+
     def _save_state_dict_to_path(
         self,
         state_dict: Dict[str, torch.Tensor],
@@ -511,6 +554,7 @@ class TrainerArtifactIoMixin:
                 adapter_state, metadata = self._prepare_adapter_init_export_for_save(adapter_state, metadata)
                 adapter_state, metadata = self._prepare_anima_lokr_export_for_save(adapter_state, metadata)
                 adapter_state, metadata = self._prepare_thin_svd_export_for_save(adapter_state, metadata)
+                adapter_state, metadata = self._prepare_sdxl_compatible_lora_export_for_save(adapter_state, metadata)
                 self._save_state_dict_to_path(adapter_state, save_path, metadata)
         finally:
             if optimizer_eval_swapped:

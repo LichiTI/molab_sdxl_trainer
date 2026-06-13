@@ -783,12 +783,17 @@ def __(mo):
         label="基础分辨率",
     )
     adapter_type_dropdown = mo.ui.dropdown(
-        options=["lora", "lokr", "loha", "locon", "dora"],
+        # 仅 SDXL：只暴露标准 LoRA。lokr/loha/locon/dora 走 LyCORIS 路线，其导出
+        # （export_lokr_state_dict 的 native 模式）写的是 networks.lora_anima 元数据 +
+        # anima 专用 key 规范，仅适配 anima 模型的 ComfyUI 加载器，SDXL 无法加载。
+        # 相关核心代码（LyCORISInjector / export_lokr_state_dict）保留以备后用，
+        # 这里只在 UI 层禁用，避免 SDXL 误选后导出不可用的 LoRA。
+        options=["lora"],
         value="lora",
-        label="Adapter 类型（lokr/loha/locon/dora 走 LyCORIS）",
+        label="Adapter 类型（SDXL 仅支持标准 LoRA；lokr/loha/locon/dora 为 anima 专用，已禁用）",
     )
-    lokr_factor_input = mo.ui.number(value=8, start=-1, stop=64, step=1, label="LoKr factor（仅 lokr，-1=自动）")
-    lokr_full_matrix_checkbox = mo.ui.checkbox(value=False, label="LoKr full matrix（强制全矩阵，不退回分解）")
+    lokr_factor_input = mo.ui.number(value=8, start=-1, stop=64, step=1, label="LoKr factor（anima 专用，SDXL 不生效）")
+    lokr_full_matrix_checkbox = mo.ui.checkbox(value=False, label="LoKr full matrix（anima 专用，SDXL 不生效）")
     rank_input = mo.ui.number(value=16, start=1, stop=4096, step=1, label="rank / network_dim")
     alpha_input = mo.ui.number(value=8, start=0, stop=4096, step=1, label="alpha")
     dropout_input = mo.ui.number(value=0.0, start=0.0, stop=1.0, step=0.01, label="dropout")
@@ -854,7 +859,7 @@ def __(mo):
     cache_latents_checkbox = mo.ui.checkbox(value=True, label="cache latents")
     cache_latents_disk_checkbox = mo.ui.checkbox(value=True, label="cache latents to disk")
     cache_text_encoder_checkbox = mo.ui.checkbox(value=False, label="cache text encoder outputs")
-    attention_backend_dropdown = mo.ui.dropdown(options=["sageattn", "sdpa", "auto", "xformers"], value="sageattn", label="attention backend，Blackwell 推荐 sageattn；不可用会回退 SDPA")
+    attention_backend_dropdown = mo.ui.dropdown(options=["sdpa", "sageattn", "auto", "xformers"], value="sdpa", label="attention backend：SDXL 默认 sdpa（与引擎 auto 策略一致，最稳）；sageattn 是 DiT 路线推荐，在 SDXL 上可能数值不稳/NaN，仅在确认稳定时再选")
     xformers_checkbox = mo.ui.checkbox(value=False, label="xformers 标记")
     torch_compile_checkbox = mo.ui.checkbox(value=False, label="torch_compile，首次跑通前建议关闭")
     low_vram_dropdown = mo.ui.dropdown(options=["off", "standard_16g", "low_12g", "very_low_8g"], value="off", label="low_vram_profile")
@@ -874,7 +879,7 @@ def __(mo):
 
 @app.cell
 def __(mo):
-    mo.md("## 6. 保存、采样与高级覆盖")
+    mo.md("## 6. 保存、训练目标（v 参数化）与高级覆盖")
 
     save_every_epoch_input = mo.ui.number(value=1, start=1, stop=1000, step=1, label="每 N epoch 保存")
     save_every_steps_input = mo.ui.number(value=0, start=0, stop=1_000_000, step=100, label="每 N steps 保存，0 关闭")
@@ -882,10 +887,9 @@ def __(mo):
     save_state_checkbox = mo.ui.checkbox(value=False, label="保存训练 state")
     save_state_end_checkbox = mo.ui.checkbox(value=False, label="结束时保存 state")
 
-    sample_every_checkbox = mo.ui.checkbox(value=False, label="启用采样预览，首次跑通前建议关闭")
-    sample_every_epochs_input = mo.ui.number(value=1, start=1, stop=1000, step=1, label="每 N epoch 采样")
-    sample_prompt_input = mo.ui.text_area(value="", label="采样 prompt，可留空", full_width=True)
-    sample_negative_input = mo.ui.text_area(value="low quality, worst quality, blurry", label="采样 negative", full_width=True)
+    # 采样预览模块已移除（molab 版不在训练过程中生成预览图）。
+    # 这里改为训练目标开关：v 参数化 / v-prediction。
+    v_parameterization_checkbox = mo.ui.checkbox(value=False, label="v 参数化 / v-prediction（仅用于 v-pred 底模，例如 NoobAI v-pred；普通 epsilon 底模请勿勾选）")
 
     advanced_json_input = mo.ui.text_area(
         value="{}",
@@ -897,13 +901,11 @@ def __(mo):
         [
             mo.hstack([save_every_epoch_input, save_every_steps_input, keep_last_input]),
             mo.hstack([save_state_checkbox, save_state_end_checkbox]),
-            mo.hstack([sample_every_checkbox, sample_every_epochs_input]),
-            sample_prompt_input,
-            sample_negative_input,
+            v_parameterization_checkbox,
             advanced_json_input,
         ]
     )
-    return advanced_json_input, keep_last_input, sample_every_checkbox, sample_every_epochs_input, sample_negative_input, sample_prompt_input, save_every_epoch_input, save_every_steps_input, save_state_checkbox, save_state_end_checkbox
+    return advanced_json_input, keep_last_input, save_every_epoch_input, save_every_steps_input, save_state_checkbox, save_state_end_checkbox, v_parameterization_checkbox
 
 
 @app.cell
@@ -939,7 +941,7 @@ def __(Path, repo):
 
 
 @app.cell
-def __(Any, adapter_type_dropdown, advanced_json_input, alpha_input, attention_backend_dropdown, batch_size_input, bucket_step_input, cache_latents_checkbox, cache_latents_disk_checkbox, cache_text_encoder_checkbox, caption_ext_input, color_aug_checkbox, config_name_input, conv_alpha_input, conv_dim_input, dropout_input, effective_train_data_dir, enable_bucket_checkbox, epochs_input, flip_aug_checkbox, grad_accum_input, grad_ckpt_checkbox, json, keep_last_input, keep_tokens_input, logging_dir_input, lokr_factor_input, lokr_full_matrix_checkbox, low_vram_dropdown, lr_input, max_bucket_input, max_steps_input, max_token_length_input, min_bucket_input, mixed_precision_dropdown, model_path_input, optimizer_dropdown, output_dir_input, output_name_input, prodigy_d0_input, prodigy_d_coef_input, rank_input, resolution_dropdown, sample_every_checkbox, sample_every_epochs_input, sample_negative_input, sample_prompt_input, save_every_epoch_input, save_every_steps_input, save_precision_dropdown, save_state_checkbox, save_state_end_checkbox, scheduler_dropdown, seed_input, shuffle_caption_checkbox, text_encoder_lr_input, torch_compile_checkbox, train_data_dir_input, train_norm_checkbox, unet_lr_input, vae_path_input, warmup_steps_input, xformers_checkbox):
+def __(Any, adapter_type_dropdown, advanced_json_input, alpha_input, attention_backend_dropdown, batch_size_input, bucket_step_input, cache_latents_checkbox, cache_latents_disk_checkbox, cache_text_encoder_checkbox, caption_ext_input, color_aug_checkbox, config_name_input, conv_alpha_input, conv_dim_input, dropout_input, effective_train_data_dir, enable_bucket_checkbox, epochs_input, flip_aug_checkbox, grad_accum_input, grad_ckpt_checkbox, json, keep_last_input, keep_tokens_input, logging_dir_input, lokr_factor_input, lokr_full_matrix_checkbox, low_vram_dropdown, lr_input, max_bucket_input, max_steps_input, max_token_length_input, min_bucket_input, mixed_precision_dropdown, model_path_input, optimizer_dropdown, output_dir_input, output_name_input, prodigy_d0_input, prodigy_d_coef_input, rank_input, resolution_dropdown, save_every_epoch_input, save_every_steps_input, save_precision_dropdown, save_state_checkbox, save_state_end_checkbox, scheduler_dropdown, seed_input, shuffle_caption_checkbox, text_encoder_lr_input, torch_compile_checkbox, train_data_dir_input, train_norm_checkbox, unet_lr_input, v_parameterization_checkbox, vae_path_input, warmup_steps_input, xformers_checkbox):
     advanced_error = ""
     try:
         advanced_overrides: dict[str, Any] = json.loads(advanced_json_input.value or "{}")
@@ -1050,10 +1052,7 @@ def __(Any, adapter_type_dropdown, advanced_json_input, alpha_input, attention_b
         "save_state": bool(save_state_checkbox.value),
         "save_state_on_train_end": bool(save_state_end_checkbox.value),
         "seed": _ival(seed_input, 42),
-        "sample_every": bool(sample_every_checkbox.value),
-        "sample_every_n_epochs": _ival(sample_every_epochs_input, 0) if sample_every_checkbox.value else 0,
-        "sample_prompts": str(sample_prompt_input.value or ""),
-        "sample_negative": str(sample_negative_input.value or ""),
+        "v_parameterization": bool(v_parameterization_checkbox.value),
         "low_vram_profile": str(low_vram_dropdown.value),
         "sdxl_low_vram_optimization": str(low_vram_dropdown.value) != "off",
         "adapter_type": adapter_type,

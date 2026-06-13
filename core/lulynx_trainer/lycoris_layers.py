@@ -635,9 +635,11 @@ class DiagOFTAdapter(nn.Module):
 class _NormAdapter(nn.Module):
     """Lightweight adapter for LayerNorm / RMSNorm layers.
 
-    Applies a per-channel scaling + bias residual on top of the norm output:
-        output = x + scale * x + bias
-    where scale and bias are low-rank (rank-1) trainable parameters.
+    Applies a per-channel trainable affine on top of the *normalized output*:
+        output = y * (1 + scale * scaling) + bias * scaling
+    where ``y`` is the base norm output (provided by the injection wrapper) and
+    ``scale``/``bias`` are rank-1 trainable parameters initialized to zero so the
+    adapter starts as an exact identity.
     """
 
     def __init__(
@@ -652,7 +654,10 @@ class _NormAdapter(nn.Module):
         self.norm_dim = norm_dim
         self.alpha = alpha
         self.scaling = alpha / 1.0  # rank-1 so scaling = alpha
-        self.scale = nn.Parameter(torch.ones(norm_dim) * 0.01)
+        # Zero-init so the adapter starts as an identity on the normalized output
+        # (standard LoRA-style init). A non-zero start perturbs every norm layer
+        # at step 0 and, combined with the wrong injection path, blew up to NaN.
+        self.scale = nn.Parameter(torch.zeros(norm_dim))
         self.bias = nn.Parameter(torch.zeros(norm_dim))
         if base_weight is None:
             base_weight = torch.ones(norm_dim, dtype=torch.float32)
@@ -1024,6 +1029,13 @@ class LyCORISInjector:
         if isinstance(lycoris_layer, (IA3Adapter, DiagOFTAdapter)):
             def new_forward(x):
                 return lycoris_layer.apply_to_output(original_forward(x))
+        elif isinstance(lycoris_layer, _NormAdapter):
+            # Norm adapters apply a trainable affine *on top of the normalized
+            # output*, not as a residual over the raw norm input. Feeding the raw
+            # input (a large-magnitude residual stream, e.g. SDXL) into the adapter
+            # and adding it back destroys normalization and explodes to NaN.
+            def new_forward(x):
+                return lycoris_layer(original_forward(x))
         else:
             def new_forward(x):
                 return original_forward(x) + lycoris_layer(x)

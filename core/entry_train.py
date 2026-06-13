@@ -449,7 +449,8 @@ def main():
                 ),
                 "runtime_features": runtime_features,
             }
-            print(f"PROGRESS_JSON: {json.dumps(progress)}", flush=True)
+            # molab build: do not emit PROGRESS_JSON to stdout (keeps the training
+            # log clean). Progress is still persisted via state_writer below.
             state_writer.update(
                 step=step,
                 epoch=epoch,
