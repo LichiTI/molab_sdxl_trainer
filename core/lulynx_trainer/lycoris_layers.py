@@ -726,14 +726,32 @@ class LyCORISInjector:
                 resolved.append(t)
         return resolved
 
-    def inject(self, model: nn.Module, target_modules: List[str], prefix: str = "") -> Dict[str, nn.Module]:
-        """注入 LyCORIS 层"""
+    def inject(
+        self,
+        model: nn.Module,
+        target_modules: List[str],
+        prefix: str = "",
+        apply_policy: bool = False,
+        exclude_name_substrings: Optional[List[str]] = None,
+    ) -> Dict[str, nn.Module]:
+        """注入 LyCORIS 层
+
+        ``apply_policy`` is accepted for signature parity with ``LoRAInjector.inject``
+        and is currently ignored by the LyCORIS path. ``exclude_name_substrings``
+        skips any module whose qualified name contains one of the substrings,
+        mirroring ``LoRAInjector`` (e.g. excluding a frozen ``llm_adapter`` subtree).
+        """
         injected_now: Dict[str, nn.Module] = {}
+        excludes = tuple(s for s in (exclude_name_substrings or ()) if s)
 
         # Resolve explicit target list plus config-level LyCORIS presets.
         target_modules = self.resolve_target_modules([*target_modules, *self._configured_presets()])
 
         for name, module in model.named_modules():
+            # Skip frozen sibling subtrees whose names substring-collide with a
+            # target suffix (e.g. anima_llm_adapter when llm_adapter is not trained).
+            if excludes and any(s in name for s in excludes):
+                continue
             # Standard targets: nn.Linear and nn.Conv2d
             if isinstance(module, (nn.Linear, nn.Conv2d)):
                 if not self._matches_target(name, module, target_modules):
@@ -749,7 +767,9 @@ class LyCORISInjector:
                 injected_now[full_name] = lycoris_layer
 
             # Norm targets: LayerNorm and RMSNorm when train_norm is enabled
-            elif self.config.train_norm and isinstance(module, (nn.LayerNorm,)):
+            elif self.config.train_norm and isinstance(module, (nn.LayerNorm,)) and not (
+                excludes and any(s in name for s in excludes)
+            ):
                 # Also match RMSNorm (common in DiT models like Anima/Newbie)
                 lycoris_layer = self._create_norm_layer(module)
                 if lycoris_layer is not None:
@@ -763,6 +783,8 @@ class LyCORISInjector:
         # Second pass: catch RMSNorm modules that aren't nn.LayerNorm subclasses
         if self.config.train_norm:
             for name, module in model.named_modules():
+                if excludes and any(s in name for s in excludes):
+                    continue
                 if name in [n for n, _ in injected_now.items() if not prefix]:
                     continue
                 if name in [n.lstrip(prefix + ".") if prefix else n for n in self._injected_layers]:
