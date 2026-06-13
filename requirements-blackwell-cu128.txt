@@ -1,0 +1,21 @@
+# PyTorch runtime for NVIDIA RTX PRO 6000 / RTX 50 Blackwell GPUs on molab/Linux.
+#
+# This follows the current Lulynx standard NVIDIA cu128 stack from resources/install/setup.ps1:
+#   torch==2.10.0+cu128
+#   torchvision==0.25.0+cu128
+#
+# Notes:
+# - The local launcher's dedicated Blackwell runtime in setup_hw.ps1 uses Windows cp312 wheel URLs,
+#   so it is not directly usable on molab's Linux/Python runtime.
+# - For molab, install from PyTorch's cu128 index and use SDPA as the default attention backend.
+# - xformers is intentionally NOT required here; SDXL LoRA works with torch SDPA.
+#
+# Install this BEFORE requirements-molab.txt:
+#   python -m pip install -r requirements-blackwell-cu128.txt
+#   python -m pip install -r requirements-molab.txt
+
+--index-url https://download.pytorch.org/whl/cu128
+
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+torchaudio==2.10.0+cu128

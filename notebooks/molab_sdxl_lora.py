@@ -2,7 +2,6 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "marimo",
-#   "torch",
 #   "diffusers",
 #   "transformers",
 #   "accelerate",
@@ -39,6 +38,7 @@ app = marimo.App(width="medium")
 def __():
     import json
     import os
+    import re
     import shlex
     import subprocess
     import sys
@@ -152,7 +152,7 @@ def __():
             *bootstrap_panel,
         ]
     )
-    return Any, Path, clone_dir_input, clone_or_update_repo, clone_repo_button, detected_repo, find_repo_root, github_repo_input, is_repo_root, json, mo, os, q, shlex, subprocess, sys, time, zipfile
+    return Any, Path, clone_dir_input, clone_or_update_repo, clone_repo_button, detected_repo, find_repo_root, github_repo_input, is_repo_root, json, mo, os, q, re, shlex, subprocess, sys, time, zipfile
 
 
 @app.cell
@@ -193,6 +193,8 @@ def __(Path, mo, repo, subprocess, sys):
         cuda_available = bool(torch.cuda.is_available())
         cuda_version = str(getattr(torch.version, "cuda", ""))
         gpu_name = torch.cuda.get_device_name(0) if cuda_available else "-"
+        device_capability = torch.cuda.get_device_capability(0) if cuda_available else None
+        torch_arch_list = torch.cuda.get_arch_list() if cuda_available else []
         vram_gb = (
             round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2)
             if cuda_available
@@ -203,32 +205,57 @@ def __(Path, mo, repo, subprocess, sys):
         cuda_available = False
         cuda_version = "-"
         gpu_name = "-"
+        device_capability = None
+        torch_arch_list = []
         vram_gb = 0
 
     nvidia_smi_button = mo.ui.run_button(label="刷新 nvidia-smi")
+    blackwell_requirements = repo / "requirements-blackwell-cu128.txt"
+    sage_requirements = repo / "requirements-sageattention.txt"
     install_command = f"{sys.executable} -m pip install -r {requirements}" if requirements.is_file() else "requirements-molab.txt 不存在"
+    blackwell_install_command = (
+        f"{sys.executable} -m pip install -r {blackwell_requirements}\n{sys.executable} -m pip install -r {requirements}"
+        if blackwell_requirements.is_file() and requirements.is_file()
+        else "requirements-blackwell-cu128.txt 或 requirements-molab.txt 不存在"
+    )
+    sage_install_command = (
+        f"{blackwell_install_command}\n{sys.executable} -m pip install -r {sage_requirements}"
+        if blackwell_requirements.is_file() and requirements.is_file() and sage_requirements.is_file()
+        else "requirements-blackwell-cu128.txt / requirements-molab.txt / requirements-sageattention.txt 不存在"
+    )
+
+    sageattention_available = False
+    try:
+        import sageattention  # noqa: F401
+        sageattention_available = True
+    except Exception:
+        sageattention_available = False
 
     status_lines = [
         f"- core/entry_train.py：{'✅' if core_entry.is_file() else '❌'} `{core_entry}`",
         f"- scripts/run_sdxl_train.py：{'✅' if runner.is_file() else '❌'} `{runner}`",
         f"- requirements-molab.txt：{'✅' if requirements.is_file() else '❌'} `{requirements}`",
+        f"- requirements-sageattention.txt：{'✅' if sage_requirements.is_file() else '❌'} `{sage_requirements}`",
         f"- Python：`{sys.version.split()[0]}`",
         f"- Torch：`{torch_version}`",
         f"- CUDA：{'✅ 可用' if cuda_available else '❌ 不可用'}，CUDA 版本：`{cuda_version}`",
         f"- GPU：`{gpu_name}`，显存：`{vram_gb} GB`",
+        f"- Compute capability：`{device_capability}`",
+        f"- Torch arch list：`{torch_arch_list}`",
+        f"- SageAttention：{'✅ 可导入' if sageattention_available else '⚠️ 未安装或不可导入'}",
     ]
 
     mo.vstack(
         [
             mo.md("## 1. 环境与仓库检查\n" + "\n".join(status_lines)),
             mo.callout(
-                f"如果依赖未安装，先在 molab cell/terminal 执行：\n\n```bash\n{install_command}\n```",
+                f"如果是 RTX PRO 6000 / Blackwell，优先执行 **SageAttention 快速路线**：\n\n```bash\n{sage_install_command}\n```\n\n如果 SageAttention 安装失败，则执行基础 cu128 路线并使用 SDPA：\n\n```bash\n{blackwell_install_command}\n```\n\n普通 CUDA 环境可执行：\n\n```bash\n{install_command}\n```\n\nBlackwell 正常应看到 CUDA `12.8` 且 arch list 包含 `sm_120` 或 `compute_120`。SageAttention 安装成功后，训练参数里的 attention backend 可选 `sageattn`。",
                 kind="info",
             ),
             nvidia_smi_button,
         ]
     )
-    return core_entry, cuda_available, gpu_name, install_command, nvidia_smi_button, requirements, runner, torch_version, vram_gb
+    return blackwell_install_command, core_entry, cuda_available, gpu_name, install_command, nvidia_smi_button, requirements, runner, sage_install_command, sage_requirements, sageattention_available, torch_version, vram_gb
 
 
 @app.cell
@@ -281,6 +308,148 @@ def __(mo, repo):
     )
     return config_name_input, logging_dir_input, model_path_input, output_dir_input, output_name_input, train_data_dir_input, vae_path_input
 
+
+
+
+@app.cell
+def __(mo):
+    mo.md("## 2B. 可选：上传训练集 ZIP 后解压")
+
+    dataset_zip_path_input = mo.ui.text(
+        value="",
+        label="训练集 ZIP 路径：上传到 molab 后填写，例如 dataset.zip 或 /marimo/dataset.zip",
+        full_width=True,
+    )
+    dataset_extract_name_input = mo.ui.text(
+        value="my_lora",
+        label="解压到 work/datasets/<这个名字>",
+        full_width=True,
+    )
+    dataset_repeats_input = mo.ui.number(value=10, start=1, stop=1000, step=1, label="如果 zip 根目录直接是图片，自动整理到几_repeats目录")
+    dataset_use_zip_checkbox = mo.ui.checkbox(value=True, label="解压成功后，最终配置自动使用解压后的训练集路径")
+    dataset_overwrite_checkbox = mo.ui.checkbox(value=False, label="覆盖已存在的解压目录")
+    dataset_unpack_button = mo.ui.run_button(label="解压训练集 ZIP")
+
+    mo.vstack(
+        [
+            dataset_zip_path_input,
+            mo.hstack([dataset_extract_name_input, dataset_repeats_input]),
+            mo.hstack([dataset_use_zip_checkbox, dataset_overwrite_checkbox]),
+            mo.callout(
+                "支持两种 zip：1) 内部已有 `10_xxx/图片+txt`；2) 根目录直接是图片+txt，会自动整理到 `10_default/`。",
+                kind="info",
+            ),
+            dataset_unpack_button,
+        ]
+    )
+    return dataset_extract_name_input, dataset_overwrite_checkbox, dataset_repeats_input, dataset_unpack_button, dataset_use_zip_checkbox, dataset_zip_path_input
+
+
+@app.cell
+def __(Path, dataset_extract_name_input, dataset_overwrite_checkbox, dataset_repeats_input, dataset_unpack_button, dataset_use_zip_checkbox, dataset_zip_path_input, mo, repo, zipfile):
+    def safe_dataset_name(raw_name: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(raw_name or "my_lora")).strip("_")
+        return cleaned or "my_lora"
+
+    def resolve_upload_path(raw_path: str) -> Path:
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            return Path("")
+        candidate = Path(path_text).expanduser()
+        if candidate.is_absolute():
+            return candidate
+        # Prefer repo-relative path, then /marimo-relative path.
+        repo_candidate = repo / candidate
+        if repo_candidate.exists():
+            return repo_candidate
+        marimo_candidate = Path("/marimo") / candidate
+        if marimo_candidate.exists():
+            return marimo_candidate
+        return repo_candidate
+
+    def safe_extract_zip(zip_path: Path, destination: Path) -> None:
+        destination.mkdir(parents=True, exist_ok=True)
+        destination_resolved = destination.resolve()
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            for member in archive.infolist():
+                member_name = member.filename.replace("\\\\", "/")
+                if not member_name or member_name.endswith("/"):
+                    continue
+                member_path = Path(member_name)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise RuntimeError(f"ZIP 内含不安全路径：{member.filename}")
+                if member_path.parts and member_path.parts[0] == "__MACOSX":
+                    continue
+                target_path = (destination / member_path).resolve()
+                if not str(target_path).startswith(str(destination_resolved)):
+                    raise RuntimeError(f"ZIP 路径越界：{member.filename}")
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member, "r") as source_handle:
+                    target_path.write_bytes(source_handle.read())
+
+    def normalize_dataset_root(extract_dir: Path, repeats: int) -> Path:
+        import shutil
+
+        image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        visible_children = [p for p in extract_dir.iterdir() if not p.name.startswith(".") and p.name != "__MACOSX"]
+        dir_children = [p for p in visible_children if p.is_dir()]
+        file_children = [p for p in visible_children if p.is_file()]
+
+        # If zip contains a single top-level directory, use it as dataset root.
+        dataset_root = dir_children[0] if len(dir_children) == 1 and not file_children else extract_dir
+
+        root_images = [p for p in dataset_root.iterdir() if p.is_file() and p.suffix.lower() in image_exts]
+        has_subset_dirs = any(p.is_dir() for p in dataset_root.iterdir())
+        if root_images and not has_subset_dirs:
+            subset_dir = dataset_root / f"{int(repeats)}_default"
+            subset_dir.mkdir(parents=True, exist_ok=True)
+            sidecar_suffixes = [".txt", ".json", ".caption"]
+            for image_path in root_images:
+                shutil.move(str(image_path), str(subset_dir / image_path.name))
+                for suffix in sidecar_suffixes:
+                    sidecar = image_path.with_suffix(suffix)
+                    if sidecar.exists():
+                        shutil.move(str(sidecar), str(subset_dir / sidecar.name))
+            dataset_root = dataset_root
+        return dataset_root
+
+    dataset_zip_message = ""
+    zip_train_data_dir = str(dataset_extract_name_input.value or "my_lora")
+    effective_train_data_dir = ""
+
+    if dataset_unpack_button.value:
+        source_zip_path = resolve_upload_path(str(dataset_zip_path_input.value or ""))
+        if not source_zip_path.is_file():
+            dataset_zip_message = f"❌ ZIP 不存在：`{source_zip_path}`"
+        elif source_zip_path.suffix.lower() != ".zip":
+            dataset_zip_message = f"❌ 不是 .zip 文件：`{source_zip_path}`"
+        else:
+            target_name = safe_dataset_name(str(dataset_extract_name_input.value or "my_lora"))
+            extract_dir = repo / "work" / "datasets" / target_name
+            if extract_dir.exists() and any(extract_dir.iterdir()) and not dataset_overwrite_checkbox.value:
+                dataset_zip_message = f"❌ 目标目录已存在且非空：`{extract_dir}`。如需覆盖，请勾选覆盖。"
+            else:
+                if extract_dir.exists() and dataset_overwrite_checkbox.value:
+                    import shutil
+                    shutil.rmtree(extract_dir)
+                try:
+                    safe_extract_zip(source_zip_path, extract_dir)
+                    detected_dataset_root = normalize_dataset_root(extract_dir, int(dataset_repeats_input.value or 10))
+                    try:
+                        zip_train_data_dir = str(detected_dataset_root.relative_to(repo))
+                    except ValueError:
+                        zip_train_data_dir = str(detected_dataset_root)
+                    effective_train_data_dir = zip_train_data_dir if dataset_use_zip_checkbox.value else ""
+                    dataset_zip_message = (
+                        f"✅ 已解压：`{source_zip_path}` → `{extract_dir}`\n\n"
+                        f"检测到训练集根目录：`{zip_train_data_dir}`\n\n"
+                        f"如果需要手动填写，训练集目录填：`{zip_train_data_dir}`"
+                    )
+                except Exception as dataset_zip_error:
+                    dataset_zip_message = f"❌ 解压失败：{type(dataset_zip_error).__name__}: {dataset_zip_error}"
+
+    mo.md(dataset_zip_message or "未触发 ZIP 解压。")
+    return dataset_zip_message, effective_train_data_dir, zip_train_data_dir
 
 @app.cell
 def __(mo):
@@ -382,7 +551,33 @@ def __(mo):
 
 
 @app.cell
-def __(Path, direct_model_auth_mode_dropdown, direct_model_download_button, direct_model_filename_input, direct_model_local_dir_input, direct_model_token_env_input, direct_model_url_input, mo, os, repo, subprocess):
+def __(Path, direct_model_auth_mode_dropdown, direct_model_download_button, direct_model_filename_input, direct_model_local_dir_input, direct_model_token_env_input, direct_model_url_input, mo, os, re, repo, subprocess):
+    def normalize_civitai_url(model_url: str) -> tuple[str, str]:
+        """Convert a Civitai web page URL into the real download API URL.
+
+        Returns (effective_url, note). The note is non-empty when normalization happened.
+        """
+        url = model_url.strip()
+        # Already an API download link.
+        if "/api/download/models/" in url:
+            return url.replace("civitai.red", "civitai.com"), ""
+        # Civitai page URL such as https://civitai.com/models/833294/...?modelVersionId=1022833
+        if "civitai" in url and "/models/" in url:
+            version_match = re.search(r"[?&]modelVersionId=(\d+)", url)
+            if version_match:
+                version_id = version_match.group(1)
+                return f"https://civitai.com/api/download/models/{version_id}", f"检测到 Civitai 页面 URL，已自动转为下载直链 modelVersionId={version_id}。"
+            return url, "⚠️ 这看起来是 Civitai 页面 URL，但没有 modelVersionId。请使用带 ?modelVersionId=的链接，或直接用 https://civitai.com/api/download/models/<版本ID>。"
+        return url, ""
+
+    def looks_like_html(target_path: Path) -> bool:
+        try:
+            with open(target_path, "rb") as handle:
+                head = handle.read(512).lstrip().lower()
+            return head.startswith(b"<!doctype html") or head.startswith(b"<html") or b"<head" in head[:256]
+        except Exception:
+            return False
+
     def download_direct_model(model_url: str, output_name: str, output_dir_text: str, token_env_name: str, auth_mode: str) -> str:
         if not model_url:
             return "❌ 请先填写模型下载 URL。"
@@ -397,8 +592,9 @@ def __(Path, direct_model_auth_mode_dropdown, direct_model_download_button, dire
             clean_output_name = "model.safetensors"
         direct_target_path = direct_output_dir / clean_output_name
 
+        effective_url, normalize_note = normalize_civitai_url(model_url)
+
         direct_token_value = os.environ.get((token_env_name or "").strip(), "") if token_env_name else ""
-        effective_url = model_url.strip()
         curl_command = ["curl", "-L", "--fail", "--retry", "3", "--continue-at", "-", "-o", str(direct_target_path)]
 
         if auth_mode == "bearer_header" and direct_token_value:
@@ -408,6 +604,7 @@ def __(Path, direct_model_auth_mode_dropdown, direct_model_download_button, dire
             effective_url = f"{effective_url}{join_char}token={direct_token_value}"
 
         curl_command.append(effective_url)
+        note_prefix = (normalize_note + "\n\n") if normalize_note else ""
 
         try:
             direct_download_result = subprocess.run(
@@ -417,15 +614,40 @@ def __(Path, direct_model_auth_mode_dropdown, direct_model_download_button, dire
                 timeout=7200,
             )
         except Exception as direct_download_error:
-            return f"❌ 下载进程启动失败：{type(direct_download_error).__name__}: {direct_download_error}"
+            return f"{note_prefix}❌ 下载进程启动失败：{type(direct_download_error).__name__}: {direct_download_error}"
 
         if direct_download_result.returncode != 0:
             sanitized_stderr = (direct_download_result.stderr or "").replace(direct_token_value, "***") if direct_token_value else (direct_download_result.stderr or "")
             sanitized_stdout = (direct_download_result.stdout or "").replace(direct_token_value, "***") if direct_token_value else (direct_download_result.stdout or "")
-            return f"❌ 下载失败，退出码 {direct_download_result.returncode}\n\n```text\n{sanitized_stdout}\n{sanitized_stderr}\n```"
+            return f"{note_prefix}❌ 下载失败，退出码 {direct_download_result.returncode}\n\n```text\n{sanitized_stdout}\n{sanitized_stderr}\n```"
 
-        size_gb = direct_target_path.stat().st_size / 1024**3 if direct_target_path.exists() else 0
-        return f"✅ 下载完成：`{direct_target_path}`，大小约 `{size_gb:.2f} GB`。上面的底模路径可填写：`{direct_target_path}`"
+        if not direct_target_path.exists():
+            return f"{note_prefix}❌ 下载后未找到文件：`{direct_target_path}`"
+
+        size_bytes = direct_target_path.stat().st_size
+        size_gb = size_bytes / 1024**3
+        size_mb = size_bytes / 1024**2
+
+        # Guard: SDXL checkpoints are multi-GB. A tiny file is almost always an HTML page or an error JSON.
+        if size_bytes < 50 * 1024 * 1024 or looks_like_html(direct_target_path):
+            preview = ""
+            try:
+                with open(direct_target_path, "rb") as handle:
+                    preview = handle.read(300).decode("utf-8", errors="replace")
+            except Exception:
+                preview = ""
+            try:
+                direct_target_path.unlink()
+            except Exception:
+                pass
+            return (
+                f"{note_prefix}❌ 下载结果只有 `{size_mb:.2f} MB`，看起来不是模型文件（可能是网页 HTML 或错误信息），已自动删除。\n\n"
+                f"常见原因：填了 Civitai 网页地址而不是下载直链，或者模型需要登录 token。\n\n"
+                f"正确直链格式：`https://civitai.com/api/download/models/<版本ID>`\n\n"
+                f"返回内容预览：\n\n```text\n{preview}\n```"
+            )
+
+        return f"{note_prefix}✅ 下载完成：`{direct_target_path}`，大小约 `{size_gb:.2f} GB`。上面的底模路径可填写：`{direct_target_path}`"
 
     direct_model_download_message = ""
     if direct_model_download_button.value:
@@ -506,7 +728,7 @@ def __(mo):
     cache_latents_checkbox = mo.ui.checkbox(value=True, label="cache latents")
     cache_latents_disk_checkbox = mo.ui.checkbox(value=True, label="cache latents to disk")
     cache_text_encoder_checkbox = mo.ui.checkbox(value=False, label="cache text encoder outputs")
-    attention_backend_dropdown = mo.ui.dropdown(options=["sdpa", "auto", "xformers"], value="sdpa", label="attention backend")
+    attention_backend_dropdown = mo.ui.dropdown(options=["sageattn", "sdpa", "auto", "xformers"], value="sageattn", label="attention backend，Blackwell 推荐 sageattn；不可用会回退 SDPA")
     xformers_checkbox = mo.ui.checkbox(value=False, label="xformers 标记")
     torch_compile_checkbox = mo.ui.checkbox(value=False, label="torch_compile，首次跑通前建议关闭")
     low_vram_dropdown = mo.ui.dropdown(options=["off", "standard_16g", "low_12g", "very_low_8g"], value="off", label="low_vram_profile")
@@ -585,7 +807,7 @@ def __(Path, repo):
 
 
 @app.cell
-def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_size_input, bucket_step_input, cache_latents_checkbox, cache_latents_disk_checkbox, cache_text_encoder_checkbox, caption_ext_input, color_aug_checkbox, config_name_input, dropout_input, enable_bucket_checkbox, epochs_input, flip_aug_checkbox, grad_accum_input, grad_ckpt_checkbox, json, keep_last_input, keep_tokens_input, logging_dir_input, low_vram_dropdown, lr_input, max_bucket_input, max_steps_input, max_token_length_input, min_bucket_input, mixed_precision_dropdown, model_path_input, optimizer_dropdown, output_dir_input, output_name_input, rank_input, resolution_dropdown, sample_every_checkbox, sample_every_epochs_input, sample_negative_input, sample_prompt_input, save_every_epoch_input, save_every_steps_input, save_precision_dropdown, save_state_checkbox, save_state_end_checkbox, scheduler_dropdown, seed_input, shuffle_caption_checkbox, text_encoder_lr_input, torch_compile_checkbox, train_data_dir_input, unet_lr_input, vae_path_input, warmup_steps_input, xformers_checkbox):
+def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_size_input, bucket_step_input, cache_latents_checkbox, cache_latents_disk_checkbox, cache_text_encoder_checkbox, caption_ext_input, color_aug_checkbox, config_name_input, dropout_input, effective_train_data_dir, enable_bucket_checkbox, epochs_input, flip_aug_checkbox, grad_accum_input, grad_ckpt_checkbox, json, keep_last_input, keep_tokens_input, logging_dir_input, low_vram_dropdown, lr_input, max_bucket_input, max_steps_input, max_token_length_input, min_bucket_input, mixed_precision_dropdown, model_path_input, optimizer_dropdown, output_dir_input, output_name_input, rank_input, resolution_dropdown, sample_every_checkbox, sample_every_epochs_input, sample_negative_input, sample_prompt_input, save_every_epoch_input, save_every_steps_input, save_precision_dropdown, save_state_checkbox, save_state_end_checkbox, scheduler_dropdown, seed_input, shuffle_caption_checkbox, text_encoder_lr_input, torch_compile_checkbox, train_data_dir_input, unet_lr_input, vae_path_input, warmup_steps_input, xformers_checkbox):
     advanced_error = ""
     try:
         advanced_overrides: dict[str, Any] = json.loads(advanced_json_input.value or "{}")
@@ -597,6 +819,7 @@ def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_
         advanced_error = f"高级 JSON 解析失败：{type(advanced_json_error).__name__}: {advanced_json_error}"
 
     attention_backend = str(attention_backend_dropdown.value)
+    selected_train_data_dir = str(effective_train_data_dir or train_data_dir_input.value or "").strip()
     config = {
         "schema_id": "sdxl-lora",
         "training_type": "lora",
@@ -604,7 +827,7 @@ def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_
         "pretrained_model_name_or_path": str(model_path_input.value).strip(),
         "base_model_path": str(model_path_input.value).strip(),
         "vae_path": str(vae_path_input.value).strip(),
-        "train_data_dir": str(train_data_dir_input.value).strip(),
+        "train_data_dir": selected_train_data_dir,
         "output_dir": str(output_dir_input.value).strip(),
         "logging_dir": str(logging_dir_input.value).strip(),
         "output_name": str(output_name_input.value).strip() or "my_sdxl_lora",
@@ -648,6 +871,7 @@ def __(Any, advanced_json_input, alpha_input, attention_backend_dropdown, batch_
         "cache_text_encoder_outputs": bool(cache_text_encoder_checkbox.value),
         "cache_text_encoder_outputs_to_disk": bool(cache_text_encoder_checkbox.value),
         "attention_backend": attention_backend,
+        "use_sage_attn": attention_backend == "sageattn",
         "sdpa": attention_backend == "sdpa",
         "xformers": bool(xformers_checkbox.value) or attention_backend == "xformers",
         "torch_compile": bool(torch_compile_checkbox.value),

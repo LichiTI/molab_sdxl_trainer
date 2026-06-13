@@ -1,0 +1,13 @@
+# Optional fastest attention backend for NVIDIA Blackwell / CUDA environments on molab/Linux.
+#
+# This mirrors the launcher's preferred sageattention-blackwell route conceptually:
+#   sageattention-blackwell > flexattention > blackwell > sdpa
+#
+# Use after installing the cu128 PyTorch stack and base requirements:
+#   python -m pip install -r requirements-blackwell-cu128.txt
+#   python -m pip install -r requirements-molab.txt
+#   python -m pip install -r requirements-sageattention.txt
+#
+# If this fails on molab, keep using SDPA; the trainer falls back safely.
+
+sageattention==1.0.6

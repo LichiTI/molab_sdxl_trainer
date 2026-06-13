@@ -41,7 +41,22 @@ git clone https://github.com/<你的用户名>/<你的仓库名>.git
 cd <你的仓库名>
 ```
 
-安装依赖：
+安装依赖。RTX PRO 6000 / Blackwell 推荐优先使用 SageAttention 快速路线：
+
+```bash
+python -m pip install -r requirements-blackwell-cu128.txt
+python -m pip install -r requirements-molab.txt
+python -m pip install -r requirements-sageattention.txt
+```
+
+如果 SageAttention 安装失败，可只安装基础 cu128 + SDPA 路线：
+
+```bash
+python -m pip install -r requirements-blackwell-cu128.txt
+python -m pip install -r requirements-molab.txt
+```
+
+普通非 Blackwell CUDA 环境可尝试：
 
 ```bash
 pip install -r requirements-molab.txt
@@ -67,13 +82,14 @@ notebooks/molab_sdxl_lora.py
 1. 检查 Python / Torch / CUDA / GPU
 2. 可选从 Hugging Face 下载 SDXL 底模
 3. 可选从普通直链 / Civitai download URL 下载模型到 `work/models/`
-4. 填写模型路径、数据集路径、输出名
-5. 设置 rank、alpha、分辨率、epoch、学习率、optimizer
-5. 设置 bucket、cache、混合精度、低显存策略
-6. 预检模型和数据集
-7. 写出训练配置 JSON
-8. 生成启动命令
-9. 可选直接启动训练或打包输出
+4. 上传训练集 zip 后一键解压并自动识别训练集目录
+5. 填写模型路径、数据集路径、输出名
+6. 设置 rank、alpha、分辨率、epoch、学习率、optimizer
+7. 设置 bucket、cache、混合精度、低显存策略
+8. 预检模型和数据集
+9. 写出训练配置 JSON
+10. 生成启动命令
+11. 可选直接启动训练或打包输出
 
 ## 命令行训练
 
@@ -116,6 +132,12 @@ core/entry_train.py
 
 ## 数据集格式
 
+如果 molab 只能单文件上传，推荐把训练集压成 zip 上传。notebook 的 `2B. 上传训练集 ZIP 后解压` 支持：
+
+- zip 内已经是 `10_xxx/图片+txt` 结构：直接解压使用。
+- zip 根目录直接是图片和同名 `.txt`：自动整理到 `10_default/`。
+- 解压成功后可自动把最终训练配置的 `train_data_dir` 指向解压结果。
+
 推荐使用 sd-scripts 风格目录：
 
 ```text
@@ -145,14 +167,15 @@ work/datasets/my_lora/
   "gradient_checkpointing": true,
   "cache_latents": true,
   "cache_latents_to_disk": true,
-  "attention_backend": "sdpa",
+  "attention_backend": "sageattn",
+  "use_sage_attn": true,
   "xformers": false,
   "torch_compile": false,
   "sample_every": false
 }
 ```
 
-跑通后再逐步尝试更高 rank、更大 batch、采样预览或低显存策略。
+如果没有安装 SageAttention，训练器会自动回退到 SDPA。跑通后再逐步尝试更高 rank、更大 batch、采样预览或低显存策略。
 
 ## 更新 GitHub
 

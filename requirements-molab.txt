@@ -1,7 +1,9 @@
-# Molab / cloud notebook minimal runtime for SDXL LoRA training
-# If molab already provides a CUDA-compatible torch, you may comment out torch and keep the preinstalled version.
+# Molab / cloud notebook minimal runtime for SDXL LoRA training.
+# For RTX PRO 6000 / RTX 50 Blackwell, install requirements-blackwell-cu128.txt first.
+# It provides a CUDA 12.8+ PyTorch wheel with sm_120 support.
 
-torch>=2.4.0
+# Keep this line: if requirements-blackwell-cu128.txt was installed first, this is already satisfied.
+torch>=2.7.1
 diffusers>=0.30.0
 transformers>=4.40.0
 accelerate>=0.30.0

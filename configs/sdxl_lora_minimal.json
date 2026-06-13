@@ -51,8 +51,9 @@
   "cache_latents_to_disk": true,
   "cache_text_encoder_outputs": false,
   "cache_text_encoder_outputs_to_disk": false,
-  "attention_backend": "sdpa",
-  "sdpa": true,
+  "attention_backend": "sageattn",
+  "use_sage_attn": true,
+  "sdpa": false,
   "xformers": false,
   "torch_compile": false,
 

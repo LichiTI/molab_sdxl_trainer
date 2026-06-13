@@ -74,7 +74,14 @@ def export(out: Path) -> None:
     _copytree(SCAFFOLD / "configs", out / "configs")
     _copytree(SCAFFOLD / "notebooks", out / "notebooks")
     _copytree(SCAFFOLD / "scripts", out / "scripts")
-    _copy_file(SCAFFOLD / "requirements-molab.txt", out / "requirements-molab.txt")
+    for req_name in (
+        "requirements-molab.txt",
+        "requirements-blackwell-cu128.txt",
+        "requirements-sageattention.txt",
+    ):
+        src_req = SCAFFOLD / req_name
+        if src_req.is_file():
+            _copy_file(src_req, out / req_name)
 
     # Replace scaffold export script copy with a note? Keep it; useful for future refresh.
     readme = (SCAFFOLD / "README.md").read_text(encoding="utf-8")
